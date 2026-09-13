@@ -3,37 +3,27 @@ const Parser = require('rss-parser');
 const parser = new Parser();
 
 const WORKER_ENDPOINT = 'https://emergencyaudit.com/api/ping';
+const PROXY_ENDPOINT = 'https://emergencyaudit.com/api/rss-proxy';
 const MASTER_ADMIN_KEY = process.env.MASTER_ADMIN_KEY || 'SecretKey_2026_Dispatch!';
 
 const TARGET_FEEDS = [
-  // --- CRAIGSLIST FEEDS ---
   { source: 'Craigslist SFV', url: 'https://losangeles.craigslist.org/search/sfv/sks?format=rss', city: 'Van Nuys / SFV, CA', zip: '91401', cat: 'HANDYMAN' },
   { source: 'Craigslist Westside', url: 'https://losangeles.craigslist.org/search/wst/sks?format=rss', city: 'Beverly Hills, CA', zip: '90210', cat: 'HANDYMAN' },
   { source: 'Craigslist Hollywood', url: 'https://losangeles.craigslist.org/search/lgs?format=rss', city: 'Hollywood, CA', zip: '90028', cat: 'HAULING' },
-  { source: 'Craigslist OC', url: 'https://orangecounty.craigslist.org/search/sks?format=rss', city: 'Orange County, CA', zip: '92660', cat: 'HANDYMAN' },
-
-  // --- MULTI-BOARD NETWORK FEEDS ---
-  { source: 'Geebo Trade Requests', url: 'https://geebo.com/rss/services', city: 'Southern California', zip: '90210', cat: 'HANDYMAN' },
-  { source: 'ClassifiedAds Services', url: 'https://www.classifiedads.com/services-cat.xml', city: 'Greater LA Area, CA', zip: '90001', cat: 'HANDYMAN' }
+  { source: 'Craigslist OC', url: 'https://orangecounty.craigslist.org/search/sks?format=rss', city: 'Orange County, CA', zip: '92660', cat: 'HANDYMAN' }
 ];
 
 async function runScraperCycle() {
-  console.log(`[${new Date().toISOString()}] 🚀 Multi-Site Harvester Active...`);
+  console.log(`[${new Date().toISOString()}] 🚀 Proxy Feed Harvester Active...`);
   let totalIngested = 0;
 
   for (const feed of TARGET_FEEDS) {
     try {
-      console.log(`Fetching ${feed.source}...`);
-
-      // Fetch with desktop browser headers to prevent HTTP 403 blocks
-      const response = await axios.get(feed.url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.9'
-        },
-        timeout: 8000
-      });
+      console.log(`Fetching ${feed.source} via Cloudflare Edge...`);
+      
+      // Route through Cloudflare Worker proxy to bypass GitHub IP bans
+      const proxiedUrl = `${PROXY_ENDPOINT}?url=${encodeURIComponent(feed.url)}`;
+      const response = await axios.get(proxiedUrl, { timeout: 10000 });
 
       const parsedFeed = await parser.parseString(response.data);
 
@@ -78,11 +68,12 @@ async function runScraperCycle() {
         }
       }
     } catch (err) {
-      console.error(`   ❌ Failed harvesting ${feed.source}:`, err.response?.status ? `Status Code ${err.response.status}` : err.message);
+      console.error(`   ❌ Failed harvesting ${feed.source}:`, err.message);
     }
   }
 
   console.log(`\n🎉 Multi-Site Cycle Complete. Total Leads Ingested: ${totalIngested}`);
+  process.exit(0);
 }
 
 runScraperCycle();

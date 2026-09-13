@@ -3,6 +3,7 @@ const Parser = require('rss-parser');
 const parser = new Parser();
 
 const WORKER_ENDPOINT = 'https://emergencyaudit.com/api/ping';
+const PROXY_ENDPOINT = 'https://emergencyaudit.com/api/rss-proxy';
 const MASTER_ADMIN_KEY = process.env.MASTER_ADMIN_KEY || 'SecretKey_2026_Dispatch!';
 
 const TRADE_KEYWORDS = [
@@ -11,9 +12,7 @@ const TRADE_KEYWORDS = [
   'hauling', 'clean', 'carpenter', 'remodel', 'install', 'gutter', 'locksmith'
 ];
 
-// Active, high-availability public RSS directories and service feeds
 const OPEN_BOARD_FEEDS = [
-  { source: 'Global Trades RSS', url: 'https://www.feedforall.com/sample.rss', city: 'Los Angeles, CA', zip: '90001' },
   { source: 'Public Service Feed', url: 'https://news.google.com/rss/search?q=handyman+repair+services&hl=en-US&gl=US&ceid=US:en', city: 'Beverly Hills, CA', zip: '90210' }
 ];
 
@@ -33,20 +32,16 @@ function classifyTrade(title) {
 }
 
 async function runScraperCycle() {
-  console.log(`[${new Date().toISOString()}] 🚀 Active Public Feed Harvester...`);
+  console.log(`[${new Date().toISOString()}] 🚀 Proxy-Powered Feed Harvester...`);
   let totalIngested = 0;
 
   for (const feed of OPEN_BOARD_FEEDS) {
     try {
-      console.log(`Scanning ${feed.source}...`);
+      console.log(`Scanning ${feed.source} via Cloudflare Edge Proxy...`);
 
-      const response = await axios.get(feed.url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-          'Accept': 'application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8'
-        },
-        timeout: 6000
-      });
+      // Route through your Cloudflare Worker proxy to bypass 401/403 bot blocks
+      const proxiedUrl = `${PROXY_ENDPOINT}?url=${encodeURIComponent(feed.url)}`;
+      const response = await axios.get(proxiedUrl, { timeout: 8000 });
 
       const parsedFeed = await parser.parseString(response.data);
 
@@ -58,9 +53,7 @@ async function runScraperCycle() {
           const snippet = item.contentSnippet || item.content || '';
 
           if (!title) continue;
-          
-          // For Google News / general RSS, we ensure it matches our trade criteria
-          if (feed.source.includes('Google') && !isHomeServiceRequest(title, snippet)) continue;
+          if (!isHomeServiceRequest(title, snippet)) continue;
 
           const cat = classifyTrade(title);
 
@@ -97,7 +90,7 @@ async function runScraperCycle() {
         }
       }
     } catch (err) {
-      console.warn(`   ⚠️ Skipped ${feed.source}: ${err.message}`);
+      console.warn(`   ⚠️ Error on ${feed.source}: ${err.message}`);
     }
   }
 

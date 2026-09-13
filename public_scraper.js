@@ -15,17 +15,47 @@ const CRAIGSLIST_FEEDS = [
   { url: 'https://sfbay.craigslist.org/search/sfc/sks?format=rss', city: 'San Francisco, CA', zip: '94102', cat: 'HANDYMAN' }
 ];
 
+async function fetchFeed(targetUrl) {
+  // Method 1: Direct fetch with residential browser headers
+  try {
+    const directRes = await axios.get(targetUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9'
+      },
+      timeout: 7000
+    });
+    if (directRes.data && !directRes.data.includes('<title>blocked</title>')) {
+      return directRes.data;
+    }
+  } catch (e) {
+    // Fallback to proxy bridge below
+  }
+
+  // Method 2: Route through proxy bridge if direct fetch is blocked
+  const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`;
+  const proxyRes = await axios.get(proxyUrl, { timeout: 10000 });
+  return proxyRes.data;
+}
+
 async function runScraperCycle() {
-  console.log(`[${new Date().toISOString()}] 🚀 Harvesting Live Craigslist Feeds...`);
+  console.log(`[${new Date().toISOString()}] 🚀 Starting Live Scraper Pipeline...`);
+  let totalIngested = 0;
 
   for (const source of CRAIGSLIST_FEEDS) {
     try {
-      const response = await axios.get(source.url, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
-      });
+      console.log(`Fetching feed: ${source.city}...`);
+      const xmlData = await fetchFeed(source.url);
 
-      const $ = cheerio.load(response.data, { xmlMode: true });
+      if (!xmlData || xmlData.includes('<title>blocked</title>')) {
+        console.error(`⚠️ Feed blocked for ${source.city}`);
+        continue;
+      }
+
+      const $ = cheerio.load(xmlData, { xmlMode: true });
       const items = $('item');
+      console.log(`Found ${items.length} work orders in ${source.city}`);
 
       for (let i = 0; i < Math.min(items.length, 3); i++) {
         const element = items[i];
@@ -55,17 +85,21 @@ async function runScraperCycle() {
           headers: {
             'Content-Type': 'application/json',
             'X-Emergency-Key': MASTER_ADMIN_KEY
-          }
+          },
+          timeout: 8000
         });
 
-        if (res.data.success) {
-          console.log(`✅ Ingested: ${res.data.sku} | ${rawTitle.substring(0, 40)}...`);
+        if (res.data && res.data.success) {
+          totalIngested++;
+          console.log(`✅ [INGESTED] ${res.data.sku} | ${rawTitle.substring(0, 35)}...`);
         }
       }
     } catch (err) {
-      console.error(`❌ Error scraping ${source.city}:`, err.response?.data || err.message);
+      console.error(`❌ Error processing ${source.city}:`, err.response?.data || err.message);
     }
   }
+
+  console.log(`\n🎉 Scraper Finished. Total Leads Loaded: ${totalIngested}`);
 }
 
 runScraperCycle();

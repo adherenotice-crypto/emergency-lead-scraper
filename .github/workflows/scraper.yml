@@ -1,9 +1,9 @@
 name: 24/7 Live Lead Scraper Engine
 
 on:
+  workflow_dispatch:
   schedule:
     - cron: '*/15 * * * *'
-  workflow_dispatch:
 
 jobs:
   scrape:
@@ -12,13 +12,8 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set Up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
       - name: Install Dependencies
-        run: npm install
+        run: npm install axios rss-parser
 
       - name: Run Live Lead Pipeline
         env:

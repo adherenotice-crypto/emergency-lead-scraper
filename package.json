@@ -1,0 +1,11 @@
+{
+  "name": "emergency-scraper",
+  "version": "1.0.0",
+  "main": "public_scraper.js",
+  "scripts": {
+    "start": "node public_scraper.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.0"
+  }
+}

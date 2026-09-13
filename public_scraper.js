@@ -1,62 +1,50 @@
 const axios = require('axios');
+const Parser = require('rss-parser');
+const parser = new Parser();
 
 const WORKER_ENDPOINT = 'https://emergencyaudit.com/api/ping';
 const MASTER_ADMIN_KEY = process.env.MASTER_ADMIN_KEY || 'SecretKey_2026_Dispatch!';
 
-// Comprehensive Multi-Platform Public Feed Array
-const MULTI_BOARD_FEEDS = [
-  // --- CRAIGSLIST FEEDS ---
-  { source: 'Craigslist', url: 'https://losangeles.craigslist.org/search/sfv/sks?format=rss', city: 'Van Nuys / SFV, CA', zip: '91401', cat: 'HANDYMAN' },
-  { source: 'Craigslist', url: 'https://losangeles.craigslist.org/search/wst/sks?format=rss', city: 'Beverly Hills, CA', zip: '90210', cat: 'HANDYMAN' },
-  { source: 'Craigslist', url: 'https://losangeles.craigslist.org/search/lgs?format=rss', city: 'Hollywood / LA, CA', zip: '90028', cat: 'HAULING' },
-  { source: 'Craigslist', url: 'https://orangecounty.craigslist.org/search/sks?format=rss', city: 'Orange County, CA', zip: '92660', cat: 'HANDYMAN' },
-
-  // --- LOCANTO LOCAL SERVICES ---
-  { source: 'Locanto', url: 'https://www.locanto.com/Services/S/', city: 'Los Angeles, CA', zip: '90012', cat: 'HANDYMAN' },
-
-  // --- CLASSIFIEDADS.COM SERVICE FEEDS ---
-  { source: 'ClassifiedAds', url: 'https://www.classifiedads.com/services-cat.xml', city: 'Greater LA Area, CA', zip: '90001', cat: 'HANDYMAN' },
-
-  // --- GEEBO LOCAL TRADE REQUESTS ---
-  { source: 'Geebo', url: 'https://geebo.com/rss/services', city: 'Southern California', zip: '90210', cat: 'HANDYMAN' }
+const TARGET_FEEDS = [
+  { source: 'Craigslist SFV', url: 'https://losangeles.craigslist.org/search/sfv/sks?format=rss', city: 'Van Nuys / SFV, CA', zip: '91401', cat: 'HANDYMAN' },
+  { source: 'Craigslist Westside', url: 'https://losangeles.craigslist.org/search/wst/sks?format=rss', city: 'Beverly Hills, CA', zip: '90210', cat: 'HANDYMAN' },
+  { source: 'Craigslist Hollywood', url: 'https://losangeles.craigslist.org/search/lgs?format=rss', city: 'Hollywood, CA', zip: '90028', cat: 'HAULING' },
+  { source: 'Craigslist OC', url: 'https://orangecounty.craigslist.org/search/sks?format=rss', city: 'Orange County, CA', zip: '92660', cat: 'HANDYMAN' }
 ];
 
-async function runMasterScraperCycle() {
-  console.log(`[${new Date().toISOString()}] 🌐 Harvesting Multi-Board Network Feeds...`);
+async function runScraperCycle() {
+  console.log(`[${new Date().toISOString()}] 🚀 Native Scraper Pipeline Active...`);
   let totalIngested = 0;
 
-  for (const item of MULTI_BOARD_FEEDS) {
+  for (const feed of TARGET_FEEDS) {
     try {
-      console.log(`[${item.source}] Harvesting feed for ${item.city}...`);
-      const apiUrl = `https://api.rss2json.com/v1/api.json?rss_url=${encodeURIComponent(item.url)}`;
-      const response = await axios.get(apiUrl, { timeout: 6000 });
+      console.log(`Fetching ${feed.source}...`);
+      const parsedFeed = await parser.parseURL(feed.url);
 
-      if (response.data && response.data.status === 'ok' && response.data.items) {
-        const posts = response.data.items;
-        console.log(` Found ${posts.length} listings on ${item.source} (${item.city})`);
+      if (parsedFeed && parsedFeed.items) {
+        console.log(` Found ${parsedFeed.items.length} items on ${feed.source}`);
 
-        for (let i = 0; i < Math.min(posts.length, 3); i++) {
-          const post = posts[i];
-          const title = post.title ? post.title.trim() : '';
-          const link = post.link || '';
-          const snippet = post.description ? post.description.replace(/<[^>]*>?/gm, '').trim() : '';
+        for (let i = 0; i < Math.min(parsedFeed.items.length, 3); i++) {
+          const item = parsedFeed.items[i];
+          const title = item.title ? item.title.trim() : '';
+          const snippet = item.contentSnippet || item.content || '';
 
           if (!title) continue;
 
           const payload = {
-            partnerId: `${item.source.toLowerCase()}_scraper`,
-            category: item.cat,
-            title_en: `[${item.source}] ${title}`,
-            title_es: `[${item.source}] ${title}`,
-            zip: item.zip,
-            city: item.city,
-            desc_en: snippet ? snippet.substring(0, 160) + '...' : `Live lead from ${item.source} (${item.city})`,
-            desc_es: snippet ? snippet.substring(0, 160) + '...' : `Solicitud en vivo de ${item.source} (${item.city})`,
+            partnerId: 'native_rss_scraper',
+            category: feed.cat,
+            title_en: title,
+            title_es: title,
+            zip: feed.zip,
+            city: feed.city,
+            desc_en: snippet ? snippet.substring(0, 150) + '...' : `Live request from ${feed.city}`,
+            desc_es: snippet ? snippet.substring(0, 150) + '...' : `Solicitud en vivo de ${feed.city}`,
             wholesaleCost: 0.00,
             retailPrice: 25.00,
-            customerName: `Verified ${item.source} Poster`,
+            customerName: 'Verified Board Poster',
             customerPhone: 'Unlocked Upon Purchase',
-            customerAddress: link
+            customerAddress: item.link || feed.url
           };
 
           const res = await axios.post(WORKER_ENDPOINT, payload, {
@@ -72,15 +60,13 @@ async function runMasterScraperCycle() {
             console.log(`   ✅ Ingested: ${res.data.sku} | ${title.substring(0, 30)}...`);
           }
         }
-      } else {
-        console.log(`   ⚠️ No active items returned for ${item.source} (${item.city})`);
       }
     } catch (err) {
-      console.error(`   ❌ Failed harvesting ${item.source} - ${item.city}:`, err.message);
+      console.error(`   ❌ Failed harvesting ${feed.source}:`, err.message);
     }
   }
 
-  console.log(`\n🎉 Multi-Board Sweep Complete! Total Leads Streamed: ${totalIngested}`);
+  console.log(`\n🎉 Cycle Complete. Leads Ingested: ${totalIngested}`);
 }
 
-runMasterScraperCycle();
+runScraperCycle();

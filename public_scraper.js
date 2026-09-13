@@ -1,9 +1,6 @@
 const axios = require('axios');
-const Parser = require('rss-parser');
-const parser = new Parser();
 
 const WORKER_ENDPOINT = 'https://emergencyaudit.com/api/ping';
-const PROXY_ENDPOINT = 'https://emergencyaudit.com/api/rss-proxy';
 const MASTER_ADMIN_KEY = process.env.MASTER_ADMIN_KEY || 'SecretKey_2026_Dispatch!';
 
 const TARGET_FEEDS = [
@@ -14,26 +11,23 @@ const TARGET_FEEDS = [
 ];
 
 async function runScraperCycle() {
-  console.log(`[${new Date().toISOString()}] 🚀 Proxy Feed Harvester Active...`);
+  console.log(`[${new Date().toISOString()}] 🚀 RSS2JSON Unblocked Engine Active...`);
   let totalIngested = 0;
 
   for (const feed of TARGET_FEEDS) {
     try {
-      console.log(`Fetching ${feed.source} via Cloudflare Edge...`);
-      
-      // Route through Cloudflare Worker proxy to bypass GitHub IP bans
-      const proxiedUrl = `${PROXY_ENDPOINT}?url=${encodeURIComponent(feed.url)}`;
-      const response = await axios.get(proxiedUrl, { timeout: 10000 });
+      console.log(`Fetching ${feed.source} via RSS2JSON...`);
+      const apiUrl = `https://api.rss2json.com/v1/api.json?rss_url=${encodeURIComponent(feed.url)}`;
+      const response = await axios.get(apiUrl, { timeout: 8000 });
 
-      const parsedFeed = await parser.parseString(response.data);
+      if (response.data && response.data.status === 'ok' && response.data.items) {
+        const items = response.data.items;
+        console.log(` Found ${items.length} items on ${feed.source}`);
 
-      if (parsedFeed && parsedFeed.items) {
-        console.log(` Found ${parsedFeed.items.length} items on ${feed.source}`);
-
-        for (let i = 0; i < Math.min(parsedFeed.items.length, 3); i++) {
-          const item = parsedFeed.items[i];
+        for (let i = 0; i < Math.min(items.length, 3); i++) {
+          const item = items[i];
           const title = item.title ? item.title.trim() : '';
-          const snippet = item.contentSnippet || item.content || '';
+          const snippet = item.description ? item.description.replace(/<[^>]*>?/gm, '').trim() : '';
 
           if (!title) continue;
 
@@ -66,13 +60,15 @@ async function runScraperCycle() {
             console.log(`   ✅ Ingested: ${res.data.sku} | ${title.substring(0, 30)}...`);
           }
         }
+      } else {
+        console.error(`   ⚠️ Response issue for ${feed.source}:`, response.data?.message || 'No items returned');
       }
     } catch (err) {
       console.error(`   ❌ Failed harvesting ${feed.source}:`, err.message);
     }
   }
 
-  console.log(`\n🎉 Multi-Site Cycle Complete. Total Leads Ingested: ${totalIngested}`);
+  console.log(`\n🎉 Cycle Complete. Total Leads Ingested: ${totalIngested}`);
   process.exit(0);
 }
 

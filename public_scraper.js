@@ -1,6 +1,7 @@
 const axios = require('axios');
 
 const WORKER_ENDPOINT = 'https://emergencyaudit.com/api/ping';
+const MASTER_ADMIN_KEY = process.env.MASTER_ADMIN_KEY || 'SecretKey_2026_Dispatch!';
 
 const TRADE_TEMPLATES = [
   { cat: 'PLUMBING', title: 'EMERGENCY MAIN SEWER LINE CLOG & BACKUP', city: 'Beverly Hills, CA', zip: '90210', desc: 'Raw sewage backing up into guest bathroom. Urgent plumber dispatch required.' },
@@ -14,7 +15,6 @@ async function runScraperCycle() {
   console.log(`[${new Date().toISOString()}] 🚀 Autonomous Work Order Generator Active...`);
   let totalIngested = 0;
 
-  // Pick 2 fresh high-intent trade leads per cycle
   const shuffled = TRADE_TEMPLATES.sort(() => 0.5 - Math.random());
   const selectedLeads = shuffled.slice(0, 2);
 
@@ -46,7 +46,8 @@ async function runScraperCycle() {
 
       const res = await axios.post(WORKER_ENDPOINT, payload, {
         headers: {
-          'Content-Type': 'application/json'
+          'Content-Type': 'application/json',
+          'X-Emergency-Key': MASTER_ADMIN_KEY
         },
         timeout: 5000
       });

@@ -1,6 +1,7 @@
 const axios = require('axios');
 
 const WORKER_ENDPOINT = 'https://emergencyaudit.com/api/ping';
+// Directly set your Cloudflare Worker MASTER_ADMIN_KEY here to bypass secret mismatch issues
 const MASTER_ADMIN_KEY = process.env.MASTER_ADMIN_KEY || 'SecretKey_2026_Dispatch!';
 
 const TRADE_TEMPLATES = [
@@ -15,7 +16,6 @@ async function runScraperCycle() {
   console.log(`[${new Date().toISOString()}] 🚀 Autonomous Work Order Generator Active...`);
   let totalIngested = 0;
 
-  // Shuffle and pick 2 fresh high-intent trade leads per cycle
   const shuffled = TRADE_TEMPLATES.sort(() => 0.5 - Math.random());
   const selectedLeads = shuffled.slice(0, 2);
 
@@ -58,7 +58,7 @@ async function runScraperCycle() {
         console.log(`   ✅ Successfully Ingested: ${res.data.sku} | ${template.title}`);
       }
     } catch (err) {
-      console.error(`   ❌ Ingestion error:`, err.message);
+      console.error(`   ❌ Ingestion error:`, err.response?.data || err.message);
     }
   }
 

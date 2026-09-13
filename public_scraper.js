@@ -1,65 +1,54 @@
 const axios = require('axios');
+const cheerio = require('cheerio');
 
 const WORKER_ENDPOINT = 'https://emergencyaudit.com/api/ping';
 const MASTER_ADMIN_KEY = process.env.MASTER_ADMIN_KEY || 'SecretKey_2026_Dispatch!';
 
-const TARGET_LOCATIONS = [
-  { zip: '90210', city: 'Beverly Hills, CA' },
-  { zip: '90401', city: 'Santa Monica, CA' },
-  { zip: '91101', city: 'Pasadena, CA' },
-  { zip: '90028', city: 'Hollywood, CA' },
-  { zip: '91201', city: 'Glendale, CA' }
+const CRAIGSLIST_FEEDS = [
+  { url: 'https://losangeles.craigslist.org/search/sfv/sks?format=rss', city: 'Van Nuys / SFV, CA', zip: '91401', cat: 'HANDYMAN' },
+  { url: 'https://losangeles.craigslist.org/search/wst/sks?format=rss', city: 'Beverly Hills / Westside, CA', zip: '90210', cat: 'HANDYMAN' },
+  { url: 'https://losangeles.craigslist.org/search/lac/sks?format=rss', city: 'Downtown LA, CA', zip: '90001', cat: 'HANDYMAN' },
+  { url: 'https://losangeles.craigslist.org/search/lgs?format=rss', city: 'Hollywood / LA, CA', zip: '90028', cat: 'HAULING' },
+  { url: 'https://orangecounty.craigslist.org/search/sks?format=rss', city: 'Newport Beach / OC, CA', zip: '92660', cat: 'HANDYMAN' },
+  { url: 'https://inlandempire.craigslist.org/search/sks?format=rss', city: 'Riverside / IE, CA', zip: '92501', cat: 'HANDYMAN' },
+  { url: 'https://sandiego.craigslist.org/search/sks?format=rss', city: 'San Diego, CA', zip: '92101', cat: 'HANDYMAN' },
+  { url: 'https://sfbay.craigslist.org/search/sfc/sks?format=rss', city: 'San Francisco, CA', zip: '94102', cat: 'HANDYMAN' }
 ];
 
 async function runScraperCycle() {
-  console.log(`[${new Date().toISOString()}] 🔍 Render Scraper Active: Harvesting Multi-City Feeds...`);
+  console.log(`[${new Date().toISOString()}] 🚀 Harvesting Live Craigslist Feeds...`);
 
-  for (const loc of TARGET_LOCATIONS) {
+  for (const source of CRAIGSLIST_FEEDS) {
     try {
-      const scrapedDrops = [
-        {
-          category: 'HANDYMAN',
-          title_en: 'Drywall Repair & Baseboard Fixing',
-          title_es: 'Reparación de Paredes y Zócalos',
-          desc_en: 'Need drywall patch in hallway and baseboards replaced.',
-          customerName: 'Verified Homeowner',
-          customerPhone: '(310) 555-0144',
-          customerAddress: '1044 Alpine Dr'
-        },
-        {
-          category: 'CLEANING',
-          title_en: 'Commercial Office Deep Cleaning',
-          title_es: 'Limpieza Profunda de Oficina Comercial',
-          desc_en: 'Weekly deep cleaning needed for 2,000 sq ft office space.',
-          customerName: 'Local Business Manager',
-          customerPhone: '(310) 555-0899',
-          customerAddress: '500 Wilshire Blvd'
-        },
-        {
-          category: 'HAULING',
-          title_en: 'Estate Furniture Removal & Junk Hauling',
-          title_es: 'Remoción de Muebles y Basura',
-          desc_en: 'Large couch, mattress, and garage boxes need removal today.',
-          customerName: 'Property Manager',
-          customerPhone: '(323) 555-0711',
-          customerAddress: '880 Sunset Blvd'
-        }
-      ];
+      const response = await axios.get(source.url, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
+      });
 
-      for (const job of scrapedDrops) {
+      const $ = cheerio.load(response.data, { xmlMode: true });
+      const items = $('item');
+
+      for (let i = 0; i < Math.min(items.length, 3); i++) {
+        const element = items[i];
+        const rawTitle = $(element).find('title').text().replace(/<!\[CDATA\[|\]\]>/g, '').trim();
+        const rawLink = $(element).find('link').text().trim();
+        const description = $(element).find('description').text().replace(/<[^>]*>?/gm, '').trim();
+
+        if (!rawTitle) continue;
+
         const payload = {
           partnerId: 'public_board_scraper',
-          category: job.category,
-          title_en: job.title_en,
-          title_es: job.title_es,
-          zip: loc.zip,
-          city: loc.city,
-          desc_en: job.desc_en,
+          category: source.cat,
+          title_en: rawTitle,
+          title_es: rawTitle,
+          zip: source.zip,
+          city: source.city,
+          desc_en: description ? description.substring(0, 150) + '...' : `Live request from ${source.city}`,
+          desc_es: description ? description.substring(0, 150) + '...' : `Solicitud en vivo de ${source.city}`,
           wholesaleCost: 0.00,
           retailPrice: 25.00,
-          customerName: job.customerName,
-          customerPhone: job.customerPhone,
-          customerAddress: job.customerAddress
+          customerName: 'Verified Board Poster',
+          customerPhone: 'Unlocked Upon Purchase',
+          customerAddress: rawLink
         };
 
         const res = await axios.post(WORKER_ENDPOINT, payload, {
@@ -70,14 +59,13 @@ async function runScraperCycle() {
         });
 
         if (res.data.success) {
-          console.log(`✅ [${job.category}] Streamed to EmergencyAudit: ${res.data.sku} (${loc.city}) -> $25 Retail`);
+          console.log(`✅ Ingested: ${res.data.sku} | ${rawTitle.substring(0, 40)}...`);
         }
       }
     } catch (err) {
-      console.error(`❌ Scraper Error in ${loc.city}:`, err.response?.data || err.message);
+      console.error(`❌ Error scraping ${source.city}:`, err.response?.data || err.message);
     }
   }
 }
 
 runScraperCycle();
-setInterval(runScraperCycle, 5 * 60 * 1000);

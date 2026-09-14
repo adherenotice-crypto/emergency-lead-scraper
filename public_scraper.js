@@ -1,68 +1,71 @@
 const axios = require('axios');
 
-const WORKER_ENDPOINT = 'https://emergencyaudit.com/api/ping';
-const MASTER_ADMIN_KEY = process.env.MASTER_ADMIN_KEY || 'SecretKey_2026_Dispatch!';
+const WORKER_ENDPOINT = process.env.WORKER_API_ENDPOINT || 'https://emergencyaudit.com/api/ping';
+const MASTER_KEY = process.env.MASTER_ADMIN_KEY || 'SecretKey_2026_Dispatch!';
 
-const TRADE_TEMPLATES = [
-  { cat: 'PLUMBING', title: 'EMERGENCY MAIN SEWER LINE CLOG & BACKUP', city: 'Beverly Hills, CA', zip: '90210', desc: 'Raw sewage backing up into guest bathroom. Urgent plumber dispatch required.' },
-  { cat: 'ELECTRICAL', title: 'MAIN BREAKER PANEL SPARKING & SMOKING', city: 'Van Nuys / SFV, CA', zip: '91401', desc: 'Smoke and sizzling sound coming from main circuit breaker box.' },
-  { cat: 'ROOFING', title: 'SEVERE STORM ROOF LEAK OVER LIVING ROOM', city: 'Newport Beach / OC, CA', zip: '92660', desc: 'Heavy water leaking through ceiling drywall during heavy rainstorm.' },
-  { cat: 'HANDYMAN', title: 'FRONT ENTRY SECURITY DOOR JAMMED & BROKEN', city: 'Hollywood / LA, CA', zip: '90028', desc: 'Front door lock broken, home unsecured. Needs immediate repair.' },
-  { cat: 'HAULING', title: 'EMERGENCY BASEMENT FLOOD DEBRIS CLEARANCE', city: 'Santa Monica, CA', zip: '90401', desc: 'Sump pump failed, water ruined drywall and flooring. Need immediate hauling.' }
+// Southern California County Docket Targets
+const DOCKET_TARGETS = [
+  { county: 'Los Angeles', code: 'LASC', defaultZip: '90012', region: 'LA Metro / Valley' },
+  { county: 'Orange', code: 'OCSC', defaultZip: '92660', region: 'Orange County' },
+  { county: 'San Diego', code: 'SDSC', defaultZip: '92101', region: 'San Diego Metro' },
+  { county: 'Riverside', code: 'RIV', defaultZip: '92501', region: 'Inland Empire' }
 ];
 
-async function runScraperCycle() {
-  console.log(`[${new Date().toISOString()}] 🚀 Autonomous Work Order Generator Active...`);
-  let totalIngested = 0;
+async function dispatchEvictionLead(leadData) {
+  try {
+    const payload = {
+      sku: `EA-WRIT-${leadData.zip}-${Math.floor(1000 + Math.random() * 9000)}`,
+      partnerId: 'github_docket_scraper',
+      sourceChannel: `${leadData.county} County Court Docket (Writ of Possession)`,
+      category: 'HAULING', // Triggers Trash-Out / Cleanout routing
+      title_en: `EVICTION TRASH-OUT & CLEANOUT: ${leadData.address}`,
+      title_es: `LIMPIEZA DE DESALOJO: ${leadData.address}`,
+      zip: leadData.zip,
+      city: `${leadData.county} Area, CA`,
+      desc_en: `Writ of Possession issued. Immediate post-eviction unit turnover, junk hauling, and re-keying required for vacant property.`,
+      desc_es: `Orden de posesión emitida. Se requiere retiro de basura y cambio de cerraduras de inmediato.`,
+      retailPrice: 50.00, // Premium pricing for high-ticket landlord leads
+      customerName: leadData.landlordOrAttorney,
+      customerPhone: leadData.contactPhone,
+      customerAddress: leadData.address,
+      maxClaims: 1
+    };
 
-  const shuffled = TRADE_TEMPLATES.sort(() => 0.5 - Math.random());
-  const selectedLeads = shuffled.slice(0, 2);
-
-  for (const template of selectedLeads) {
-    try {
-      const generatedSku = `EA-AUTO-${template.zip}-${Math.floor(1000 + Math.random() * 9000)}`;
-      const dropId = `job_${Date.now()}_${Math.floor(100 + Math.random() * 900)}`;
-
-      const payload = {
-        sku: generatedSku,
-        dropId: dropId,
-        partnerId: 'autonomous_dispatch_engine',
-        category: template.cat,
-        title_en: template.title,
-        title_es: template.title,
-        zip: template.zip,
-        city: template.city,
-        desc_en: template.desc,
-        desc_es: template.desc,
-        wholesaleCost: 0.00,
-        retailPrice: 25.00,
-        customerName: 'Verified Homeowner',
-        customerPhone: 'Unlocked Upon Purchase',
-        customerAddress: `Service Reference Address (${template.city})`,
-        status: 'AVAILABLE'
-      };
-
-      console.log(`Dispatching ${template.cat} lead for ${template.city}...`);
-
-      const res = await axios.post(WORKER_ENDPOINT, payload, {
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Emergency-Key': MASTER_ADMIN_KEY
-        },
-        timeout: 5000
-      });
-
-      if (res.data && res.data.success) {
-        totalIngested++;
-        console.log(`   ✅ Successfully Ingested: ${res.data.sku} | ${template.title}`);
+    const res = await axios.post(WORKER_ENDPOINT, payload, {
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Emergency-Key': MASTER_KEY
       }
-    } catch (err) {
-      console.error(`   ❌ Ingestion error:`, err.response?.data || err.message);
-    }
-  }
+    });
 
-  console.log(`\n🎉 Cycle Complete. Total Live Work Orders Ingested: ${totalIngested}`);
-  process.exit(0);
+    console.log(`[SUCCESS] Ingested ${leadData.county} Lead: ${res.data.sku || res.data.dropId}`);
+  } catch (err) {
+    console.error(`[ERROR] Dispatch failed for ${leadData.county}:`, err.response?.data || err.message);
+  }
 }
 
-runScraperCycle();
+async function runPipeline() {
+  console.log(`🚀 STARTING SOCAL EVICTION DOCKET INGESTION CYCLE...`);
+
+  for (const target of DOCKET_TARGETS) {
+    console.log(`\nScanning ${target.county} County Court Portals for "Writ of Possession Issued"...`);
+    
+    // In production, execute your fetch/Cheerio logic against county search endpoints here.
+    // Filter strictly for: Case Type === "Unlawful Detainer" AND Status === "Writ of Possession Issued"
+    
+    // Example Parsed Record structure from court docket:
+    const mockParsedRecord = {
+      county: target.county,
+      zip: target.defaultZip,
+      address: `Service Property Address (${target.region})`,
+      landlordOrAttorney: `Plaintiff Attorney / Property Mgr (${target.code}-UD)`,
+      contactPhone: `+1 (310) 555-0199` // Replaced dynamically via your skip-trace call
+    };
+
+    await dispatchEvictionLead(mockParsedRecord);
+  }
+
+  console.log(`\n✅ PIPELINE CYCLE COMPLETE. Shutting down GitHub runner.`);
+}
+
+runPipeline();

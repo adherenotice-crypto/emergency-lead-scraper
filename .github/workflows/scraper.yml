@@ -1,29 +1,32 @@
-name: 24/7 SoCal Eviction Lead Scraper Engine
+name: SoCal Courthouse Writ Scraper
 
 on:
   schedule:
-    # Runs every 2 hours (00:00, 02:00, 04:00, etc.)
-    - cron: '0 */2 * * *'
-  workflow_dispatch: # Allows manual run button in Actions tab
+    # 13:00 UTC = 6:00 AM PDT | 01:00 UTC = 6:00 PM PDT
+    - cron: '0 1,13 * * *'
+  workflow_dispatch: # Allows 1-click manual runs anytime
 
 jobs:
   scrape-and-dispatch:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Source Code
-        uses: actions/checkout@v3
+      - name: Check out Repository
+        uses: actions/checkout@v4
 
-      - name: Setup Node.js Runtime
-        uses: actions/setup-node@v3
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          node-version: '18'
+          python-version: '3.10'
 
-      - name: Install Dependencies
-        run: npm install axios cheerio
+      - name: Install Scraper Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 playwright
+          playwright install chromium
 
-      - name: Execute SoCal Eviction Docket Pipeline
+      - name: Execute Court Scraper Pipeline
         env:
-          WORKER_API_ENDPOINT: "https://emergencyaudit.com/api/ping"
-          MASTER_ADMIN_KEY: ${{ secrets.MASTER_ADMIN_KEY }}
-        run: node public_scraper.js
+          WORKER_ENDPOINT: "https://emergencyaudit.com/api/ping"
+          EMERGENCY_KEY: ${{ secrets.EMERGENCY_KEY }}
+        run: python scraper.py

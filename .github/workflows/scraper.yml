@@ -1,21 +1,29 @@
-name: 24/7 Live Lead Scraper Engine
+name: 24/7 SoCal Eviction Lead Scraper Engine
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: '*/15 * * * *'
+    # Runs every 2 hours (00:00, 02:00, 04:00, etc.)
+    - cron: '0 */2 * * *'
+  workflow_dispatch: # Allows manual run button in Actions tab
 
 jobs:
-  scrape:
+  scrape-and-dispatch:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      - name: Checkout Source Code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js Runtime
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
 
       - name: Install Dependencies
-        run: npm install axios rss-parser
+        run: npm install axios cheerio
 
-      - name: Run Live Lead Pipeline
+      - name: Execute SoCal Eviction Docket Pipeline
         env:
+          WORKER_API_ENDPOINT: "https://emergencyaudit.com/api/ping"
           MASTER_ADMIN_KEY: ${{ secrets.MASTER_ADMIN_KEY }}
         run: node public_scraper.js

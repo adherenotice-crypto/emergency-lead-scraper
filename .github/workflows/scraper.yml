@@ -2,8 +2,8 @@ name: SoCal Courthouse Writ Scraper
 
 on:
   schedule:
-    - cron: '0 */6 * * *' # Runs automated feed sweep every 6 hours
-  workflow_dispatch: # Enables manual execution button in Actions tab
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
 
 jobs:
   scrape-and-dispatch:
@@ -18,15 +18,16 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install Scraper Dependencies
+      - name: Install Dependencies & Chromium Binaries
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 playwright
-          playwright install chromium --with-deps
+          pip install requests beautifulsoup4 playwright playwright-stealth
+          playwright install --with-deps chromium
 
-      - name: Execute Court Scraper Pipeline
+      - name: Execute Stealth Scraper Pipeline
         env:
           EMERGENCY_KEY: ${{ secrets.EMERGENCY_KEY }}
           MASTER_ADMIN_KEY: ${{ secrets.MASTER_ADMIN_KEY }}
           API_URL: "https://emergencyaudit.com/api/ping"
+          PROXY_SERVER: ${{ secrets.PROXY_SERVER }} # Optional: Pass residential proxy if available
         run: python scraper.py

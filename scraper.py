@@ -22,7 +22,7 @@ HEADERS = {
 APOLLO_MATCH_URL = "https://api.apollo.io/v1/people/match"
 ENRICHMENT_CACHE = {}
 
-# STRICT JUNK FILTER: Drop auctions, trustee sales, name changes, and general notices
+# STRICT JUNK FILTER: Drops auctions, trustee sales, and name changes
 JUNK_NOTICE_FILTER = [
     "change of name", "fictitious business", "notice to creditors", 
     "order to show cause", "probate", "statement of abandonment",
@@ -73,7 +73,7 @@ REAL_DATA_FEEDS = [
 ]
 
 async def run_real_lead_scraper():
-    print("[*] Launching High-Intent Eviction Pipeline...", flush=True)
+    print("[*] Launching Flexible Intent Eviction Pipeline...", flush=True)
     total_posted = 0
 
     async with async_playwright() as p:
@@ -109,8 +109,9 @@ async def run_real_lead_scraper():
                     if any(junk in context_window for junk in JUNK_NOTICE_FILTER):
                         continue
 
-                    # 2. Strict Intent Check: Must explicitly look like an active eviction/writ
-                    if not any(k in context_window for k in ["writ of possession", "unlawful detainer", "notice to vacate", "eviction judgment", "sheriff lockout"]):
+                    # 2. Flexible Intent Check: Must contain at least one core eviction term
+                    intent_keywords = ["writ", "possession", "eviction", "vacate", "unlawful", "detainer", "sheriff", "tenant"]
+                    if not any(k in context_window for k in intent_keywords):
                         continue
 
                     # 3. ABSOLUTE ADDRESS REQUIREMENT: Drop immediately if no clean street address exists

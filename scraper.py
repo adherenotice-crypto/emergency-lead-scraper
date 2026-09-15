@@ -8,6 +8,9 @@ from playwright.async_api import async_playwright
 
 os.environ["PYTHONUNBUFFERED"] = "1"
 
+# ----------------------------------------------------------------------
+# CLOUDFLARE DISPATCH API CONFIGURATION
+# ----------------------------------------------------------------------
 API_URL = os.getenv("API_URL", "https://emergencyaudit.com/api/ping")
 SECURITY_KEY = (
     os.getenv("EMERGENCY_KEY")
@@ -20,7 +23,9 @@ HEADERS = {
     "X-Emergency-Key": SECURITY_KEY
 }
 
-# Strict extraction regex
+# ----------------------------------------------------------------------
+# STRICT EXTRACTION REGEX PATTERNS
+# ----------------------------------------------------------------------
 CASE_REGEX = re.compile(r'\b(2[0-6][A-Z0-9]{2,4}UD[0-9]{4,8}|UD-[0-9]{5,10}|[0-9]{2}SUD[0-9]{4,6})\b', re.I)
 ADDRESS_REGEX = re.compile(r'\b\d{1,5}\s+[A-Za-z0-9\s.,]+(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Boulevard|Dr|Drive|Way|Ct|Court|Ln|Lane)\b', re.I)
 PHONE_REGEX = re.compile(r'\b(?:\+?1[-. ]?)?\(?([2-9][0-9]{2})\)?[-. ]?([2-9][0-9]{2})[-. ]?([0-9]{4})\b')
@@ -76,7 +81,7 @@ def clean_email(email_str):
     return None
 
 async def run_court_search_scraper():
-    print("[*] Launching Interactive Court Search Engine...", flush=True)
+    print("[*] Launching Synchronized Court Search Engine...", flush=True)
     total_posted = 0
 
     launch_args = [
@@ -98,6 +103,7 @@ async def run_court_search_scraper():
             page = await context.new_page()
             page.set_default_timeout(12000)
 
+            # Mask bot flags
             await page.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
                 window.chrome = { runtime: {} };
@@ -107,13 +113,18 @@ async def run_court_search_scraper():
                 await page.goto(portal["url"], wait_until="domcontentloaded", timeout=12000)
                 await asyncio.sleep(2)
 
-                # Form interaction: Find search box and submit query
+                # Form interaction: Find input box, enter search term, and await redirect safely
                 search_box = await page.query_selector("input[type='text'], input[type='search'], input[id*='search'], input[name*='case']")
                 if search_box:
                     await search_box.fill("Writ of Possession")
-                    await page.keyboard.press("Enter")
-                    await asyncio.sleep(3)
+                    try:
+                        async with page.expect_navigation(wait_until="domcontentloaded", timeout=8000):
+                            await page.keyboard.press("Enter")
+                    except Exception:
+                        await asyncio.sleep(3)
 
+                # Wait for any background page navigations to settle completely
+                await page.wait_for_load_state("domcontentloaded")
                 html = await page.content()
                 soup = BeautifulSoup(html, "html.parser")
                 blocks = soup.find_all(["tr", "div", "li", "p"])
@@ -125,7 +136,7 @@ async def run_court_search_scraper():
                     case_match = CASE_REGEX.search(raw_text)
                     addr_match = ADDRESS_REGEX.search(raw_text)
 
-                    # Strict Guard: Requires both real case # and street address
+                    # STRICT GUARD: Skip unless BOTH a real case number AND real street address exist
                     if not case_match or not addr_match:
                         continue
 

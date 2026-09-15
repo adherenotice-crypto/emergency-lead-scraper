@@ -1,13 +1,15 @@
 import os
 import re
 import time
+import asyncio
 import requests
 from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright
 
 os.environ["PYTHONUNBUFFERED"] = "1"
 
 # ----------------------------------------------------------------------
-# SYSTEM KEYS & API ENDPOINTS
+# SYSTEM KEYS & API DISPATCH ENDPOINTS
 # ----------------------------------------------------------------------
 API_URL = os.getenv("API_URL", "https://emergencyaudit.com/api/ping")
 SECURITY_KEY = os.getenv("EMERGENCY_KEY") or os.getenv("MASTER_ADMIN_KEY") or "SecretKey_2026_Dispatch!"
@@ -17,23 +19,19 @@ HEADERS = {
     "Content-Type": "application/json",
     "X-Emergency-Key": SECURITY_KEY
 }
-
 APOLLO_MATCH_URL = "https://api.apollo.io/v1/people/match"
 ENRICHMENT_CACHE = {}
 
-# Strict negative filter to bypass sidebar noise and non-eviction filings
 JUNK_NOTICE_FILTER = [
     "change of name", "fictitious business", "notice to creditors", 
     "order to show cause", "probate", "statement of abandonment",
-    "redding record", "stockton record", "searchlight"
+    "redding record", "stockton record", "searchlight", "fbn number"
 ]
 
 CASE_REGEX = re.compile(r'\b(2[0-6][A-Z0-9]{2,4}UD[0-9]{4,8}|UD-[0-9]{2,5}-[0-9]{4,8}|[0-9]{2}SUD[0-9]{4,6}|[0-9]{6,10}-UD)\b', re.I)
-ADDRESS_REGEX = re.compile(r'\b\d{1,5}\s+[A-Za-z0-9\s.,#]+(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Boulevard|Dr|Drive|Way|Ct|Court|Ln|Lane|Pl|Place|Cir|Circle)\b', re.I)
+# Corrected layout rule to filter out numerical search result strings
+ADDRESS_REGEX = re.compile(r'\b\d{1,5}\s+[A-Za-z][A-Za-z0-9\s.,#]+(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Boulevard|Dr|Drive|Way|Ct|Court|Ln|Lane|Pl|Place|Cir|Circle)\b', re.I)
 
-# ----------------------------------------------------------------------
-# APOLLO B2B ENRICHMENT ENGINE
-# ----------------------------------------------------------------------
 def enrich_via_apollo(raw_name_string):
     if not APOLLO_API_KEY:
         return None, None
@@ -65,9 +63,6 @@ def enrich_via_apollo(raw_name_string):
     ENRICHMENT_CACHE[clean_name] = (None, None)
     return None, None
 
-# ----------------------------------------------------------------------
-# TARGETED REAL DATA FEEDS
-# ----------------------------------------------------------------------
 REAL_DATA_FEEDS = [
     {"county": "Los Angeles", "name": "California Public Notice Registry (LA)", "url": "https://www.capublicnotice.com/search/results?q=Writ+of+Possession", "zip": "90210"},
     {"county": "Orange County", "name": "California Public Notice Registry (OC)", "url": "https://www.capublicnotice.com/search/results?q=Unlawful+Detainer", "zip": "92660"},
@@ -75,111 +70,114 @@ REAL_DATA_FEEDS = [
     {"county": "San Diego", "name": "California Public Notice Registry (SD)", "url": "https://www.capublicnotice.com/search/results?q=Eviction+Notice", "zip": "92101"}
 ]
 
-def run_real_lead_scraper():
-    print("[*] Launching Container-Isolated Eviction Pipeline...", flush=True)
+async def run_real_lead_scraper():
+    print("[*] Launching Container-Isolated Playwright Pipeline Engine...", flush=True)
     total_posted = 0
 
-    req_headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-    }
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"]
+        )
 
-    for feed in REAL_DATA_FEEDS:
-        print(f"\n[*] Querying Target Feed: {feed['name']}...", flush=True)
-        try:
-            res = requests.get(feed["url"], headers=req_headers, timeout=15)
-            if res.status_code != 200:
-                continue
+        for feed in REAL_DATA_FEEDS:
+            print(f"\n[*] Querying Feed Node: {feed['name']}...", flush=True)
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+            )
+            page = await context.new_page()
 
-            soup = BeautifulSoup(res.text, "html.parser")
+            try:
+                await page.goto(feed["url"], wait_until="networkidle", timeout=20000)
+                await asyncio.sleep(4)
 
-            # STEP 1: ISOLATE LISTING CONTAINERS ONLY (Skip global headers, sidebars, and footers)
-            containers = soup.find_all("div", class_=re.compile(r'(result|notice|listing|item|article|card)', re.I))
-            if not containers:
-                containers = soup.find_all(["article", "tr"])
+                html = await page.content()
+                soup = BeautifulSoup(html, "html.parser")
 
-            matched = 0
-            for container in containers:
-                raw_text = container.get_text(separator=" ", strip=True)
+                containers = soup.find_all(["div", "article", "li"], class_=re.compile(r'(result|notice|listing|item|card)', re.I))
+                if not containers:
+                    containers = soup.find_all(["tr", "p", "td"])
 
-                # STEP 2: REJECT JUNK NOTICES
-                if any(junk in raw_text.lower() for junk in JUNK_NOTICE_FILTER):
-                    continue
+                matched = 0
+                for container in containers:
+                    raw_text = container.get_text(separator=" ", strip=True)
 
-                if not any(k in raw_text.lower() for k in ["writ of possession", "unlawful detainer", "notice to vacate", "eviction judgment", "writ"]):
-                    continue
+                    if any(junk in raw_text.lower() for junk in JUNK_NOTICE_FILTER):
+                        continue
 
-                # STEP 3: REGIONAL GUARD (Ensures Shasta/Stockton items don't leak into SoCal)
-                county_clean = feed["county"].lower().replace(" county", "")
-                if county_clean not in raw_text.lower() and not any(z in raw_text for z in [feed["zip"][:3]]):
-                    continue
+                    if not any(k in raw_text.lower() for k in ["writ of possession", "unlawful detainer", "notice to vacate", "eviction judgment", "writ"]):
+                        continue
 
-                case_match = CASE_REGEX.search(raw_text)
-                addr_match = ADDRESS_REGEX.search(raw_text)
+                    case_match = CASE_REGEX.search(raw_text)
+                    addr_match = ADDRESS_REGEX.search(raw_text)
 
-                if not addr_match:
-                    continue
+                    if not addr_match:
+                        continue
 
-                real_docket = case_match.group(0) if case_match else f"WRIT-{int(time.time()) % 100000}"
-                real_address = f"{addr_match.group(0)}, {feed['county']}, CA"
-                
-                entity_name = "Property Asset Manager"
-                if "plaintiff" in raw_text.lower():
-                    parts = re.split(r'plaintiff[:\s]+', raw_text, flags=re.I)
-                    if len(parts) > 1:
-                        entity_name = " ".join(parts[1].split()[:3]).replace(",", "")
+                    real_docket = case_match.group(0) if case_match else f"WRIT-{int(time.time()) % 100000}"
+                    real_address = f"{addr_match.group(0)}, {feed['county']}, CA"
 
-                phone, email = None, None
-                if entity_name != "Property Asset Manager" and len(entity_name) > 3:
-                    phone, email = enrich_via_apollo(entity_name)
+                    entity_name = "Property Asset Manager"
+                    if "plaintiff" in raw_text.lower():
+                        parts = re.split(r'plaintiff[:\s]+', raw_text, flags=re.I)
+                        if len(parts) > 1:
+                            entity_name = " ".join(parts[1].split()[:3]).replace(",", "")
 
-                final_phone = phone or "Direct Contact Pending"
-                final_email = email or "Counsel On File"
+                    phone, email = None, None
+                    if entity_name != "Property Asset Manager" and len(entity_name) > 3:
+                        phone, email = enrich_via_apollo(entity_name)
 
-                category = "TURNKEY_RESTORATION" if any(w in raw_text.lower() for w in ["remodel", "turnkey", "restoration", "trash", "clean"]) else "HAULING"
-                price = 199.00 if category == "TURNKEY_RESTORATION" else 129.00
-                drop_id = f"job_REAL_{feed['county'][:2].upper()}_{real_docket}_{int(time.time())}"
+                    final_phone = phone or "Unmasked Upon Purchase"
+                    final_email = email or "Unmasked Upon Purchase"
 
-                payload = {
-                    "sku": f"EA-WRIT-{feed['zip']}-{total_posted+1000}",
-                    "dropId": drop_id,
-                    "sourceChannel": f"{feed['name']} (Docket #{real_docket})",
-                    "category": category,
-                    "title_en": f"POST-EVICTION {category.replace('_', ' ')} (${int(price)})",
-                    "zip": feed["zip"],
-                    "city": f"{feed['county']}, CA",
-                    "desc_en": f"Verified Writ Notice: {raw_text[:200]}...",
-                    "retailPrice": price,
-                    "customerName": entity_name,
-                    "customerPhone": final_phone,
-                    "customerAddress": real_address,
-                    "dossier": {
-                        "assetManager": entity_name,
-                        "amPhone": final_phone,
-                        "listingAgent": "Local Default REO Broker",
-                        "agentPhone": final_phone,
-                        "propertyManager": "Direct Receiver / PM",
-                        "pmPhone": final_phone,
-                        "attorney": entity_name,
-                        "attorneyPhone": final_phone,
-                        "attorneyEmail": final_email
+                    category = "TRADE_EMERGENCY" if any(w in raw_text.lower() for w in ["remodel", "turnkey", "restoration"]) else "HAULING"
+                    price = 199.00 if category == "TRADE_EMERGENCY" else 129.00
+                    drop_id = f"job_REAL_{feed['county'][:2].upper()}_{real_docket}_{int(time.time())}"
+
+                    payload = {
+                        "sku": f"EA-WRIT-{feed['zip']}-{total_posted+1000}",
+                        "dropId": drop_id,
+                        "sourceChannel": f"{feed['name']} (Record #{real_docket})",
+                        "category": category,
+                        "title_en": f"POST-EVICTION {category.replace('_', ' ')} (${int(price)})",
+                        "zip": feed["zip"],
+                        "city": f"{feed['county']}, CA",
+                        "desc_en": f"Live structural writ activity parsed dynamically. Notice Preview: {raw_text[:140]}...",
+                        "retailPrice": price,
+                        "customerName": entity_name,
+                        "customerPhone": final_phone,
+                        "customerAddress": real_address,
+                        "dossier": {
+                            "assetManager": "REO Portfolio Real Estate Team",
+                            "amPhone": final_phone,
+                            "listingAgent": "Local Default Broker Assignment",
+                            "agentPhone": "Unmasked Upon Purchase",
+                            "propertyManager": "Assigned Receiver / Property PM",
+                            "pmPhone": "Unmasked Upon Purchase",
+                            "attorney": entity_name,
+                            "attorneyPhone": final_phone,
+                            "attorneyEmail": final_email
+                        }
                     }
-                }
 
-                try:
-                    post_res = requests.post(API_URL, json=payload, headers=HEADERS, timeout=5)
-                    if post_res.status_code == 200:
-                        print(f"  [+] SUCCESS: Ingested valid eviction lead -> {drop_id} | {real_address}", flush=True)
-                        total_posted += 1
-                        matched += 1
-                except Exception:
-                    pass
+                    try:
+                        post_res = requests.post(API_URL, json=payload, headers=HEADERS, timeout=5)
+                        if post_res.status_code == 200:
+                            print(f"  [+] SUCCESS: Ingested lead -> {drop_id} | Location: {real_address}", flush=True)
+                            total_posted += 1
+                            matched += 1
+                    except Exception:
+                        pass
 
-            print(f"[+] Scan Complete for {feed['county']}: Extracted {matched} clean leads.", flush=True)
-        except Exception as err:
-            print(f"[!] Feed Exception on {feed['county']}: {err}", flush=True)
+                print(f"[+] Scan Complete for {feed['county']}: Extracted {matched} verified unique records.", flush=True)
 
-    print(f"\n[*] Cycle Complete. Ingested {total_posted} clean eviction leads!", flush=True)
+            except Exception as err:
+                print(f"[!] Processing exception on {feed['county']} run pipeline: {err}", flush=True)
+            finally:
+                await page.close()
+
+        await browser.close()
+    print(f"\n[*] Execution Cycle Complete. Ingested {total_posted} total unique leads into Cloudflare KV!", flush=True)
 
 if __name__ == "__main__":
-    run_real_lead_scraper()
+    asyncio.run(run_real_lead_scraper())

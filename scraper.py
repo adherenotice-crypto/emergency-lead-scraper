@@ -6,7 +6,6 @@ import asyncio
 import requests
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
-from playwright_stealth import stealth_async
 
 os.environ["PYTHONUNBUFFERED"] = "1"
 
@@ -16,7 +15,6 @@ SECURITY_KEY = (
     or os.getenv("MASTER_ADMIN_KEY")
     or "SecretKey_2026_Dispatch!"
 )
-PROXY_SERVER = os.getenv("PROXY_SERVER") # e.g. "http://user:pass@proxy.example.com:8080"
 
 HEADERS = {
     "Content-Type": "application/json",
@@ -77,7 +75,7 @@ COURT_PORTALS = {
 }
 
 async def run_stealth_scraper():
-    print("[*] Launching Stealth Engine with WAF Evasion...", flush=True)
+    print("[*] Launching Native Stealth Engine with WAF Evasion...", flush=True)
     total_posted = 0
 
     launch_args = [
@@ -89,13 +87,10 @@ async def run_stealth_scraper():
         "--ignore-certificate-errors"
     ]
 
-    proxy_config = {"server": PROXY_SERVER} if PROXY_SERVER else None
-
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=launch_args,
-            proxy=proxy_config
+            args=launch_args
         )
 
         for code, portal in COURT_PORTALS.items():
@@ -109,28 +104,23 @@ async def run_stealth_scraper():
             )
             
             page = await context.new_page()
-            page.set_default_timeout(12000)
+            page.set_default_timeout(10000)
 
-            # Apply Playwright Stealth Evasion
-            await stealth_async(page)
+            # Native Chromium bot mask bypass
+            await page.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                window.chrome = { runtime: {} };
+            """)
 
             try:
-                # Navigate and await network DOM load
-                await page.goto(portal["url"], wait_until="domcontentloaded", timeout=12000)
-                await asyncio.sleep(2)
-
-                # Attempt non-blocking search interaction
-                search_input = await page.query_selector("input[type='text'], input[type='search']")
-                if search_input:
-                    await search_input.type("Unlawful Detainer", delay=100)
-                    await page.keyboard.press("Enter")
-                    await asyncio.sleep(2)
+                await page.goto(portal["url"], wait_until="domcontentloaded", timeout=10000)
+                await asyncio.sleep(1.5)
 
                 html = await page.content()
                 soup = BeautifulSoup(html, "html.parser")
                 rows = soup.find_all(["tr", "div", "li"], class_=re.compile(r'(case|docket|row|result)', re.I))
 
-                print(f"[+] Scanned {len(rows)} nodes on {code} via Stealth Context.", flush=True)
+                print(f"[+] Scanned {len(rows)} nodes on {code} via Native Stealth Context.", flush=True)
 
                 for idx, row in enumerate(rows[:2]):
                     raw_text = row.get_text(separator=" ", strip=True)
@@ -181,14 +171,14 @@ async def run_stealth_scraper():
                         total_posted += 1
 
             except Exception as err:
-                print(f"[!] Stealth Exception ({code}): {err}", flush=True)
+                print(f"[!] Exception ({code}): {err}", flush=True)
             finally:
                 await page.close()
                 await context.close()
 
         await browser.close()
 
-    print(f"[*] Complete. Ingested {total_posted} stealth-cleared court leads into Cloudflare KV!", flush=True)
+    print(f"[*] Complete. Ingested {total_posted} native-cleared court leads into Cloudflare KV!", flush=True)
 
 if __name__ == "__main__":
     asyncio.run(run_stealth_scraper())

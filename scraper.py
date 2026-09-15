@@ -58,7 +58,7 @@ REAL_DATA_FEEDS = [
 ]
 
 async def run_real_lead_scraper():
-    print("[*] Launching Direct-Target Playwright Pipeline...", flush=True)
+    print("[*] Launching DOM-Injection Playwright Pipeline...", flush=True)
     total_posted = 0
 
     async with async_playwright() as p:
@@ -69,18 +69,31 @@ async def run_real_lead_scraper():
 
         for feed in REAL_DATA_FEEDS:
             print(f"\n[*] Querying Feed Node: {feed['name']}...", flush=True)
-            context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 800}
+            )
             page = await context.new_page()
 
             try:
                 await page.goto("https://www.capublicnotice.com/", wait_until="networkidle", timeout=25000)
                 await asyncio.sleep(3)
 
-                # Direct interaction using the exact ID discovered in the logs
-                await page.fill("#_keywords_id_all", feed["query"])
-                await page.press("#_keywords_id_all", "Enter")
-                print(f"  [+] Successfully filled and submitted query: '{feed['query']}'", flush=True)
-                await asyncio.sleep(7) # Wait for results table to render
+                # BYPASS UI FILL: Execute raw JavaScript to set value and submit form instantly
+                await page.evaluate("""(searchQuery) => {
+                    const inputs = document.querySelectorAll('input[name="keywords"]');
+                    for (let input of inputs) {
+                        input.value = searchQuery;
+                        const form = input.closest('form');
+                        if (form) {
+                            form.submit();
+                            return;
+                        }
+                    }
+                }""", feed["query"])
+                
+                print(f"  [+] Injected query via DOM: '{feed['query']}'", flush=True)
+                await asyncio.sleep(8) # Allow results grid to render
 
                 soup = BeautifulSoup(await page.content(), "html.parser")
                 for widget in soup(["script", "style", "nav", "footer", "header"]):
@@ -162,7 +175,7 @@ async def run_real_lead_scraper():
                             print(f"  [+] SUCCESS: Ingested lead -> {drop_id} | Location: {real_address}", flush=True)
                             total_posted += 1
                             matched += 1
-                            if matched >= 5: # Cap at 5 per feed for verification
+                            if matched >= 5:
                                 break
                     except Exception:
                         pass

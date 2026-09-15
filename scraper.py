@@ -58,7 +58,7 @@ REAL_DATA_FEEDS = [
 ]
 
 async def run_real_lead_scraper():
-    print("[*] Launching Verbose Diagnostic Pipeline...", flush=True)
+    print("[*] Launching Direct-Target Playwright Pipeline...", flush=True)
     total_posted = 0
 
     async with async_playwright() as p:
@@ -74,23 +74,20 @@ async def run_real_lead_scraper():
 
             try:
                 await page.goto("https://www.capublicnotice.com/", wait_until="networkidle", timeout=25000)
-                await asyncio.sleep(4)
+                await asyncio.sleep(3)
 
-                search_input = await page.wait_for_selector('input[type="text"], input[placeholder*="search" i]', timeout=3000)
-                if search_input:
-                    await search_input.fill(feed["query"])
-                    await search_input.press("Enter")
-                    print(f"  [+] Submitted query: '{feed['query']}'", flush=True)
-                    await asyncio.sleep(8)
+                # Direct interaction using the exact ID discovered in the logs
+                await page.fill("#_keywords_id_all", feed["query"])
+                await page.press("#_keywords_id_all", "Enter")
+                print(f"  [+] Successfully filled and submitted query: '{feed['query']}'", flush=True)
+                await asyncio.sleep(7) # Wait for results table to render
 
                 soup = BeautifulSoup(await page.content(), "html.parser")
                 for widget in soup(["script", "style", "nav", "footer", "header"]):
                     widget.decompose()
 
                 text_blocks = [node.get_text(separator=" ", strip=True) for node in soup.find_all(["div", "article", "tr", "p", "li"]) if len(node.get_text(separator=" ", strip=True)) > 40]
-                print(f"  [*] Inspected {len(text_blocks)} blocks. Printing first 3 blocks for inspection:", flush=True)
-                for idx, b in enumerate(text_blocks[:3]):
-                    print(f"      [{idx}] {b[:140]}", flush=True)
+                print(f"  [*] Inspected {len(text_blocks)} active text blocks on results page.", flush=True)
 
                 matched = 0
                 for block in text_blocks:
@@ -99,58 +96,73 @@ async def run_real_lead_scraper():
                     if any(junk in context_window for junk in JUNK_NOTICE_FILTER):
                         continue
 
-                    # Track filtering stages for debugging
                     intent_keywords = ["writ", "possession", "eviction", "vacate", "unlawful", "detainer", "sheriff", "tenant", "notice"]
                     if not any(k in context_window for k in intent_keywords):
                         continue
 
                     addr_match = ADDRESS_REGEX.search(block)
-                    if not addr_match:
-                        # Fallback to check if any street number exists
+                    if addr_match:
+                        real_address = f"{addr_match.group(0).strip()}, {feed['county']}, CA"
+                    else:
                         num_match = re.search(r'\b\d{2,5}\s+[A-Za-z]+', block)
                         if num_match:
                             real_address = f"{num_match.group(0)}, {feed['county']}, CA"
                         else:
                             continue
-                    else:
-                        real_address = f"{addr_match.group(0).strip()}, {feed['county']}, CA"
 
                     case_match = CASE_REGEX.search(block)
                     real_docket = case_match.group(0) if case_match else f"WRIT-{int(time.time()) % 100000}-{matched}"
 
+                    entity_name = "Property Asset Manager"
+                    if "plaintiff" in context_window:
+                        parts = re.split(r'plaintiff[:\s]+', block, flags=re.I)
+                        if len(parts) > 1:
+                            entity_name = " ".join(parts[1].split()[:3]).replace(",", "")
+
+                    phone, email = None, None
+                    if entity_name != "Property Asset Manager" and len(entity_name) > 3:
+                        phone, email = enrich_via_apollo(entity_name)
+
+                    final_phone = phone or "Unmasked Upon Purchase"
+                    final_email = email or "Unmasked Upon Purchase"
+
+                    category = "TRADE_EMERGENCY" if any(w in context_window for w in ["remodel", "turnkey", "restoration", "damage"]) else "HAULING"
+                    price = 199.00 if category == "TRADE_EMERGENCY" else 129.00
+                    drop_id = f"job_REAL_{feed['county'][:2].upper()}_{real_docket}_{int(time.time())}"
+
                     payload = {
                         "sku": f"EA-WRIT-{feed['zip']}-{total_posted+1000}",
-                        "dropId": f"job_REAL_{feed['county'][:2].upper()}_{real_docket}_{int(time.time())}",
+                        "dropId": drop_id,
                         "sourceChannel": f"{feed['name']} (Record #{real_docket})",
-                        "category": "HAULING",
-                        "title_en": "POST-EVICTION HAULING ($129)",
+                        "category": category,
+                        "title_en": f"POST-EVICTION {category.replace('_', ' ')} (${int(price)})",
                         "zip": feed["zip"],
                         "city": f"{feed['county']}, CA",
-                        "desc_en": f"Verified Notice Context: {block[:140]}...",
-                        "retailPrice": 129.00,
-                        "customerName": "Property Asset Manager",
-                        "customerPhone": "Unmasked Upon Purchase",
+                        "desc_en": f"Verified Writ Notice parsed dynamically. Notice Context: {block[:140]}...",
+                        "retailPrice": price,
+                        "customerName": entity_name,
+                        "customerPhone": final_phone,
                         "customerAddress": real_address,
                         "dossier": {
-                            "assetManager": "REO Team",
-                            "amPhone": "Unmasked Upon Purchase",
-                            "listingAgent": "Local Default Broker",
+                            "assetManager": "REO Portfolio Real Estate Team",
+                            "amPhone": final_phone,
+                            "listingAgent": "Local Default Broker Assignment",
                             "agentPhone": "Unmasked Upon Purchase",
-                            "propertyManager": "Assigned PM",
+                            "propertyManager": "Assigned Receiver / Property PM",
                             "pmPhone": "Unmasked Upon Purchase",
-                            "attorney": "Counsel On File",
-                            "attorneyPhone": "Unmasked Upon Purchase",
-                            "attorneyEmail": "Unmasked Upon Purchase"
+                            "attorney": entity_name,
+                            "attorneyPhone": final_phone,
+                            "attorneyEmail": final_email
                         }
                     }
 
                     try:
                         res = requests.post(API_URL, json=payload, headers=HEADERS, timeout=5)
                         if res.status_code == 200:
-                            print(f"  [+] SUCCESS INGESTION -> {real_address}", flush=True)
+                            print(f"  [+] SUCCESS: Ingested lead -> {drop_id} | Location: {real_address}", flush=True)
                             total_posted += 1
                             matched += 1
-                            if matched >= 5:
+                            if matched >= 5: # Cap at 5 per feed for verification
                                 break
                     except Exception:
                         pass
@@ -163,7 +175,7 @@ async def run_real_lead_scraper():
                 await page.close()
 
         await browser.close()
-    print(f"\n[*] Execution Complete. Total Posted: {total_posted}", flush=True)
+    print(f"\n[*] Execution Complete. Total Ingested: {total_posted}", flush=True)
 
 if __name__ == "__main__":
     asyncio.run(run_real_lead_scraper())

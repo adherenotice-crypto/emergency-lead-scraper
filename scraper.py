@@ -22,7 +22,6 @@ HEADERS = {
 APOLLO_MATCH_URL = "https://api.apollo.io/v1/people/match"
 ENRICHMENT_CACHE = {}
 
-# STRICT JUNK FILTER: Drops auctions, trustee sales, and name changes
 JUNK_NOTICE_FILTER = [
     "change of name", "fictitious business", "notice to creditors", 
     "order to show cause", "probate", "statement of abandonment",
@@ -32,9 +31,7 @@ JUNK_NOTICE_FILTER = [
 ]
 
 CASE_REGEX = re.compile(r'\b(2[0-6][A-Z0-9]{2,4}UD[0-9]{4,8}|UD-[0-9]{2,5}-[0-9]{4,8}|[0-9]{2}SUD[0-9]{4,6}|[0-9]{6,10}-UD)\b', re.I)
-
-# RELAXED ADDRESS REGEX: Captures standard street numbers + names up to commas or abbreviations
-ADDRESS_REGEX = re.compile(r'\b\d{1,5}\s+[A-Za-z0-9\s.,#-]{3,35}(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Boulevard|Dr|Drive|Way|Ct|Court|Ln|Lane|Pl|Place|Cir|Circle|Bl|Way|Pkwy)?\b', re.I)
+ADDRESS_REGEX = re.compile(r'\b\d{1,5}\s+[A-Za-z0-9\s.,#-]{3,35}(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Boulevard|Dr|Drive|Way|Ct|Court|Ln|Lane|Pl|Place|Cir|Circle)?\b', re.I)
 
 def enrich_via_apollo(raw_name_string):
     if not APOLLO_API_KEY:
@@ -68,14 +65,14 @@ def enrich_via_apollo(raw_name_string):
     return None, None
 
 REAL_DATA_FEEDS = [
-    {"county": "Los Angeles", "name": "California Public Notice Registry (LA)", "url": "https://www.capublicnotice.com/search/results?q=Writ+of+Possession", "zip": "90210"},
-    {"county": "Orange County", "name": "California Public Notice Registry (OC)", "url": "https://www.capublicnotice.com/search/results?q=Unlawful+Detainer", "zip": "92660"},
-    {"county": "Riverside", "name": "California Public Notice Registry (IE)", "url": "https://www.capublicnotice.com/search/results?q=Notice+To+Vacate", "zip": "92501"},
-    {"county": "San Diego", "name": "California Public Notice Registry (SD)", "url": "https://www.capublicnotice.com/search/results?q=Eviction+Notice", "zip": "92101"}
+    {"county": "Los Angeles", "name": "California Public Notice Registry (LA)", "query": "Writ of Possession", "zip": "90210"},
+    {"county": "Orange County", "name": "California Public Notice Registry (OC)", "query": "Unlawful Detainer", "zip": "92660"},
+    {"county": "Riverside", "name": "California Public Notice Registry (IE)", "query": "Notice To Vacate", "zip": "92501"},
+    {"county": "San Diego", "name": "California Public Notice Registry (SD)", "query": "Eviction Notice", "zip": "92101"}
 ]
 
 async def run_real_lead_scraper():
-    print("[*] Launching Resilient Address-Match Eviction Pipeline...", flush=True)
+    print("[*] Launching Debug Playwright Automation Engine...", flush=True)
     total_posted = 0
 
     async with async_playwright() as p:
@@ -92,8 +89,30 @@ async def run_real_lead_scraper():
             page = await context.new_page()
 
             try:
-                await page.goto(feed["url"], wait_until="networkidle", timeout=20000)
-                await asyncio.sleep(5)
+                print(f"  [*] Navigating to base registry URL...", flush=True)
+                await page.goto("https://www.capublicnotice.com/", wait_until="networkidle", timeout=25000)
+                await asyncio.sleep(4)
+
+                # Diagnostic: Try multiple possible search input selectors
+                search_input = None
+                selectors = ['input[type="text"]', 'input[placeholder*="search" i]', 'input[name*="search" i]', 'input.search-input']
+                
+                for sel in selectors:
+                    try:
+                        search_input = await page.wait_for_selector(sel, timeout=3000)
+                        if search_input:
+                            print(f"  [+] Found search input using selector: {sel}", flush=True)
+                            break
+                    except Exception:
+                        continue
+
+                if search_input:
+                    await search_input.fill(feed["query"])
+                    await search_input.press("Enter")
+                    print(f"  [+] Successfully submitted query: '{feed['query']}'", flush=True)
+                    await asyncio.sleep(7) # Wait for dynamic rendering
+                else:
+                    print(f"  [!] Warning: Could not locate search input box. Scraping static content fallback...", flush=True)
 
                 html = await page.content()
                 soup = BeautifulSoup(html, "html.parser")
@@ -102,26 +121,23 @@ async def run_real_lead_scraper():
                     widget.decompose()
 
                 text_blocks = [node.get_text(separator=" ", strip=True) for node in soup.find_all(["div", "article", "tr", "p", "li"]) if len(node.get_text(separator=" ", strip=True)) > 40]
+                print(f"  [*] Inspected {len(text_blocks)} total text blocks on page.", flush=True)
 
                 matched = 0
                 for block in text_blocks:
                     context_window = block.lower()
 
-                    # 1. Skip if contains any junk/auction terms
                     if any(junk in context_window for junk in JUNK_NOTICE_FILTER):
                         continue
 
-                    # 2. Flexible Intent Check
                     intent_keywords = ["writ", "possession", "eviction", "vacate", "unlawful", "detainer", "sheriff", "tenant"]
                     if not any(k in context_window for k in intent_keywords):
                         continue
 
-                    # 3. Resilient Address Matcher (with smart fallback if exact suffix is missing)
                     addr_match = ADDRESS_REGEX.search(block)
                     if addr_match:
                         real_address = f"{addr_match.group(0).strip()}, {feed['county']}, CA"
                     else:
-                        # Fallback to county context if numbers exist in a valid legal block
                         num_match = re.search(r'\b\d{2,5}\s+[A-Za-z]+', block)
                         if num_match:
                             real_address = f"{num_match.group(0)}, {feed['county']}, CA"
@@ -180,6 +196,8 @@ async def run_real_lead_scraper():
                             print(f"  [+] SUCCESS: Ingested lead -> {drop_id} | Location: {real_address}", flush=True)
                             total_posted += 1
                             matched += 1
+                            if matched >= 5:
+                                break
                     except Exception:
                         pass
 

@@ -20,7 +20,7 @@ HEADERS = {
     "X-Emergency-Key": SECURITY_KEY
 }
 
-# Strict extraction patterns
+# Strict extraction regex
 CASE_REGEX = re.compile(r'\b(2[0-6][A-Z0-9]{2,4}UD[0-9]{4,8}|UD-[0-9]{5,10}|[0-9]{2}SUD[0-9]{4,6})\b', re.I)
 ADDRESS_REGEX = re.compile(r'\b\d{1,5}\s+[A-Za-z0-9\s.,]+(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Boulevard|Dr|Drive|Way|Ct|Court|Ln|Lane)\b', re.I)
 PHONE_REGEX = re.compile(r'\b(?:\+?1[-. ]?)?\(?([2-9][0-9]{2})\)?[-. ]?([2-9][0-9]{2})[-. ]?([0-9]{4})\b')
@@ -29,7 +29,7 @@ EMAIL_REGEX = re.compile(r'\b[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+\b')
 COURT_PORTALS = {
     "LASC": {
         "name": "Los Angeles Superior Court (LASC)",
-        "url": "https://www.lacourt.org/portal",
+        "url": "https://www.lacourt.ca.gov/casesummary/ui/",
         "county": "Los Angeles",
         "zip": "90210"
     },
@@ -75,15 +75,14 @@ def clean_email(email_str):
         return clean
     return None
 
-async def run_strict_scraper():
-    print("[*] Launching Strict Real-Data Court Scraper Engine...", flush=True)
+async def run_court_search_scraper():
+    print("[*] Launching Interactive Court Search Engine...", flush=True)
     total_posted = 0
 
     launch_args = [
         "--no-sandbox",
         "--disable-setuid-sandbox",
         "--disable-blink-features=AutomationControlled",
-        "--disable-infobars",
         "--ignore-certificate-errors"
     ]
 
@@ -91,13 +90,13 @@ async def run_strict_scraper():
         browser = await p.chromium.launch(headless=True, args=launch_args)
 
         for code, portal in COURT_PORTALS.items():
-            print(f"[*] Accessing Portal: {portal['name']}...", flush=True)
+            print(f"[*] Navigating & Querying Portal: {portal['name']}...", flush=True)
             context = await browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
                 viewport={"width": 1920, "height": 1080}
             )
             page = await context.new_page()
-            page.set_default_timeout(10000)
+            page.set_default_timeout(12000)
 
             await page.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
@@ -105,8 +104,15 @@ async def run_strict_scraper():
             """)
 
             try:
-                await page.goto(portal["url"], wait_until="domcontentloaded", timeout=10000)
-                await asyncio.sleep(1.5)
+                await page.goto(portal["url"], wait_until="domcontentloaded", timeout=12000)
+                await asyncio.sleep(2)
+
+                # Form interaction: Find search box and submit query
+                search_box = await page.query_selector("input[type='text'], input[type='search'], input[id*='search'], input[name*='case']")
+                if search_box:
+                    await search_box.fill("Writ of Possession")
+                    await page.keyboard.press("Enter")
+                    await asyncio.sleep(3)
 
                 html = await page.content()
                 soup = BeautifulSoup(html, "html.parser")
@@ -119,7 +125,7 @@ async def run_strict_scraper():
                     case_match = CASE_REGEX.search(raw_text)
                     addr_match = ADDRESS_REGEX.search(raw_text)
 
-                    # STRICT GUARD: Skip unless BOTH a real case number AND real street address are present
+                    # Strict Guard: Requires both real case # and street address
                     if not case_match or not addr_match:
                         continue
 
@@ -169,17 +175,17 @@ async def run_strict_scraper():
                         total_posted += 1
                         matched_on_portal += 1
 
-                print(f"[+] Verified {matched_on_portal} live records extracted on {code}.", flush=True)
+                print(f"[+] Extracted {matched_on_portal} verified records from {code}.", flush=True)
 
             except Exception as err:
-                print(f"[!] Processing exception on {code}: {err}", flush=True)
+                print(f"[!] Search exception on {code}: {err}", flush=True)
             finally:
                 await page.close()
                 await context.close()
 
         await browser.close()
 
-    print(f"[*] Complete. Ingested {total_posted} 100% verified real leads into Cloudflare KV!", flush=True)
+    print(f"[*] Complete. Ingested {total_posted} verified real leads into Cloudflare KV!", flush=True)
 
 if __name__ == "__main__":
-    asyncio.run(run_strict_scraper())
+    asyncio.run(run_court_search_scraper())

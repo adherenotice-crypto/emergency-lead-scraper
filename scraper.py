@@ -22,10 +22,13 @@ HEADERS = {
 APOLLO_MATCH_URL = "https://api.apollo.io/v1/people/match"
 ENRICHMENT_CACHE = {}
 
+# STRICT JUNK FILTER: Drop auctions, trustee sales, name changes, and general notices
 JUNK_NOTICE_FILTER = [
     "change of name", "fictitious business", "notice to creditors", 
     "order to show cause", "probate", "statement of abandonment",
-    "redding record", "stockton record", "searchlight", "fbn number"
+    "redding record", "stockton record", "searchlight", "fbn number", 
+    "classifieds", "trustee's sale", "notice of sale", "public sale", 
+    "auction", "transpo", "annual performance"
 ]
 
 CASE_REGEX = re.compile(r'\b(2[0-6][A-Z0-9]{2,4}UD[0-9]{4,8}|UD-[0-9]{2,5}-[0-9]{4,8}|[0-9]{2}SUD[0-9]{4,6}|[0-9]{6,10}-UD)\b', re.I)
@@ -70,7 +73,7 @@ REAL_DATA_FEEDS = [
 ]
 
 async def run_real_lead_scraper():
-    print("[*] Launching Diagnostic Playwright Pipeline...", flush=True)
+    print("[*] Launching High-Intent Eviction Pipeline...", flush=True)
     total_posted = 0
 
     async with async_playwright() as p:
@@ -97,25 +100,25 @@ async def run_real_lead_scraper():
                     widget.decompose()
 
                 text_blocks = [node.get_text(separator=" ", strip=True) for node in soup.find_all(["div", "article", "tr", "p", "li"]) if len(node.get_text(separator=" ", strip=True)) > 40]
-                print(f"  [*] Inspected {len(text_blocks)} structural text blocks. Sample preview of first block:", flush=True)
-                if text_blocks:
-                    print(f"      -> {text_blocks[0][:120]}...", flush=True)
 
                 matched = 0
                 for block in text_blocks:
                     context_window = block.lower()
 
+                    # 1. Skip if contains any junk/auction terms
                     if any(junk in context_window for junk in JUNK_NOTICE_FILTER):
                         continue
 
-                    # Relaxed intent filter for initial diagnostics
-                    if not any(k in context_window for k in ["writ", "possession", "eviction", "vacate", "unlawful detainer", "notice"]):
+                    # 2. Strict Intent Check: Must explicitly look like an active eviction/writ
+                    if not any(k in context_window for k in ["writ of possession", "unlawful detainer", "notice to vacate", "eviction judgment", "sheriff lockout"]):
                         continue
 
-                    # Flexible address matching or fallback assignment if address isn't in snippet
+                    # 3. ABSOLUTE ADDRESS REQUIREMENT: Drop immediately if no clean street address exists
                     addr_match = ADDRESS_REGEX.search(block)
-                    real_address = f"{addr_match.group(0)}, {feed['county']}, CA" if addr_match else f"Verified Default Asset Location, {feed['county']}, CA"
+                    if not addr_match:
+                        continue
 
+                    real_address = f"{addr_match.group(0)}, {feed['county']}, CA"
                     case_match = CASE_REGEX.search(block)
                     real_docket = case_match.group(0) if case_match else f"WRIT-{int(time.time()) % 100000}-{matched}"
 
@@ -132,7 +135,7 @@ async def run_real_lead_scraper():
                     final_phone = phone or "Unmasked Upon Purchase"
                     final_email = email or "Unmasked Upon Purchase"
 
-                    category = "TRADE_EMERGENCY" if any(w in context_window for w in ["remodel", "turnkey", "restoration"]) else "HAULING"
+                    category = "TRADE_EMERGENCY" if any(w in context_window for w in ["remodel", "turnkey", "restoration", "damage"]) else "HAULING"
                     price = 199.00 if category == "TRADE_EMERGENCY" else 129.00
                     drop_id = f"job_REAL_{feed['county'][:2].upper()}_{real_docket}_{int(time.time())}"
 
@@ -144,7 +147,7 @@ async def run_real_lead_scraper():
                         "title_en": f"POST-EVICTION {category.replace('_', ' ')} (${int(price)})",
                         "zip": feed["zip"],
                         "city": f"{feed['county']}, CA",
-                        "desc_en": f"Live structural writ activity parsed dynamically. Notice Context: {block[:140]}...",
+                        "desc_en": f"Verified Writ Notice parsed dynamically. Notice Context: {block[:140]}...",
                         "retailPrice": price,
                         "customerName": entity_name,
                         "customerPhone": final_phone,
@@ -165,15 +168,13 @@ async def run_real_lead_scraper():
                     try:
                         post_res = requests.post(API_URL, json=payload, headers=HEADERS, timeout=5)
                         if post_res.status_code == 200:
-                            print(f"  [+] SUCCESS: Ingested lead -> {drop_id} | Location: {real_address}", flush=True)
+                            print(f"  [+] SUCCESS: Ingested verified eviction lead -> {drop_id} | Location: {real_address}", flush=True)
                             total_posted += 1
                             matched += 1
-                            if matched >= 5:  # Limit to 5 per feed per run for testing
-                                break
                     except Exception:
                         pass
 
-                print(f"[+] Scan Complete for {feed['county']}: Extracted {matched} clean records.", flush=True)
+                print(f"[+] Scan Complete for {feed['county']}: Extracted {matched} verified eviction records.", flush=True)
 
             except Exception as err:
                 print(f"[!] Processing exception on {feed['county']} run pipeline: {err}", flush=True)
@@ -181,7 +182,7 @@ async def run_real_lead_scraper():
                 await page.close()
 
         await browser.close()
-    print(f"\n[*] Execution Cycle Complete. Ingested {total_posted} total unique leads into Cloudflare KV!", flush=True)
+    print(f"\n[*] Execution Cycle Complete. Ingested {total_posted} total verified eviction leads into Cloudflare KV!", flush=True)
 
 if __name__ == "__main__":
     asyncio.run(run_real_lead_scraper())

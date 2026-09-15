@@ -20,6 +20,9 @@ HEADERS = {
 
 APOLLO_MATCH_URL = "https://api.apollo.io/v1/people/match"
 
+# Deduplication cache to prevent redundant API queries
+ENRICHMENT_CACHE = {}
+
 # ----------------------------------------------------------------------
 # REGEX PARSING SCHEMAS
 # ----------------------------------------------------------------------
@@ -30,42 +33,43 @@ ADDRESS_REGEX = re.compile(r'\b\d{1,5}\s+[A-Za-z0-9\s.,#]+(?:St|Street|Ave|Avenu
 # AUTOMATED APOLLO B2B ENRICHMENT ENGINE
 # ----------------------------------------------------------------------
 def enrich_via_apollo(raw_name_string):
-    """Queries Apollo.io Person Match API via x-api-key header."""
+    """Queries Apollo.io Person Match API with caching and free-plan error handling."""
     if not APOLLO_API_KEY:
-        print("  [!] Warning: APOLLO_API_KEY secret is not set.", flush=True)
         return None, None
-        
-    print(f"  [*] Initializing Apollo Lookup for: '{raw_name_string}'...", flush=True)
-    
-    payload = {
-        "name": raw_name_string
-    }
-    
+
+    clean_name = raw_name_string.strip().upper()
+    if clean_name in ENRICHMENT_CACHE:
+        return ENRICHMENT_CACHE[clean_name]
+
+    print(f"  [*] Initializing Apollo Lookup for: '{clean_name}'...", flush=True)
+
+    payload = {"name": clean_name}
     apollo_headers = {
         "Content-Type": "application/json",
         "Cache-Control": "no-cache",
         "x-api-key": APOLLO_API_KEY
     }
-    
+
     try:
         response = requests.post(APOLLO_MATCH_URL, json=payload, headers=apollo_headers, timeout=5)
         if response.status_code == 200:
             data = response.json()
             person = data.get("person") or {}
-            
             email = person.get("email")
             phone = person.get("sanitized_phone") or (person.get("phone_numbers", [{}])[0].get("sanitized_number") if person.get("phone_numbers") else None)
-            
+
             if email or phone:
                 print(f"  [+] Apollo Match Success! Phone: {phone} | Email: {email}", flush=True)
+                ENRICHMENT_CACHE[clean_name] = (phone, email)
                 return phone, email
-            else:
-                print("  [-] Apollo queried successfully, but no direct contact found.", flush=True)
-        else:
-            print(f"  [!] Apollo API Error ({response.status_code}): {response.text[:100]}", flush=True)
+        elif response.status_code == 403:
+            print("  [!] Apollo Free Tier Limitation: Match API requires paid plan. Bypassing enrichment.", flush=True)
+            ENRICHMENT_CACHE[clean_name] = (None, None)
+            return None, None
     except Exception as e:
         print(f"  [!] Apollo Lookup exception: {e}", flush=True)
-        
+
+    ENRICHMENT_CACHE[clean_name] = (None, None)
     return None, None
 
 # ----------------------------------------------------------------------

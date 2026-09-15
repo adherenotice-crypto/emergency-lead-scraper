@@ -19,9 +19,11 @@ HEADERS = {
     "Content-Type": "application/json",
     "X-Emergency-Key": SECURITY_KEY
 }
+
 APOLLO_MATCH_URL = "https://api.apollo.io/v1/people/match"
 ENRICHMENT_CACHE = {}
 
+# Strict systemic layout exclusions to drop global navigation widgets/sidebars
 JUNK_NOTICE_FILTER = [
     "change of name", "fictitious business", "notice to creditors", 
     "order to show cause", "probate", "statement of abandonment",
@@ -32,6 +34,9 @@ CASE_REGEX = re.compile(r'\b(2[0-6][A-Z0-9]{2,4}UD[0-9]{4,8}|UD-[0-9]{2,5}-[0-9]
 # Corrected layout rule to filter out numerical search result strings
 ADDRESS_REGEX = re.compile(r'\b\d{1,5}\s+[A-Za-z][A-Za-z0-9\s.,#]+(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Boulevard|Dr|Drive|Way|Ct|Court|Ln|Lane|Pl|Place|Cir|Circle)\b', re.I)
 
+# ----------------------------------------------------------------------
+# APOLLO B2B CONTACT ENRICHMENT PIPELINE
+# ----------------------------------------------------------------------
 def enrich_via_apollo(raw_name_string):
     if not APOLLO_API_KEY:
         return None, None
@@ -63,6 +68,9 @@ def enrich_via_apollo(raw_name_string):
     ENRICHMENT_CACHE[clean_name] = (None, None)
     return None, None
 
+# ----------------------------------------------------------------------
+# TARGET DATA FEEDS
+# ----------------------------------------------------------------------
 REAL_DATA_FEEDS = [
     {"county": "Los Angeles", "name": "California Public Notice Registry (LA)", "url": "https://www.capublicnotice.com/search/results?q=Writ+of+Possession", "zip": "90210"},
     {"county": "Orange County", "name": "California Public Notice Registry (OC)", "url": "https://www.capublicnotice.com/search/results?q=Unlawful+Detainer", "zip": "92660"},
@@ -70,6 +78,9 @@ REAL_DATA_FEEDS = [
     {"county": "San Diego", "name": "California Public Notice Registry (SD)", "url": "https://www.capublicnotice.com/search/results?q=Eviction+Notice", "zip": "92101"}
 ]
 
+# ----------------------------------------------------------------------
+# CORE ASYNCHRONOUS SCALER TIMELINE
+# ----------------------------------------------------------------------
 async def run_real_lead_scraper():
     print("[*] Launching Container-Isolated Playwright Pipeline Engine...", flush=True)
     total_posted = 0
@@ -88,12 +99,14 @@ async def run_real_lead_scraper():
             page = await context.new_page()
 
             try:
+                # Direct dynamic Javascript rendering execution 
                 await page.goto(feed["url"], wait_until="networkidle", timeout=20000)
                 await asyncio.sleep(4)
 
                 html = await page.content()
                 soup = BeautifulSoup(html, "html.parser")
 
+                # Container tracking parameters to focus strictly on structural notice cards
                 containers = soup.find_all(["div", "article", "li"], class_=re.compile(r'(result|notice|listing|item|card)', re.I))
                 if not containers:
                     containers = soup.find_all(["tr", "p", "td"])
@@ -160,6 +173,7 @@ async def run_real_lead_scraper():
                         }
                     }
 
+                    # Push payload directly out to your remote endpoint database
                     try:
                         post_res = requests.post(API_URL, json=payload, headers=HEADERS, timeout=5)
                         if post_res.status_code == 200:

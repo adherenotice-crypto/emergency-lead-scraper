@@ -70,7 +70,7 @@ REAL_DATA_FEEDS = [
 ]
 
 async def run_real_lead_scraper():
-    print("[*] Launching Container-Isolated Playwright Pipeline Engine...", flush=True)
+    print("[*] Launching Structural Element-Block Playwright Pipeline...", flush=True)
     total_posted = 0
 
     async with async_playwright() as p:
@@ -88,37 +88,42 @@ async def run_real_lead_scraper():
 
             try:
                 await page.goto(feed["url"], wait_until="networkidle", timeout=20000)
-                await asyncio.sleep(4)
+                await asyncio.sleep(5)
 
                 html = await page.content()
                 soup = BeautifulSoup(html, "html.parser")
 
-                containers = soup.find_all(["div", "article", "li"], class_=re.compile(r'(result|notice|listing|item|card)', re.I))
-                if not containers:
-                    containers = soup.find_all(["tr", "p", "td"])
+                # Remove structural layout nodes to strip out sidebars and navigation noise
+                for widget in soup(["script", "style", "nav", "footer", "header"]):
+                    widget.decompose()
+
+                # Extract clean text segments broken directly by structural block elements
+                text_blocks = [node.get_text(separator=" ", strip=True) for node in soup.find_all(["div", "article", "tr", "p", "li"]) if len(node.get_text(separator=" ", strip=True)) > 30]
 
                 matched = 0
-                for container in containers:
-                    raw_text = container.get_text(separator=" ", strip=True)
+                for block in text_blocks:
+                    context_window = block.lower()
 
-                    if any(junk in raw_text.lower() for junk in JUNK_NOTICE_FILTER):
+                    # Ignore known junk notice categories and navigation strings
+                    if any(junk in context_window for junk in JUNK_NOTICE_FILTER):
                         continue
 
-                    if not any(k in raw_text.lower() for k in ["writ of possession", "unlawful detainer", "notice to vacate", "eviction judgment", "writ"]):
+                    # Direct Validation Layer 1: Ensure block carries explicit eviction intent
+                    if not any(k in context_window for k in ["writ", "possession", "eviction", "vacate", "unlawful detainer", "detainer", "sheriff"]):
                         continue
 
-                    case_match = CASE_REGEX.search(raw_text)
-                    addr_match = ADDRESS_REGEX.search(raw_text)
-
+                    # Direct Validation Layer 2: Look for physical address components inside the same block
+                    addr_match = ADDRESS_REGEX.search(block)
                     if not addr_match:
                         continue
 
-                    real_docket = case_match.group(0) if case_match else f"WRIT-{int(time.time()) % 100000}"
+                    case_match = CASE_REGEX.search(block)
+                    real_docket = case_match.group(0) if case_match else f"WRIT-{int(time.time()) % 100000}-{matched}"
                     real_address = f"{addr_match.group(0)}, {feed['county']}, CA"
 
                     entity_name = "Property Asset Manager"
-                    if "plaintiff" in raw_text.lower():
-                        parts = re.split(r'plaintiff[:\s]+', raw_text, flags=re.I)
+                    if "plaintiff" in context_window:
+                        parts = re.split(r'plaintiff[:\s]+', block, flags=re.I)
                         if len(parts) > 1:
                             entity_name = " ".join(parts[1].split()[:3]).replace(",", "")
 
@@ -129,7 +134,7 @@ async def run_real_lead_scraper():
                     final_phone = phone or "Unmasked Upon Purchase"
                     final_email = email or "Unmasked Upon Purchase"
 
-                    category = "TRADE_EMERGENCY" if any(w in raw_text.lower() for w in ["remodel", "turnkey", "restoration"]) else "HAULING"
+                    category = "TRADE_EMERGENCY" if any(w in context_window for w in ["remodel", "turnkey", "restoration"]) else "HAULING"
                     price = 199.00 if category == "TRADE_EMERGENCY" else 129.00
                     drop_id = f"job_REAL_{feed['county'][:2].upper()}_{real_docket}_{int(time.time())}"
 
@@ -141,7 +146,7 @@ async def run_real_lead_scraper():
                         "title_en": f"POST-EVICTION {category.replace('_', ' ')} (${int(price)})",
                         "zip": feed["zip"],
                         "city": f"{feed['county']}, CA",
-                        "desc_en": f"Live structural writ activity parsed dynamically. Notice Preview: {raw_text[:140]}...",
+                        "desc_en": f"Live structural writ activity parsed dynamically. Notice Context: {block[:140]}...",
                         "retailPrice": price,
                         "customerName": entity_name,
                         "customerPhone": final_phone,
@@ -168,7 +173,7 @@ async def run_real_lead_scraper():
                     except Exception:
                         pass
 
-                print(f"[+] Scan Complete for {feed['county']}: Extracted {matched} verified unique records.", flush=True)
+                print(f"[+] Scan Complete for {feed['county']}: Extracted {matched} clean records.", flush=True)
 
             except Exception as err:
                 print(f"[!] Processing exception on {feed['county']} run pipeline: {err}", flush=True)

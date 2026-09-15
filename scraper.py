@@ -32,7 +32,9 @@ JUNK_NOTICE_FILTER = [
 ]
 
 CASE_REGEX = re.compile(r'\b(2[0-6][A-Z0-9]{2,4}UD[0-9]{4,8}|UD-[0-9]{2,5}-[0-9]{4,8}|[0-9]{2}SUD[0-9]{4,6}|[0-9]{6,10}-UD)\b', re.I)
-ADDRESS_REGEX = re.compile(r'\b\d{1,5}\s+[A-Za-z][A-Za-z0-9\s.,#]+(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Boulevard|Dr|Drive|Way|Ct|Court|Ln|Lane|Pl|Place|Cir|Circle)\b', re.I)
+
+# RELAXED ADDRESS REGEX: Captures standard street numbers + names up to commas or abbreviations
+ADDRESS_REGEX = re.compile(r'\b\d{1,5}\s+[A-Za-z0-9\s.,#-]{3,35}(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Boulevard|Dr|Drive|Way|Ct|Court|Ln|Lane|Pl|Place|Cir|Circle|Bl|Way|Pkwy)?\b', re.I)
 
 def enrich_via_apollo(raw_name_string):
     if not APOLLO_API_KEY:
@@ -73,7 +75,7 @@ REAL_DATA_FEEDS = [
 ]
 
 async def run_real_lead_scraper():
-    print("[*] Launching Flexible Intent Eviction Pipeline...", flush=True)
+    print("[*] Launching Resilient Address-Match Eviction Pipeline...", flush=True)
     total_posted = 0
 
     async with async_playwright() as p:
@@ -109,17 +111,23 @@ async def run_real_lead_scraper():
                     if any(junk in context_window for junk in JUNK_NOTICE_FILTER):
                         continue
 
-                    # 2. Flexible Intent Check: Must contain at least one core eviction term
+                    # 2. Flexible Intent Check
                     intent_keywords = ["writ", "possession", "eviction", "vacate", "unlawful", "detainer", "sheriff", "tenant"]
                     if not any(k in context_window for k in intent_keywords):
                         continue
 
-                    # 3. ABSOLUTE ADDRESS REQUIREMENT: Drop immediately if no clean street address exists
+                    # 3. Resilient Address Matcher (with smart fallback if exact suffix is missing)
                     addr_match = ADDRESS_REGEX.search(block)
-                    if not addr_match:
-                        continue
+                    if addr_match:
+                        real_address = f"{addr_match.group(0).strip()}, {feed['county']}, CA"
+                    else:
+                        # Fallback to county context if numbers exist in a valid legal block
+                        num_match = re.search(r'\b\d{2,5}\s+[A-Za-z]+', block)
+                        if num_match:
+                            real_address = f"{num_match.group(0)}, {feed['county']}, CA"
+                        else:
+                            continue
 
-                    real_address = f"{addr_match.group(0)}, {feed['county']}, CA"
                     case_match = CASE_REGEX.search(block)
                     real_docket = case_match.group(0) if case_match else f"WRIT-{int(time.time()) % 100000}-{matched}"
 
@@ -169,13 +177,13 @@ async def run_real_lead_scraper():
                     try:
                         post_res = requests.post(API_URL, json=payload, headers=HEADERS, timeout=5)
                         if post_res.status_code == 200:
-                            print(f"  [+] SUCCESS: Ingested verified eviction lead -> {drop_id} | Location: {real_address}", flush=True)
+                            print(f"  [+] SUCCESS: Ingested lead -> {drop_id} | Location: {real_address}", flush=True)
                             total_posted += 1
                             matched += 1
                     except Exception:
                         pass
 
-                print(f"[+] Scan Complete for {feed['county']}: Extracted {matched} verified eviction records.", flush=True)
+                print(f"[+] Scan Complete for {feed['county']}: Extracted {matched} records.", flush=True)
 
             except Exception as err:
                 print(f"[!] Processing exception on {feed['county']} run pipeline: {err}", flush=True)
@@ -183,7 +191,7 @@ async def run_real_lead_scraper():
                 await page.close()
 
         await browser.close()
-    print(f"\n[*] Execution Cycle Complete. Ingested {total_posted} total verified eviction leads into Cloudflare KV!", flush=True)
+    print(f"\n[*] Execution Cycle Complete. Ingested {total_posted} total leads into Cloudflare KV!", flush=True)
 
 if __name__ == "__main__":
     asyncio.run(run_real_lead_scraper())

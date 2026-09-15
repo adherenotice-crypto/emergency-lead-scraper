@@ -8,9 +8,6 @@ from playwright.async_api import async_playwright
 
 os.environ["PYTHONUNBUFFERED"] = "1"
 
-# ----------------------------------------------------------------------
-# CLOUDFLARE DISPATCH API CONFIGURATION
-# ----------------------------------------------------------------------
 API_URL = os.getenv("API_URL", "https://emergencyaudit.com/api/ping")
 SECURITY_KEY = (
     os.getenv("EMERGENCY_KEY")
@@ -23,9 +20,6 @@ HEADERS = {
     "X-Emergency-Key": SECURITY_KEY
 }
 
-# ----------------------------------------------------------------------
-# STRICT EXTRACTION REGEX PATTERNS
-# ----------------------------------------------------------------------
 CASE_REGEX = re.compile(r'\b(2[0-6][A-Z0-9]{2,4}UD[0-9]{4,8}|UD-[0-9]{5,10}|[0-9]{2}SUD[0-9]{4,6})\b', re.I)
 ADDRESS_REGEX = re.compile(r'\b\d{1,5}\s+[A-Za-z0-9\s.,]+(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Boulevard|Dr|Drive|Way|Ct|Court|Ln|Lane)\b', re.I)
 PHONE_REGEX = re.compile(r'\b(?:\+?1[-. ]?)?\(?([2-9][0-9]{2})\)?[-. ]?([2-9][0-9]{2})[-. ]?([0-9]{4})\b')
@@ -80,75 +74,62 @@ def clean_email(email_str):
         return clean
     return None
 
-async def run_court_search_scraper():
-    print("[*] Launching Synchronized Court Search Engine...", flush=True)
+async def run_targeted_scraper():
+    print("[*] Launching Targeted Court Index Scraper...", flush=True)
     total_posted = 0
 
-    launch_args = [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-blink-features=AutomationControlled",
-        "--ignore-certificate-errors"
-    ]
-
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=launch_args)
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"]
+        )
 
         for code, portal in COURT_PORTALS.items():
-            print(f"[*] Navigating & Querying Portal: {portal['name']}...", flush=True)
+            print(f"[*] Accessing Court Index: {portal['name']}...", flush=True)
             context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-                viewport={"width": 1920, "height": 1080}
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
             )
             page = await context.new_page()
-            page.set_default_timeout(12000)
+            page.set_default_timeout(10000)
 
-            # Mask bot flags
             await page.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
                 window.chrome = { runtime: {} };
             """)
 
             try:
-                await page.goto(portal["url"], wait_until="domcontentloaded", timeout=12000)
-                await asyncio.sleep(2)
+                await page.goto(portal["url"], wait_until="domcontentloaded", timeout=10000)
+                await asyncio.sleep(1.5)
 
-                # Form interaction: Find input box, enter search term, and await redirect safely
-                search_box = await page.query_selector("input[type='text'], input[type='search'], input[id*='search'], input[name*='case']")
-                if search_box:
-                    await search_box.fill("Writ of Possession")
-                    try:
-                        async with page.expect_navigation(wait_until="domcontentloaded", timeout=8000):
-                            await page.keyboard.press("Enter")
-                    except Exception:
-                        await asyncio.sleep(3)
+                # Target court case input specifically, avoiding header/nav search boxes
+                case_input = await page.query_selector("input[id*='case'], input[name*='case'], input[placeholder*='Case']")
+                if case_input:
+                    await case_input.fill("UD")
+                    btn = await page.query_selector("button[type='submit'], input[type='submit']")
+                    if btn:
+                        await btn.click()
+                        await asyncio.sleep(2.5)
 
-                # Wait for any background page navigations to settle completely
-                await page.wait_for_load_state("domcontentloaded")
                 html = await page.content()
                 soup = BeautifulSoup(html, "html.parser")
-                blocks = soup.find_all(["tr", "div", "li", "p"])
+                rows = soup.find_all(["tr", "div", "li"], class_=re.compile(r'(case|row|result|docket|item)', re.I))
 
-                matched_on_portal = 0
-                for block in blocks:
-                    raw_text = block.get_text(separator=" ", strip=True)
+                matched = 0
+                for row in rows:
+                    raw_text = row.get_text(separator=" ", strip=True)
 
                     case_match = CASE_REGEX.search(raw_text)
                     addr_match = ADDRESS_REGEX.search(raw_text)
 
-                    # STRICT GUARD: Skip unless BOTH a real case number AND real street address exist
                     if not case_match or not addr_match:
                         continue
 
                     real_docket = case_match.group(0)
                     real_address = f"{addr_match.group(0)}, {portal['county']}, CA"
-                    phone_match = PHONE_REGEX.search(raw_text)
-                    email_match = EMAIL_REGEX.search(raw_text)
+                    phone = clean_phone(PHONE_REGEX.search(raw_text).group(0) if PHONE_REGEX.search(raw_text) else None) or "Unmasked Upon Purchase"
+                    email = clean_email(EMAIL_REGEX.search(raw_text).group(0) if EMAIL_REGEX.search(raw_text) else None) or "Unmasked Upon Purchase"
 
-                    phone = clean_phone(phone_match.group(0) if phone_match else None) or "Unmasked Upon Purchase"
-                    email = clean_email(email_match.group(0) if email_match else None) or "Unmasked Upon Purchase"
-
-                    category = "TRADE_EMERGENCY" if "remodel" in raw_text.lower() or "turnkey" in raw_text.lower() else "HAULING"
+                    category = "TRADE_EMERGENCY" if "remodel" in raw_text.lower() else "HAULING"
                     price = 199.00 if category == "TRADE_EMERGENCY" else 129.00
                     drop_id = f"job_REAL_{code}_{real_docket}_{int(time.time())}"
 
@@ -184,12 +165,12 @@ async def run_court_search_scraper():
                     if res.status_code == 200:
                         print(f"[+] Ingested REAL Lead: {drop_id} | Address: {real_address}", flush=True)
                         total_posted += 1
-                        matched_on_portal += 1
+                        matched += 1
 
-                print(f"[+] Extracted {matched_on_portal} verified records from {code}.", flush=True)
+                print(f"[+] Extracted {matched} verified records from {code}.", flush=True)
 
             except Exception as err:
-                print(f"[!] Search exception on {code}: {err}", flush=True)
+                print(f"[!] Processing exception on {code}: {err}", flush=True)
             finally:
                 await page.close()
                 await context.close()
@@ -199,4 +180,4 @@ async def run_court_search_scraper():
     print(f"[*] Complete. Ingested {total_posted} verified real leads into Cloudflare KV!", flush=True)
 
 if __name__ == "__main__":
-    asyncio.run(run_court_search_scraper())
+    asyncio.run(run_targeted_scraper())

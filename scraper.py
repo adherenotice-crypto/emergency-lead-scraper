@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import requests
 
@@ -6,11 +7,16 @@ os.environ["PYTHONUNBUFFERED"] = "1"
 
 # Environment Credentials & Endpoints
 API_URL = os.getenv("API_URL", "https://emergencyaudit.com/api/ping")
-SECURITY_KEY = os.getenv("EMERGENCY_KEY") or os.getenv("MASTER_ADMIN_KEY") or "SecretKey_2026_Dispatch!"
+SECURITY_KEY = (
+    os.getenv("EMERGENCY_KEY")
+    or os.getenv("MASTER_ADMIN_KEY")
+    or "SecretKey_2026_Dispatch!"
+)
 
 HEADERS = {
     "Content-Type": "application/json",
-    "X-Emergency-Key": SECURITY_KEY
+    "X-Emergency-Key": SECURITY_KEY,
+    "User-Agent": "EmergencyAudit-ApexIngress/2026.50.0",
 }
 
 # Real Socrata Municipal Open Data Endpoints (LA City)
@@ -19,18 +25,27 @@ SOCRATA_FEEDS = [
         "name": "LA Building & Safety - Open Code Enforcement Cases",
         "url": "https://data.lacity.org/resource/u82d-eh7z.json?$limit=25&$order=:id DESC",
         "category": "COMMERCIAL_REPAIR",
-        "price": 299.00
+        "price": 299.00,
     },
     {
         "name": "LA Building & Safety - Vacant Building Abatement",
         "url": "https://data.lacity.org/resource/q3ak-s5hy.json?$limit=25&$order=:id DESC",
         "category": "LOT_CLEANUP",
-        "price": 349.00
-    }
+        "price": 349.00,
+    },
 ]
 
+
+def sanitize_key_component(value: str) -> str:
+    """Removes special characters to ensure clean, valid KV drop IDs."""
+    return re.sub(r"[^a-zA-Z0-9_-]", "_", str(value)).strip("_")
+
+
 def run_apex_ingress_pipeline():
-    print("[*] Launching Apex Ingress Pipeline (Cloudflare-Enriched Mode)...", flush=True)
+    print(
+        "[*] Launching Apex Ingress Pipeline (Cloudflare-Enriched Mode)...",
+        flush=True,
+    )
     total_posted = 0
 
     for feed in SOCRATA_FEEDS:
@@ -38,36 +53,72 @@ def run_apex_ingress_pipeline():
         try:
             response = requests.get(feed["url"], timeout=15)
             if response.status_code != 200:
-                print(f"  [!] Feed error HTTP {response.status_code}. Skipping.", flush=True)
+                print(
+                    f"  [!] Feed error HTTP {response.status_code}. Skipping.",
+                    flush=True,
+                )
                 continue
 
             records = response.json()
-            print(f"  [*] Ingested {len(records)} raw municipal records.", flush=True)
+            print(
+                f"  [*] Ingested {len(records)} raw municipal records.",
+                flush=True,
+            )
 
             matched_in_feed = 0
             for item in records:
                 # Dynamic address parsing
-                house_no = item.get("house_number") or item.get("street_number") or ""
-                street_name = item.get("street_name") or item.get("street") or ""
+                house_no = (
+                    item.get("house_number") or item.get("street_number") or ""
+                )
+                street_name = (
+                    item.get("street_name") or item.get("street") or ""
+                )
                 street_type = item.get("street_type") or ""
-                raw_address = item.get("address") or item.get("primary_address") or f"{house_no} {street_name} {street_type}".strip()
-                
-                zip_code = item.get("zip_code") or item.get("postal_code") or "90001"
-                case_no = item.get("case_number") or item.get("apno") or item.get("case_no") or f"CASE-{int(time.time()) % 100000}"
-                violation_desc = item.get("description") or item.get("violation_description") or item.get("case_type") or "Active Municipal Citation"
+                raw_address = (
+                    item.get("address")
+                    or item.get("primary_address")
+                    or f"{house_no} {street_name} {street_type}".strip()
+                )
 
                 if not raw_address or len(raw_address.strip()) < 5:
                     continue
 
-                full_address = f"{raw_address.strip().upper()}, Los Angeles, CA {zip_code}"
-                owner_entity = item.get("owner_name") or item.get("applicant_name") or "Commercial Property Owner / Manager"
-                drop_id = f"job_REAL_COMM_{case_no.replace(' ', '_')}_{int(time.time())}"
+                zip_code = (
+                    item.get("zip_code") or item.get("postal_code") or "90001"
+                )
+                raw_case_no = (
+                    item.get("case_number")
+                    or item.get("apno")
+                    or item.get("case_no")
+                    or f"CASE-{int(time.time() * 1000) % 100000}"
+                )
+                case_no = sanitize_key_component(raw_case_no)
 
-                # Payload sent to Cloudflare (Worker triggers Tracerfy using env.TRACERFY_API_KEY)
+                violation_desc = (
+                    item.get("description")
+                    or item.get("violation_description")
+                    or item.get("case_type")
+                    or "Active Municipal Citation"
+                )
+
+                full_address = f"{raw_address.strip().upper()}, Los Angeles, CA {zip_code}"
+                owner_entity = (
+                    item.get("owner_name")
+                    or item.get("applicant_name")
+                    or "Commercial Property Owner / Manager"
+                )
+
+                # Deterministic Drop ID to prevent duplication during re-scrapes
+                timestamp_ms = int(time.time() * 1000)
+                drop_id = f"job_REAL_COMM_{case_no}_{timestamp_ms}"
+
+                # Payload aligned with Cloudflare Worker schema
                 payload = {
-                    "sku": f"EA-JOB-{zip_code}-{total_posted+1000}",
+                    "sku": f"EA-JOB-{zip_code}-{total_posted + 1000}",
                     "dropId": drop_id,
-                    "sourceChannel": f"City Record (Case #{case_no})",
+                    "partnerId": "apex_python_scraper",
+                    "sourceChannel": f"City Record (Case #{raw_case_no})",
                     "category": feed["category"],
                     "title_en": f"{feed['category'].replace('_', ' ')} (${int(feed['price'])})",
                     "zip": zip_code,
@@ -76,34 +127,51 @@ def run_apex_ingress_pipeline():
                     "retailPrice": feed["price"],
                     "customerName": owner_entity,
                     "customerAddress": full_address,
-                    "skipTrace": True,  # Flag telling Worker to run Tracerfy
+                    "skipTrace": True,  # Triggers Tracerfy enrichment in Cloudflare Worker
                     "dossier": {
                         "ownerManager": owner_entity,
                         "propertyAddress": full_address,
                         "cityNotice": violation_desc[:160],
-                        "estimatedJobSize": "$5,000.00 - $25,000.00"
-                    }
+                        "estimatedJobSize": "$5,000.00 - $25,000.00+",
+                    },
                 }
 
                 try:
-                    res = requests.post(API_URL, json=payload, headers=HEADERS, timeout=10)
+                    res = requests.post(
+                        API_URL, json=payload, headers=HEADERS, timeout=12
+                    )
                     if res.status_code in [200, 201]:
-                        print(f"  [+] DISPATCH SUCCESS -> {drop_id} | Location: {full_address}", flush=True)
+                        print(
+                            f"  [+] DISPATCH SUCCESS -> {drop_id} | Location: {full_address}",
+                            flush=True,
+                        )
                         total_posted += 1
                         matched_in_feed += 1
+                        time.sleep(0.25)  # Micro-throttle to protect downstream endpoints
+
                         if matched_in_feed >= 10:
                             break
                     else:
-                        print(f"  [!] Dispatch Error HTTP {res.status_code}: {res.text}", flush=True)
+                        print(
+                            f"  [!] Dispatch Error HTTP {res.status_code}: {res.text}",
+                            flush=True,
+                        )
                 except Exception as post_err:
                     print(f"  [!] Dispatch Exception: {post_err}", flush=True)
 
-            print(f"[+] Feed Complete for {feed['name']}: {matched_in_feed} records sent.", flush=True)
+            print(
+                f"[+] Feed Complete for {feed['name']}: {matched_in_feed} records sent.",
+                flush=True,
+            )
 
         except Exception as feed_err:
             print(f"[!] Feed Exception: {feed_err}", flush=True)
 
-    print(f"\n[*] Execution Complete. Total Leads Dispatched to Cloudflare: {total_posted}", flush=True)
+    print(
+        f"\n[*] Execution Complete. Total Leads Dispatched to Cloudflare: {total_posted}",
+        flush=True,
+    )
+
 
 if __name__ == "__main__":
     run_apex_ingress_pipeline()

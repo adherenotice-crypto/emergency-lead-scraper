@@ -1,35 +1,33 @@
-name: SoCal Courthouse Writ Scraper
+name: SoCal B2B Lead Scrubbing & Dispatch Pipeline
 
 on:
   schedule:
-    - cron: '0 */6 * * *'
-  workflow_dispatch:
+    - cron: '0 */6 * * *'  # Runs automatically every 6 hours
+  workflow_dispatch:        # Allows manual trigger button in GitHub UI
 
 jobs:
-  scrape-and-dispatch:
+  scrub-and-dispatch:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check out Repository
-        uses: actions/checkout@v4
+      - name: Checkout Code
+        uses: actions/checkout@v3
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
           python-version: '3.10'
 
-      - name: Install Python Dependencies
+      - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 playwright
+          pip install requests
 
-      - name: Install Playwright Chromium Dependencies
-        run: playwright install chromium --with-deps
-
-      - name: Run Lead Scraper
+      - name: Execute Lead Pipeline
         env:
-          EMERGENCY_KEY: ${{ secrets.EMERGENCY_KEY }}
-          MASTER_ADMIN_KEY: ${{ secrets.MASTER_ADMIN_KEY }}
-          API_URL: "https://emergencyaudit.com/api/ping"
-          APOLLO_API_KEY: ${{ secrets.APOLLO_API_KEY }}
-        run: python scraper.py
+          WORKER_URL: "https://emergencyaudit.com"
+          MASTER_ADMIN_KEY: "SecretKey_2026_Dispatch!"
+          TRACERFY_API_KEY: ${{ secrets.TRACERFY_API_KEY }}
+          ENABLE_TRACERFY: "false"  # CHANGE TO "true" WHEN READY TO RELEASE FUNDS & TRACE LIVE
+        run: |
+          python so_cal_lead_pipeline.py

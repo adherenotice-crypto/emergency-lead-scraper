@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
 ============================================================================
-EmergencyAudit.com! // AUTOMATED B2B SCRUBBING & DISPATCH PIPELINE
+EmergencyAudit.com | AUTOMATED PAY-PER-CALL PIPELINE & SCRAPER
 ============================================================================
-Architecture : GitHub Actions -> Socrata Municipal -> LA Assessor -> SOS Unmask -> Tracerfy -> Cloudflare
-Target Domain: emergencyaudit.com
+Architecture : GitHub Actions -> Socrata Municipal -> LA Assessor -> Tracerfy -> EmergencyAudit/case
 ============================================================================
 """
 
@@ -13,11 +12,20 @@ import re
 import json
 import time
 import requests
+from urllib.parse import quote
 
+# =====================================================================
+# 1. ENVIRONMENT CONFIGURATION & REMOTE KILL-SWITCH
+# =====================================================================
 WORKER_URL = os.getenv("WORKER_URL", "https://emergencyaudit.com")
 MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY", "SecretKey_2026_Dispatch!")
 TRACERFY_API_KEY = os.getenv("TRACERFY_API_KEY", "")
 ENABLE_TRACERFY = os.getenv("ENABLE_TRACERFY", "false").lower() == "true"
+
+# PIPELINE KILL SWITCH: Set PAUSE_PIPELINE="true" in GitHub Secrets / Env to pause execution instantly
+PAUSE_PIPELINE = os.getenv("PAUSE_PIPELINE", "false").lower() == "true"
+
+NETWORK_1800_NUMBER = os.getenv("NETWORK_1800_NUMBER", "18005550199")
 
 # Active SoCal Municipal Endpoints
 SOCRATA_FEEDS = [
@@ -40,16 +48,11 @@ SOCRATA_FEEDS = [
 
 ENTITY_PATTERNS = r"\b(LLC|INC|CORP|CORPORATION|HOLDINGS|PROPERTIES|TRUST|LP|PARTNERSHIP|REALTY)\b"
 
-VALUATION_MAP = {
-    "COMMERCIAL_REPAIR": "$5,000.00 - $25,000.00+",
-    "LOT_CLEANUP": "$1,500.00 - $5,000.00",
-    "TRADE_EMERGENCY": "$1,000.00 - $4,000.00",
-    "HANDYMAN": "$400.00 - $1,800.00",
-    "HAULING": "$500.00 - $2,200.00",
-    "CLEANING": "$300.00 - $1,200.00"
-}
-
+# =====================================================================
+# 2. DATA EXTRACTION & FIXES
+# =====================================================================
 def extract_address(item):
+    """Extracts clean street address from Socrata record."""
     for field in ["address", "primary_address", "prop_address", "site_address", "location_address", "street_address"]:
         val = item.get(field)
         if val and isinstance(val, str) and len(val.strip()) >= 5:
@@ -62,6 +65,7 @@ def extract_address(item):
     return combined.upper() if len(combined) >= 5 else None
 
 def extract_zip(item, address_text=""):
+    """Extracts valid 5-digit California ZIP code without random hash fallbacks."""
     for field in ["zip_code", "zipcode", "zip", "postal_code", "site_zip", "prop_zip", "zip_code_1"]:
         val = str(item.get(field, "")).strip()
         if re.match(r"^9\d{4}$", val):
@@ -71,39 +75,31 @@ def extract_zip(item, address_text=""):
     if match:
         return match.group(1)
 
-    fallback_zips = ["90210", "90001", "90028", "91401", "91101", "90802", "90501", "91764"]
-    return fallback_zips[abs(hash(address_text)) % len(fallback_zips)]
+    # Clean default for central LA instead of randomized fake zip assignment
+    return "90012"
 
 def extract_violation_desc(item):
-    """Deep search across Socrata text keys to pull real violation detail."""
+    """Search text fields to pull actual violation details."""
     for key in ["primary_violation", "violation_description", "order_type", "sub_type", "description", "case_type", "comments"]:
         val = item.get(key)
         if val and isinstance(val, str) and len(val.strip()) > 5:
             return val.strip()
-    return "Commercial Code Compliance & Maintenance Notice"
-
-def categorize_job(text, default_cat):
-    t = str(text).lower()
-    if re.search(r"\b(lot|vacant|brush|fire hazard|abatement|clearing|dumping|yard|weeds|debris)\b", t):
-        return "LOT_CLEANUP"
-    if re.search(r"\b(lock|locksmith|key|re-key|rekey|secure|board-up|door|handyman|gate|window|latch)\b", t):
-        return "HANDYMAN"
-    if re.search(r"\b(trash-out|junk|haul|hauling|clearout|dumpster|trash|accumulated)\b", t):
-        return "HAULING"
-    if re.search(r"\b(clean|cleaning|sanitized|deep clean|carpet|mold|sanitation|unsanitary)\b", t):
-        return "CLEANING"
-    if re.search(r"\b(remodel|drywall|paint|flooring|restoration|renovation|plumbing|electrical)\b", t):
-        return "TRADE_EMERGENCY"
-    return "COMMERCIAL_REPAIR"
+    return "Municipal Hazard & Compliance Order"
 
 def lookup_tax_assessor(address):
+    """Fixes LA Assessor query logic for multi-word street names."""
     try:
-        parts = re.sub(r"[^\w\s]", "", address).split()
+        clean_addr = re.sub(r"[^\w\s]", "", address).strip()
+        parts = clean_addr.split()
         if len(parts) >= 2:
-            street_num, street_name = parts[0], parts[1]
+            street_num = parts[0]
+            # Skip directionals (N, S, E, W) to match street name accurately
+            street_name = parts[2] if parts[1] in ["N", "S", "E", "W"] and len(parts) > 2 else parts[1]
+            
             url = "https://data.lacounty.gov/resource/28ee-2bgz.json"
             params = {"$where": f"situshouse_no='{street_num}' AND situsstreetname LIKE '%{street_name}%'", "$limit": "1"}
             res = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
+            
             if res.status_code == 200 and "json" in res.headers.get("Content-Type", ""):
                 records = res.json()
                 if isinstance(records, list) and len(records) > 0:
@@ -115,7 +111,7 @@ def lookup_tax_assessor(address):
                         "zip": rec.get("situszip") or rec.get("zip") or None
                     }
     except Exception as e:
-        print(f"⚠️ Assessor query exception for {address}: {e}")
+        print(f"[Assessor Query Warning] {address}: {e}")
 
     return {"owner_name": "PROPERTY OWNER / MANAGER", "mail_address": address, "apn": "N/A", "zip": None}
 
@@ -127,46 +123,57 @@ def unmask_entity_owner(owner_name, mail_address):
             return possible_human
     return owner_name
 
-def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90001"):
+def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90012"):
+    """Tracerfy Skip-tracing API call."""
     if not ENABLE_TRACERFY or not TRACERFY_API_KEY:
-        return {"phone": "Unmasked Upon Purchase", "email": "Unmasked Upon Purchase", "status": "HOLDING_MODE"}
+        return {"phone": None, "status": "HOLDING_MODE"}
 
     try:
-        url = "https://tracerfy.com/v1/api/trace/lookup/"
-        headers = {"Authorization": f"Bearer {TRACERFY_API_KEY}", "Content-Type": "application/json"}
-        payload = {"find_owner": human_name == "PROPERTY OWNER / MANAGER", "address": address, "city": city, "state": state, "zip": zip_code}
-        
-        if human_name != "PROPERTY OWNER / MANAGER":
-            parts = human_name.split()
-            payload["first_name"] = parts[0]
-            payload["last_name"] = " ".join(parts[1:]) if len(parts) > 1 else parts[0]
-
-        res = requests.post(url, json=payload, headers=headers, timeout=10)
+        url = "https://api.tracerfy.com/v1/skip-trace"
+        payload = {"address": address, "name": human_name, "api_key": TRACERFY_API_KEY}
+        res = requests.post(url, json=payload, timeout=8)
         if res.status_code == 200:
             data = res.json()
-            phones = data.get("phone_numbers") or data.get("phones") or []
-            emails = data.get("emails") or []
-            phone_val = phones[0].get("number") if phones and isinstance(phones[0], dict) else (phones[0] if phones else None)
-            return {"phone": phone_val or "Unmasked Upon Purchase", "email": emails[0] if emails else "Unmasked Upon Purchase", "status": "VERIFIED"}
+            phones = data.get("mobile_phones") or data.get("phones") or []
+            return {"phone": phones[0] if phones else None, "status": "VERIFIED"}
     except Exception as e:
-        print(f"⚠️ Tracerfy Exception: {e}")
+        print(f"[Tracerfy Warning] Exception: {e}")
 
-    return {"phone": "Unmasked Upon Purchase", "email": "Unmasked Upon Purchase", "status": "FAILED"}
+    return {"phone": None, "status": "FAILED"}
 
-def push_to_cloudflare(lead_payload):
+# =====================================================================
+# 3. PAY-PER-CALL ENGINE DISPATCH & REMOTE CHECK
+# =====================================================================
+def is_remote_paused():
+    """Checks Cloudflare Worker endpoint to see if Pause Toggle is active on back office."""
+    if PAUSE_PIPELINE:
+        return True
     try:
-        res = requests.post(f"{WORKER_URL}/api/ping", json=lead_payload, headers={"Content-Type": "application/json", "X-Emergency-Key": MASTER_ADMIN_KEY}, timeout=8)
-        return res.status_code == 200
+        res = requests.get(f"{WORKER_URL}/api/status", timeout=4)
+        if res.status_code == 200 and res.json().get("paused") is True:
+            return True
     except Exception:
-        return False
+        pass
+    return False
 
 def run_pipeline():
+    # 1. Kill switch evaluation
+    if is_remote_paused():
+        print("=====================================================")
+        print(" PIPELINE STATUS: PAUSED (Kill-Switch Active)")
+        print(" Execution stopped. No records processed or SMS sent.")
+        print("=====================================================")
+        return
+
+    print("[Pipeline] Running municipal extraction & routing...")
     processed_count = 0
+
     for feed in SOCRATA_FEEDS:
         try:
             res = requests.get(feed["url"], timeout=10)
             if res.status_code != 200:
                 continue
+                
             for item in res.json():
                 address = extract_address(item)
                 if not address:
@@ -175,39 +182,43 @@ def run_pipeline():
                 assessor_data = lookup_tax_assessor(address)
                 zip_code = assessor_data["zip"] or extract_zip(item, address)
                 violation = extract_violation_desc(item)
-                category = categorize_job(violation, feed["default_cat"])
-                case_no = item.get("case_number") or item.get("apno") or f"CASE-{int(time.time() * 1000) % 100000}"
+                case_no = item.get("case_number") or item.get("apno") or f"AUD-{int(time.time() * 1000) % 100000}"
                 human_owner = unmask_entity_owner(assessor_data["owner_name"], assessor_data["mail_address"])
                 trace_data = skip_trace(human_owner, address, "Los Angeles", "CA", zip_code)
 
+                # 2. Build Pay-Per-Call Dynamic URL
+                encoded_address = quote(address)
+                case_url = f"{WORKER_URL}/case?id={case_no}&address={encoded_address}&phone={NETWORK_1800_NUMBER}"
+
+                # 3. Payload for EmergencyAudit Pay-Per-Call System
                 payload = {
-                    "sku": f"EA-JOB-{zip_code}-{int(time.time() * 1000) % 9000 + 1000}",
-                    "dropId": f"job_SCRUBBED_{str(case_no).replace(' ', '_')}_{int(time.time())}",
-                    "partnerId": "github_pipeline_v3",
-                    "sourceChannel": f"City Record (Case #{case_no})",
-                    "category": category,
-                    "zip": zip_code,
-                    "city": "Los Angeles, CA",
-                    "customerName": human_owner,
-                    "customerAddress": f"{address}, Los Angeles, CA {zip_code}",
-                    "customerPhone": trace_data["phone"],
-                    "customerEmail": trace_data["email"],
-                    "desc_en": f"City Notice: {violation[:160]}",
-                    "estimatedValue": VALUATION_MAP.get(category, "$5,000.00 - $25,000.00+"),
-                    "dossier": {
-                        "ownerManager": human_owner,
-                        "directPhone": trace_data["phone"],
-                        "contactEmail": trace_data["email"],
-                        "cityNotice": violation[:180],
-                        "apnNumber": assessor_data["apn"],
-                        "taxMailingAddress": assessor_data["mail_address"]
-                    }
+                    "citation_id": case_no,
+                    "address": f"{address}, Los Angeles, CA {zip_code}",
+                    "owner_name": human_owner,
+                    "phone": trace_data["phone"],
+                    "violation": violation[:180],
+                    "case_url": case_url,
+                    "apn": assessor_data["apn"]
                 }
-                if push_to_cloudflare(payload):
-                    processed_count += 1
-                time.sleep(0.04)
+
+                # Push to Cloudflare Edge / Engine
+                try:
+                    res_push = requests.post(
+                        f"{WORKER_URL}/api/dispatch", 
+                        json=payload, 
+                        headers={"X-Emergency-Key": MASTER_ADMIN_KEY}, 
+                        timeout=5
+                    )
+                    if res_push.status_code == 200:
+                        processed_count += 1
+                except Exception:
+                    pass
+
+                time.sleep(0.05)
         except Exception as e:
-            print(f"Feed exception: {e}")
+            print(f"[Feed Exception] {feed['name']}: {e}")
+
+    print(f"[Batch Complete] Successfully processed {processed_count} municipal leads.")
 
 if __name__ == "__main__":
     run_pipeline()

@@ -1,4 +1,4 @@
-name: SoCal B2B Lead Scrubbing & Dispatch Pipeline
+name: EmergencyAudit Pay-Per-Call Pipeline
 
 on:
   schedule:
@@ -26,8 +26,10 @@ jobs:
       - name: Execute Lead Pipeline
         env:
           WORKER_URL: "https://emergencyaudit.com"
-          MASTER_ADMIN_KEY: "SecretKey_2026_Dispatch!"
+          MASTER_ADMIN_KEY: ${{ secrets.MASTER_ADMIN_KEY }}
           TRACERFY_API_KEY: ${{ secrets.TRACERFY_API_KEY }}
-          ENABLE_TRACERFY: "true"  # LIVE PAID SKIP-TRACING ACTIVATED
+          ENABLE_TRACERFY: "true"
+          PAUSE_PIPELINE: ${{ secrets.PAUSE_PIPELINE }}  # Set to "true" in GitHub Secrets to PAUSE execution
+          NETWORK_1800_NUMBER: "18005550199"
         run: |
-          python so_cal_lead_pipeline.py
+          python backend/scraper.py

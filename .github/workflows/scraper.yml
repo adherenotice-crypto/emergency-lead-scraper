@@ -3,7 +3,7 @@ name: SoCal B2B Lead Scrubbing & Dispatch Pipeline
 on:
   schedule:
     - cron: '0 */6 * * *'  # Runs automatically every 6 hours
-  workflow_dispatch:        # Manual run button in GitHub UI
+  workflow_dispatch:        # Allows manual trigger button in GitHub UI
 
 jobs:
   scrub-and-dispatch:
@@ -28,6 +28,6 @@ jobs:
           WORKER_URL: "https://emergencyaudit.com"
           MASTER_ADMIN_KEY: "SecretKey_2026_Dispatch!"
           TRACERFY_API_KEY: ${{ secrets.TRACERFY_API_KEY }}
-          ENABLE_TRACERFY: "false"  # TOGGLE TO "true" WHEN READY FOR LIVE PAID TRACERFY SPENDS
+          ENABLE_TRACERFY: "true"  # LIVE PAID SKIP-TRACING ACTIVATED
         run: |
           python so_cal_lead_pipeline.py

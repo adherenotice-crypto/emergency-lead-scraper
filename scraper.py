@@ -66,7 +66,6 @@ def lookup_tax_assessor(address):
     Returns: dict(owner_name, mail_address, apn)
     """
     try:
-        # Sanitize address for search query
         clean_addr = re.sub(r"[^\w\s]", "", address).split()[0:3]
         search_query = " ".join(clean_addr)
         
@@ -97,14 +96,12 @@ def unmask_entity_owner(owner_name, mail_address):
     """
     Extracts individual human decision-makers from LLCs, Trusts, and Corporations.
     """
-    # 1. Check for 'C/O' (In Care Of) Trustee/Manager on tax records
     if "C/O" in owner_name or "C/O" in mail_address:
         parts = owner_name.split("C/O") if "C/O" in owner_name else mail_address.split("C/O")
         possible_human = parts[-1].strip().split(",")[0]
         if len(possible_human) > 3 and not re.search(ENTITY_PATTERNS, possible_human):
             return possible_human
 
-    # 2. Check OpenCorporates API for LLC Managing Officer if corporate string detected
     if re.search(ENTITY_PATTERNS, owner_name):
         try:
             clean_company = re.sub(r"[^\w\s]", "", owner_name).strip()
@@ -122,11 +119,10 @@ def unmask_entity_owner(owner_name, mail_address):
         except Exception as e:
             print(f"⚠️ OpenCorporates unmask exception for {owner_name}: {e}")
 
-    # Fall back to cleaned owner name
     return owner_name
 
 # ============================================================================
-# STAGE 4: TRACERFY SKIP TRACING (CONDITIONAL / WAIT STATE SAFE)
+# STAGE 4: TRACERFY SKIP TRACING (CONDITIONAL / HOLDING MODE SAFE)
 # ============================================================================
 def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90001"):
     """
@@ -218,7 +214,6 @@ def run_pipeline():
             print(f"📥 Pulled {len(records)} raw municipal records. Scrubbing...")
 
             for item in records:
-                # 1. Extract Address
                 address = extract_address(item)
                 if not address:
                     continue  # Filter out broken junk records missing addresses
@@ -227,17 +222,12 @@ def run_pipeline():
                 case_no = item.get("case_number") or item.get("apno") or f"CASE-{int(time.time() * 1000) % 100000}"
                 violation = item.get("primary_violation") or item.get("description") or "Municipal Citation Order"
 
-                # 2. Tax Assessor Lookup
                 assessor_data = lookup_tax_assessor(address)
                 raw_owner = item.get("owner_name") or assessor_data["owner_name"]
 
-                # 3. Unmask Entity / Corporate Shell
                 human_decision_maker = unmask_entity_owner(raw_owner, assessor_data["mail_address"])
-
-                # 4. Skip Trace via Tracerfy (Safe holding mode if toggle is off)
                 trace_data = skip_trace(human_decision_maker, address, "Los Angeles", "CA", zip_code)
 
-                # 5. Build Scrubbed Production Payload
                 payload = {
                     "sku": f"EA-JOB-{zip_code}-{int(time.time()) % 9000 + 1000}",
                     "dropId": f"job_SCRUBBED_{case_no.replace(' ', '_')}",
@@ -251,7 +241,7 @@ def run_pipeline():
                     "customerPhone": trace_data["phone"],
                     "customerEmail": trace_data["email"],
                     "desc_en": f"City Notice: {violation[:160]}",
-                    "skipTrace": False,  # Already processed
+                    "skipTrace": False,
                     "dossier": {
                         "ownerManager": human_decision_maker,
                         "directPhone": trace_data["phone"],
@@ -262,11 +252,10 @@ def run_pipeline():
                     }
                 }
 
-                # 6. Inject into Live Cloudflare Engine
                 if push_to_cloudflare(payload):
                     processed_count += 1
 
-                time.sleep(0.1) # Rate limit protection
+                time.sleep(0.1)
 
         except Exception as err:
             print(f"❌ Error processing feed {feed['name']}: {err}")

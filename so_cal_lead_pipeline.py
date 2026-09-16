@@ -36,8 +36,8 @@ SOCRATA_FEEDS = [
         "default_cat": "LOT_CLEANUP"
     },
     {
-        "name": "LA Housing - Code Violations & Systemic Inspection",
-        "url": "https://data.lacity.org/resource/2n62-383m.json?$limit=150",
+        "name": "LA Building & Safety - Building Permits & Orders",
+        "url": "https://data.lacity.org/resource/y94q-85p2.json?$limit=150",
         "default_cat": "TRADE_EMERGENCY"
     }
 ]
@@ -68,12 +68,10 @@ def extract_zip(item, address_text=""):
         if re.match(r"^9\d{4}$", val):
             return val
 
-    # Regex search across full address string
     match = re.search(r"\b(9\d{4})\b", str(address_text))
     if match:
         return match.group(1)
 
-    # Varied regional fallback distribution based on address hash
     fallback_zips = ["90210", "90001", "90028", "91401", "91101", "90802", "90501", "91764"]
     idx = abs(hash(address_text)) % len(fallback_zips)
     return fallback_zips[idx]
@@ -270,15 +268,11 @@ def run_pipeline():
             for item in records:
                 address = extract_address(item)
                 if not address:
-                    continue  # Filter out broken records missing property address
+                    continue
 
-                # Tax Assessor Lookup
                 assessor_data = lookup_tax_assessor(address)
-
-                # Zip Code Resolution
                 zip_code = assessor_data["zip"] or extract_zip(item, address)
 
-                # Dynamic Violation & Category Classification
                 violation = (
                     item.get("primary_violation")
                     or item.get("violation_description")
@@ -296,7 +290,7 @@ def run_pipeline():
 
                 payload = {
                     "sku": f"EA-JOB-{zip_code}-{int(time.time() * 1000) % 9000 + 1000}",
-                    "dropId": f"job_SCRUBBED_{case_no.replace(' ', '_')}_{int(time.time())}",
+                    "dropId": f"job_SCRUBBED_{str(case_no).replace(' ', '_')}_{int(time.time())}",
                     "partnerId": "github_pipeline_v2",
                     "sourceChannel": f"City Record (Case #{case_no})",
                     "category": category,

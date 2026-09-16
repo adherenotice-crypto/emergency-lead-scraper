@@ -21,7 +21,7 @@ WORKER_URL = os.getenv("WORKER_URL", "https://emergencyaudit.com")
 MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY", "SecretKey_2026_Dispatch!")
 TRACERFY_API_KEY = os.getenv("TRACERFY_API_KEY", "")
 
-# SET TO 'false' TO TEST PIPELINE FLOW WITHOUT SPENDING TRACERFY CREDITS
+# SET TO 'true' WHEN READY FOR LIVE PAID TRACERFY TRACES
 ENABLE_TRACERFY = os.getenv("ENABLE_TRACERFY", "false").lower() == "true"
 
 SOCRATA_FEEDS = [
@@ -36,8 +36,8 @@ SOCRATA_FEEDS = [
         "default_cat": "LOT_CLEANUP"
     },
     {
-        "name": "LA Building & Safety - Building Permits & Orders",
-        "url": "https://data.lacity.org/resource/y94q-85p2.json?$limit=150",
+        "name": "LA Building & Safety - Building Permits Issued",
+        "url": "https://data.lacity.org/resource/794q-22s2.json?$limit=100",
         "default_cat": "TRADE_EMERGENCY"
     }
 ]
@@ -62,7 +62,7 @@ def extract_address(item):
 
 
 def extract_zip(item, address_text=""):
-    """Scans all Socrata location fields and address text for valid 5-digit SoCal zip codes."""
+    """Scans Socrata fields and address text for 5-digit SoCal zip codes."""
     for field in ["zip_code", "zipcode", "zip", "postal_code", "site_zip", "prop_zip", "zip_code_1"]:
         val = str(item.get(field, "")).strip()
         if re.match(r"^9\d{4}$", val):
@@ -78,7 +78,7 @@ def extract_zip(item, address_text=""):
 
 
 # ============================================================================
-# STAGE 2: DYNAMIC JOB CATEGORIZER (ROUTER)
+# STAGE 2: DYNAMIC JOB CATEGORIZER
 # ============================================================================
 def categorize_job(text, default_cat):
     """Categorizes violation text into trade buckets matching pricing tiers."""
@@ -104,7 +104,7 @@ def categorize_job(text, default_cat):
 # STAGE 3: TAX ASSESSOR LOOKUP (LA COUNTY OPEN DATA)
 # ============================================================================
 def lookup_tax_assessor(address):
-    """Queries LA County Assessor Portal with structured parameters to retrieve owner & APN."""
+    """Queries LA County Assessor Portal to match property address to tax roll owner."""
     try:
         parts = re.sub(r"[^\w\s]", "", address).split()
         if len(parts) >= 2:
@@ -147,7 +147,7 @@ def lookup_tax_assessor(address):
 # STAGE 4: UNMASK CORPORATE SHELLS (LLC / TRUST / INC)
 # ============================================================================
 def unmask_entity_owner(owner_name, mail_address):
-    """Extracts individual decision-makers from LLCs, Trusts, and Corporations."""
+    """Extracts individual human decision-makers from LLCs, Trusts, and Corporations."""
     if "C/O" in owner_name or "C/O" in mail_address:
         parts = owner_name.split("C/O") if "C/O" in owner_name else mail_address.split("C/O")
         possible_human = parts[-1].strip().split(",")[0]
@@ -175,10 +175,10 @@ def unmask_entity_owner(owner_name, mail_address):
 
 
 # ============================================================================
-# STAGE 5: TRACERFY SKIP TRACING (HOLDING MODE SAFE)
+# STAGE 5: TRACERFY SKIP TRACING (OFFICIAL BEARER TOKEN API)
 # ============================================================================
 def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90001"):
-    """Executes Tracerfy skip-trace only if ENABLE_TRACERFY=true and API Key exists."""
+    """Executes Tracerfy skip-trace lookup using Bearer token authentication."""
     if not ENABLE_TRACERFY or not TRACERFY_API_KEY:
         print(f"⏳ TRACERFY IN HOLDING MODE: Bypassing API charge for {human_name}")
         return {
@@ -188,28 +188,48 @@ def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90
         }
 
     try:
-        res = requests.post(
-            "https://api.tracerfy.com/v1/skip-trace",
-            json={
-                "api_key": TRACERFY_API_KEY,
-                "full_name": human_name,
-                "address": address,
-                "city": city,
-                "state": state,
-                "zip": zip_code
-            },
-            headers={"Content-Type": "application/json"},
-            timeout=8
-        )
+        url = "https://tracerfy.com/v1/api/trace/lookup/"
+        headers = {
+            "Authorization": f"Bearer {TRACERFY_API_KEY}",
+            "Content-Type": "application/json"
+        }
+
+        payload = {
+            "find_owner": True if human_name == "PROPERTY OWNER / MANAGER" else False,
+            "address": address,
+            "city": city,
+            "state": state,
+            "zip": zip_code
+        }
+
+        if human_name != "PROPERTY OWNER / MANAGER":
+            parts = human_name.split()
+            payload["first_name"] = parts[0]
+            payload["last_name"] = " ".join(parts[1:]) if len(parts) > 1 else parts[0]
+
+        res = requests.post(url, json=payload, headers=headers, timeout=10)
         if res.status_code == 200:
             data = res.json()
+            phones = data.get("phone_numbers") or data.get("phones") or []
+            emails = data.get("emails") or []
+
+            phone_val = (
+                phones[0].get("number")
+                if isinstance(phones, list) and len(phones) > 0 and isinstance(phones[0], dict)
+                else (phones[0] if isinstance(phones, list) and len(phones) > 0 else data.get("phone"))
+            )
+            email_val = emails[0] if isinstance(emails, list) and len(emails) > 0 else data.get("email")
+
+            print(f"⚡ TRACERFY HIT: {human_name} -> Phone: {phone_val or 'Found'}")
             return {
-                "phone": data.get("phone") or data.get("mobile_phone") or "Unmasked Upon Purchase",
-                "email": data.get("email") or "Unmasked Upon Purchase",
+                "phone": phone_val or "Unmasked Upon Purchase",
+                "email": email_val or "Unmasked Upon Purchase",
                 "status": "VERIFIED_TRACERFY"
             }
+        else:
+            print(f"⚠️ Tracerfy API Non-200 [{res.status_code}]: {res.text[:120]}")
     except Exception as e:
-        print(f"⚠️ Tracerfy API Error for {human_name}: {e}")
+        print(f"⚠️ Tracerfy API Exception for {human_name}: {e}")
 
     return {
         "phone": "Unmasked Upon Purchase",

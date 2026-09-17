@@ -3,7 +3,7 @@ name: EmergencyAudit Pay-Per-Call Pipeline
 on:
   schedule:
     - cron: '0 */6 * * *'  # Runs automatically every 6 hours
-  workflow_dispatch:        # Enables manual "Run workflow" button in GitHub
+  workflow_dispatch:         # Enables manual "Run workflow" button in GitHub
 
 jobs:
   scrub-and-dispatch:
@@ -36,4 +36,4 @@ jobs:
           TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
           TWILIO_PHONE_NUMBER: ${{ secrets.TWILIO_PHONE_NUMBER }}
         run: |
-          python scraper.py
+          python so_cal_lead_pipeline.py

@@ -3,7 +3,7 @@ name: EmergencyAudit Pay-Per-Call Pipeline
 on:
   schedule:
     - cron: '0 */6 * * *'  # Runs automatically every 6 hours
-  workflow_dispatch:        # Enables the manual "Run workflow" button in GitHub
+  workflow_dispatch:        # Enables manual "Run workflow" button in GitHub
 
 jobs:
   scrub-and-dispatch:
@@ -21,7 +21,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests twilio
+          pip install requests
 
       - name: Execute Scraper Pipeline
         env:
@@ -31,5 +31,9 @@ jobs:
           ENABLE_TRACERFY: "true"
           PAUSE_PIPELINE: ${{ secrets.PAUSE_PIPELINE }}
           NETWORK_1800_NUMBER: "18005550199"
+          ENABLE_TWILIO_SMS: "true"
+          TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
+          TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
+          TWILIO_PHONE_NUMBER: ${{ secrets.TWILIO_PHONE_NUMBER }}
         run: |
           python scraper.py

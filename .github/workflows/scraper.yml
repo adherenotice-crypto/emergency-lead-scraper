@@ -3,7 +3,7 @@ name: EmergencyAudit Pay-Per-Call Pipeline
 on:
   schedule:
     - cron: '0 */6 * * *'  # Runs automatically every 6 hours
-  workflow_dispatch:        # Allows manual trigger button in GitHub UI
+  workflow_dispatch:        # Enables the manual "Run workflow" button in GitHub
 
 jobs:
   scrub-and-dispatch:
@@ -21,15 +21,15 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          pip install requests twilio
 
-      - name: Execute Lead Pipeline
+      - name: Execute Scraper Pipeline
         env:
           WORKER_URL: "https://emergencyaudit.com"
           MASTER_ADMIN_KEY: ${{ secrets.MASTER_ADMIN_KEY }}
           TRACERFY_API_KEY: ${{ secrets.TRACERFY_API_KEY }}
           ENABLE_TRACERFY: "true"
-          PAUSE_PIPELINE: ${{ secrets.PAUSE_PIPELINE }}  # Set to "true" in GitHub Secrets to PAUSE execution
+          PAUSE_PIPELINE: ${{ secrets.PAUSE_PIPELINE }}
           NETWORK_1800_NUMBER: "18005550199"
         run: |
-          python backend/scraper.py
+          python scraper.py

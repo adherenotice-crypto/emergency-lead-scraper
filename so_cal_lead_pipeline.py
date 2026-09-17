@@ -4,7 +4,7 @@
 EmergencyAudit.com | AUTOMATED PAY-PER-CALL PIPELINE & SCRAPER
 ============================================================================
 Architecture : GitHub Actions -> Socrata Municipal -> LA Assessor -> Tracerfy 
-               -> Cloudflare Worker -> Twilio SMS -> EmergencyAudit/case
+               -> Cloudflare Worker -> Twilio SMS -> EmergencyAudit /case
 ============================================================================
 """
 
@@ -12,11 +12,13 @@ import os
 import re
 import json
 import time
+import datetime
+from zoneinfo import ZoneInfo
 import requests
 from urllib.parse import quote
 
 # =====================================================================
-# 1. ENVIRONMENT CONFIGURATION & REMOTE KILL-SWITCH
+# 1. ENVIRONMENT CONFIGURATION & SYSTEM CONTROLS
 # =====================================================================
 WORKER_URL = os.getenv("WORKER_URL", "https://emergencyaudit.com")
 MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY", "EmergencyAudit_Master_Key_2027!")
@@ -26,37 +28,92 @@ ENABLE_TRACERFY = os.getenv("ENABLE_TRACERFY", "false").lower() == "true"
 # TWILIO CONFIGURATION
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
-TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "")
+TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "") or os.getenv("TWILIO_FROM_NUMBER", "")
 ENABLE_TWILIO_SMS = os.getenv("ENABLE_TWILIO_SMS", "false").lower() == "true"
 
-# PIPELINE KILL SWITCH: Set PAUSE_PIPELINE="true" in GitHub Secrets / Env to pause execution instantly
+# SYSTEM CONTROLS & SAFETY FLAGS
 PAUSE_PIPELINE = os.getenv("PAUSE_PIPELINE", "false").lower() == "true"
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
+STAGING_MODE = os.getenv("STAGING_MODE", "false").lower() == "true"
 
+# PHONE & WEBHOOK CONFIGURATION
 NETWORK_1800_NUMBER = os.getenv("NETWORK_1800_NUMBER", "18005550199")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")  # Discord/Slack Webhook for alerts
 
-# Active SoCal Municipal Endpoints
+# ACTIVE SOCAL MUNICIPAL ENDPOINTS
 SOCRATA_FEEDS = [
     {
         "name": "LA Building & Safety - Code Enforcement",
         "url": "https://data.lacity.org/resource/u82d-eh7z.json?$limit=150",
-        "default_cat": "COMMERCIAL_REPAIR"
+        "default_cat": "COMMERCIAL"
     },
     {
         "name": "LA Building & Safety - Vacant Abatement",
         "url": "https://data.lacity.org/resource/q3ak-s5hy.json?$limit=150",
-        "default_cat": "LOT_CLEANUP"
+        "default_cat": "EMERGENCY"
     },
     {
         "name": "LA City Active Code Citations & Orders",
         "url": "https://data.lacity.org/resource/2n62-383m.json?$limit=150",
-        "default_cat": "TRADE_EMERGENCY"
+        "default_cat": "TRADE"
     }
 ]
 
-ENTITY_PATTERNS = r"\b(LLC|INC|CORP|CORPORATION|HOLDINGS|PROPERTIES|TRUST|LP|PARTNERSHIP|REALTY)\b"
+CORPORATE_KEYWORDS = [
+    "LLC", "INC", "CORP", "CORPORATION", "HOLDINGS", "PROPERTIES", 
+    "TRUST", "LP", "PARTNERSHIP", "REALTY", "BANK", "CITY OF", "DEPT"
+]
+
+# MUNICIPAL CODE TRANSLATION DICTIONARY
+MUNICIPAL_CODE_MAP = {
+    # Building & Structural (Commercial)
+    "91.8104": {"desc": "Unsafe Building Maintenance & Structural Hazard Notice", "category": "COMMERCIAL"},
+    "91.103.1": {"desc": "Unpermitted Construction & Alteration Order", "category": "COMMERCIAL"},
+    "17920.3": {"desc": "Substandard Structure & Building Compliance Order", "category": "COMMERCIAL"},
+    
+    # Emergency & Hazard Remediation
+    "57.105.1": {"desc": "Fire Safety Violation & Hazardous Material Storage Order", "category": "EMERGENCY"},
+    "91.8903": {"desc": "Emergency Abatement & Secure Building Notice", "category": "EMERGENCY"},
+    
+    # Lot Clean-Up & Exterior Trade
+    "64.70": {"desc": "Water Quality & Environmental Discharge Violation", "category": "TRADE"},
+    "22.110": {"desc": "Zoning Non-Compliance & Overgrown Lot Clean-Up Order", "category": "TRADE"}
+}
+
 
 # =====================================================================
-# 2. DATA EXTRACTION & FIXES
+# 2. SYSTEM HEALTH & SAFETY GUARDRAILS
+# =====================================================================
+def send_webhook_alert(message):
+    """Dispatches instant failure notifications to Discord or Slack."""
+    if not WEBHOOK_URL:
+        return
+    try:
+        payload = {"content": f"🚨 **EmergencyAudit Pipeline Alert:** {message}"}
+        requests.post(WEBHOOK_URL, json=payload, timeout=5)
+    except Exception as e:
+        print(f"[Webhook Exception] {e}")
+
+def is_remote_paused():
+    """Checks Cloudflare Worker endpoint to see if Pause Toggle is active on back office."""
+    if PAUSE_PIPELINE:
+        return True
+    try:
+        res = requests.get(f"{WORKER_URL}/api/status", timeout=4)
+        if res.status_code == 200 and res.json().get("paused") is True:
+            return True
+    except Exception as e:
+        print(f"[Warning] Could not fetch remote pause status: {e}")
+    return False
+
+def is_compliant_sms_window(tz_name="America/Los_Angeles", start_hour=8, end_hour=20):
+    """TCPA Guardrail: Returns True only between 8:00 AM and 8:00 PM Pacific Time."""
+    local_now = datetime.datetime.now(ZoneInfo(tz_name))
+    return start_hour <= local_now.hour < end_hour
+
+
+# =====================================================================
+# 3. MUNICIPAL EXTRACTION & DATA PARSING
 # =====================================================================
 def extract_address(item):
     """Extracts clean street address from Socrata record."""
@@ -85,15 +142,26 @@ def extract_zip(item, address_text=""):
     return "90012"
 
 def extract_violation_desc(item):
-    """Search text fields to pull actual violation details."""
+    """Searches text fields to pull actual violation details."""
     for key in ["primary_violation", "violation_description", "order_type", "sub_type", "description", "case_type", "comments"]:
         val = item.get(key)
         if val and isinstance(val, str) and len(val.strip()) > 5:
             return val.strip()
     return "Municipal Hazard & Compliance Order"
 
+def translate_municipal_code(raw_violation_string, default_category="COMMERCIAL"):
+    """Parses raw ordinance numbers, returning plain English descriptions and revenue categories."""
+    if not raw_violation_string or raw_violation_string.strip() == "":
+        return "Municipal Hazard & Code Compliance Order", default_category
+
+    for code, info in MUNICIPAL_CODE_MAP.items():
+        if code in raw_violation_string:
+            return info["desc"], info["category"]
+
+    return raw_violation_string, default_category
+
 def lookup_tax_assessor(address):
-    """Fixes LA Assessor query logic and handles non-JSON error responses gracefully."""
+    """Queries LA County Assessor endpoint for parcel APN and owner details."""
     try:
         clean_addr = re.sub(r"[^\w\s]", "", address).strip()
         parts = clean_addr.split()
@@ -117,44 +185,67 @@ def lookup_tax_assessor(address):
                             "zip": rec.get("situszip") or rec.get("zip") or None
                         }
                 except ValueError:
-                    pass  # Suppress JSON parse errors when Socrata returns non-JSON responses
-    except Exception:
-        pass
+                    pass
+    except Exception as e:
+        print(f"[Assessor Exception] {e}")
 
     return {"owner_name": "PROPERTY OWNER / MANAGER", "mail_address": address, "apn": "N/A", "zip": None}
 
 def unmask_entity_owner(owner_name, mail_address):
+    """Extracts human contact name if C/O entity is present."""
     if "C/O" in owner_name or "C/O" in mail_address:
         parts = owner_name.split("C/O") if "C/O" in owner_name else mail_address.split("C/O")
         possible_human = parts[-1].strip().split(",")[0]
-        if len(possible_human) > 3 and not re.search(ENTITY_PATTERNS, possible_human):
+        if len(possible_human) > 3 and not any(kw in possible_human.upper() for kw in CORPORATE_KEYWORDS):
             return possible_human
     return owner_name
 
+def is_corporate_entity(name):
+    """Pre-scrubbing filter: Returns True if owner name contains corporate keywords."""
+    if not name:
+        return False
+    upper_name = name.upper()
+    return any(keyword in upper_name for keyword in CORPORATE_KEYWORDS)
+
+
+# =====================================================================
+# 4. SKIP-TRACING & TWILIO DISPATCH ENGINES
+# =====================================================================
 def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90012"):
-    """Tracerfy Skip-tracing API call with DNS fail-safe."""
+    """Tracerfy Skip-tracing API call for mobile unmasking."""
     if not ENABLE_TRACERFY or not TRACERFY_API_KEY:
-        return {"phone": None, "status": "HOLDING_MODE"}
+        return {"phone": None, "status": "HOLDING_MODE", "phone_type": "UNKNOWN"}
 
     try:
-        url = "https://api.tracerfy.com/v1/skip-trace"
-        payload = {"address": address, "name": human_name, "api_key": TRACERFY_API_KEY}
-        res = requests.post(url, json=payload, timeout=8)
+        url = "https://api.tracerfy.com/v1/search"
+        payload = {"name": human_name, "address": address, "city": city, "state": state, "zip": zip_code}
+        headers = {"Authorization": f"Bearer {TRACERFY_API_KEY}", "Content-Type": "application/json"}
+        res = requests.post(url, json=payload, headers=headers, timeout=8)
+        
         if res.status_code == 200:
             data = res.json()
-            phones = data.get("mobile_phones") or data.get("phones") or []
-            return {"phone": phones[0] if phones else None, "status": "VERIFIED"}
-    except requests.exceptions.RequestException:
-        return {"phone": None, "status": "DNS_FAILED"}
+            for phone_obj in data.get("phones", []):
+                if phone_obj.get("type", "").lower() == "mobile":
+                    return {"phone": phone_obj.get("number"), "status": "VERIFIED", "phone_type": "MOBILE"}
+    except Exception as e:
+        print(f"[Tracerfy Error] {e}")
+        send_webhook_alert(f"Tracerfy API lookup failed for {address}: {e}")
 
-    return {"phone": None, "status": "FAILED"}
+    return {"phone": None, "status": "FAILED", "phone_type": "NO_MOBILE"}
 
-# =====================================================================
-# 3. TWILIO SMS ENGINE DISPATCH
-# =====================================================================
-def send_twilio_sms(to_phone, address_text, case_url, case_no):
+def send_twilio_sms(to_phone, case_no, case_url):
     """Dispatches automated SMS notice containing Door 2 case link."""
-    if not ENABLE_TWILIO_SMS or not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN or not TWILIO_PHONE_NUMBER:
+    if not ENABLE_TWILIO_SMS:
+        print(f"[SMS Skipped] ENABLE_TWILIO_SMS=false for Case #{case_no}")
+        return False
+
+    if not is_compliant_sms_window():
+        print(f"[TCPA Quiet Hours] Outside legal sending window. Holding SMS for Case #{case_no}")
+        return False
+
+    if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_PHONE_NUMBER):
+        print("[Twilio Error] Missing Twilio credentials.")
+        send_webhook_alert("Twilio dispatch failed due to missing API credentials.")
         return False
 
     if not to_phone or len(to_phone.strip()) < 10:
@@ -165,10 +256,7 @@ def send_twilio_sms(to_phone, address_text, case_url, case_no):
         if not clean_phone.startswith("+"):
             clean_phone = f"+1{clean_phone}" if len(clean_phone) == 10 else f"+{clean_phone}"
 
-        sms_body = (
-            f"NOTICE: A municipal record flag (#{case_no}) has been indexed regarding property parcel "
-            f"{address_text}. Review case details & resolution options: {case_url}"
-        )
+        sms_body = f"Public Record Advisory: Citation #{case_no} indexed. Review parcel status & resolution options: {case_url} Reply STOP to opt out."
 
         twilio_url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Messages.json"
         data = {
@@ -185,101 +273,152 @@ def send_twilio_sms(to_phone, address_text, case_url, case_no):
         )
 
         if res.status_code in [200, 201]:
-            print(f"[Twilio SMS Sent] -> {clean_phone} (Case: {case_no})")
+            print(f"[Twilio Success] Sent SMS to {clean_phone} for Case #{case_no}")
             return True
         else:
-            print(f"[Twilio Error] {res.status_code}: {res.text}")
+            print(f"[Twilio Error {res.status_code}] {res.text}")
+            send_webhook_alert(f"Twilio API rejected message for Case #{case_no}: {res.text}")
     except Exception as e:
         print(f"[Twilio Exception] {e}")
+        send_webhook_alert(f"Twilio API exception for Case #{case_no}: {e}")
 
     return False
 
-# =====================================================================
-# 4. PAY-PER-CALL ENGINE DISPATCH & REMOTE CHECK
-# =====================================================================
-def is_remote_paused():
-    """Checks Cloudflare Worker endpoint to see if Pause Toggle is active on back office."""
-    if PAUSE_PIPELINE:
-        return True
-    try:
-        res = requests.get(f"{WORKER_URL}/api/status", timeout=4)
-        if res.status_code == 200 and res.json().get("paused") is True:
-            return True
-    except Exception:
-        pass
-    return False
 
+# =====================================================================
+# 5. MASTER PIPELINE EXECUTION ENGINE
+# =====================================================================
 def run_pipeline():
     if is_remote_paused():
         print("=====================================================")
         print(" PIPELINE STATUS: PAUSED (Kill-Switch Active)")
         print(" Execution stopped. No records processed or SMS sent.")
         print("=====================================================")
+        send_webhook_alert("Pipeline execution skipped because System Remote Kill-Switch is ACTIVE.")
         return
 
     print("[Pipeline] Running municipal extraction & routing...")
     processed_count = 0
     sms_sent_count = 0
 
+    # Step A: Collect and Deduplicate Scraped Leads by Parcel Address
+    grouped_properties = {}
+
     for feed in SOCRATA_FEEDS:
         try:
             res = requests.get(feed["url"], timeout=10)
             if res.status_code != 200:
+                send_webhook_alert(f"Socrata Feed Failure [{res.status_code}]: {feed['name']}")
                 continue
-                
+
             for item in res.json():
                 address = extract_address(item)
-                if not address:
+                if not address or len(address) < 5:
                     continue
 
-                assessor_data = lookup_tax_assessor(address)
-                zip_code = assessor_data["zip"] or extract_zip(item, address)
-                violation = extract_violation_desc(item)
+                raw_violation = extract_violation_desc(item)
+                plain_violation, category = translate_municipal_code(raw_violation, feed["default_cat"])
                 case_no = item.get("case_number") or item.get("apno") or f"AUD-{int(time.time() * 1000) % 100000}"
-                human_owner = unmask_entity_owner(assessor_data["owner_name"], assessor_data["mail_address"])
-                trace_data = skip_trace(human_owner, address, "Los Angeles", "CA", zip_code)
 
-                # Build Pay-Per-Call Dynamic URL (Door 2 Case Link)
-                encoded_address = quote(f"{address}, Los Angeles, CA {zip_code}")
-                case_url = f"{WORKER_URL}/case?id={case_no}&address={encoded_address}&phone={NETWORK_1800_NUMBER}"
+                if address not in grouped_properties:
+                    grouped_properties[address] = {
+                        "address": address,
+                        "case_no": case_no,
+                        "raw_items": [item],
+                        "violations": [plain_violation],
+                        "raw_codes": [raw_violation],
+                        "category": category,
+                        "zip_code": extract_zip(item, address)
+                    }
+                else:
+                    # Append additional violation to existing property record
+                    if plain_violation not in grouped_properties[address]["violations"]:
+                        grouped_properties[address]["violations"].append(plain_violation)
+                        grouped_properties[address]["raw_codes"].append(raw_violation)
 
-                phone_number = trace_data["phone"]
-
-                # Payload for EmergencyAudit Back Office KV Store
-                payload = {
-                    "citation_id": case_no,
-                    "address": f"{address}, Los Angeles, CA {zip_code}",
-                    "owner_name": human_owner,
-                    "phone": phone_number,
-                    "customerPhone": phone_number or "Unmasked Upon Purchase",
-                    "violation": violation[:180],
-                    "case_url": case_url,
-                    "apn": assessor_data["apn"]
-                }
-
-                # Push to Cloudflare Edge / Engine
-                try:
-                    res_push = requests.post(
-                        f"{WORKER_URL}/api/dispatch", 
-                        json=payload, 
-                        headers={"X-Emergency-Key": MASTER_ADMIN_KEY}, 
-                        timeout=5
-                    )
-                    if res_push.status_code == 200:
-                        processed_count += 1
-
-                        if phone_number:
-                            if send_twilio_sms(phone_number, address, case_url, case_no):
-                                sms_sent_count += 1
-                    else:
-                        print(f"❌ DISPATCH REJECTED [{res_push.status_code}]: {res_push.text}")
-
-                except Exception as e:
-                    print(f"[Dispatch Error] {e}")
-
-                time.sleep(0.05)
         except Exception as e:
             print(f"[Feed Exception] {feed['name']}: {e}")
+            send_webhook_alert(f"Feed exception in {feed['name']}: {e}")
+
+    print(f"[Deduplication Complete] Grouped into {len(grouped_properties)} unique property parcels.")
+
+    # Step B: Process Grouped Parcels
+    for address, prop in grouped_properties.items():
+        case_no = prop["case_no"]
+        assessor_data = lookup_tax_assessor(address)
+        zip_code = assessor_data["zip"] or prop["zip_code"]
+        human_owner = unmask_entity_owner(assessor_data["owner_name"], assessor_data["mail_address"])
+
+        # 1. Pre-Scrub Filter: Corporate Entities
+        if is_corporate_entity(human_owner):
+            print(f"[Pre-Scrub] Skipping corporate entity '{human_owner}' for Case #{case_no}")
+            continue
+
+        # 2. Skip-Trace Owner Cell Phone
+        trace_data = skip_trace(human_owner, address, "Los Angeles", "CA", zip_code)
+        phone_number = trace_data["phone"]
+        phone_type = trace_data["phone_type"]
+
+        # 3. Construct Case Notice URL
+        encoded_address = quote(f"{address}, Los Angeles, CA {zip_code}")
+        case_url = f"{WORKER_URL}/case?id={case_no}&address={encoded_address}&phone={NETWORK_1800_NUMBER}"
+
+        # 4. Format Combined Violation Strings
+        combined_violations = " • ".join(prop["violations"])
+        combined_raw_codes = " | ".join(prop["raw_codes"])
+
+        # 5. Determine Initial Staging Status
+        initial_status = "PENDING_REVIEW" if STAGING_MODE else "INDEXED"
+
+        payload = {
+            "citation_id": case_no,
+            "address": f"{address}, Los Angeles, CA {zip_code}",
+            "owner_name": human_owner,
+            "phone": phone_number or "PENDING UNMASK",
+            "customerPhone": phone_number or "Unmasked Upon Purchase",
+            "phone_type": phone_type,
+            "violation": combined_violations[:250],
+            "raw_code": combined_raw_codes[:250],
+            "category": prop["category"],
+            "case_url": case_url,
+            "apn": assessor_data["apn"],
+            "status": initial_status
+        }
+
+        # 6. Dry-Run Check
+        if DRY_RUN:
+            print(f"[DRY-RUN EXECUTION] Case #{case_no} | Category: {prop['category']} | Phone: {phone_number} ({phone_type})")
+            continue
+
+        # 7. Push Lead Payload to Cloudflare KV Store
+        try:
+            res_push = requests.post(
+                f"{WORKER_URL}/api/dispatch", 
+                json=payload, 
+                headers={"X-Emergency-Key": MASTER_ADMIN_KEY}, 
+                timeout=5
+            )
+            if res_push.status_code == 200:
+                processed_count += 1
+
+                # 8. Dispatch SMS (Skipped if STAGING_MODE is True)
+                if not STAGING_MODE and phone_number and phone_type == "MOBILE":
+                    if send_twilio_sms(phone_number, case_no, case_url):
+                        sms_sent_count += 1
+                        payload["status"] = "SENT"
+                        requests.post(
+                            f"{WORKER_URL}/api/dispatch", 
+                            json=payload, 
+                            headers={"X-Emergency-Key": MASTER_ADMIN_KEY}, 
+                            timeout=5
+                        )
+            else:
+                print(f"❌ DISPATCH REJECTED [{res_push.status_code}]: {res_push.text}")
+
+        except Exception as e:
+            print(f"[Dispatch Error] {e}")
+
+        time.sleep(0.05)
 
     print(f"[Batch Complete] Processed {processed_count} records | Sent {sms_sent_count} SMS notices.")
 

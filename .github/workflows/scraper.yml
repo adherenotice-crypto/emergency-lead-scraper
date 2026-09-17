@@ -30,7 +30,10 @@ jobs:
           TRACERFY_API_KEY: ${{ secrets.TRACERFY_API_KEY }}
           ENABLE_TRACERFY: "true"
           PAUSE_PIPELINE: ${{ secrets.PAUSE_PIPELINE }}
-          NETWORK_1800_NUMBER: "18005550199"
+          DRY_RUN: ${{ secrets.DRY_RUN }}
+          STAGING_MODE: ${{ secrets.STAGING_MODE }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          NETWORK_1800_NUMBER: ${{ secrets.NETWORK_1800_NUMBER }}
           ENABLE_TWILIO_SMS: "true"
           TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
           TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}

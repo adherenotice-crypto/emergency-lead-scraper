@@ -93,7 +93,7 @@ def extract_violation_desc(item):
     return "Municipal Hazard & Compliance Order"
 
 def lookup_tax_assessor(address):
-    """Fixes LA Assessor query logic for multi-word street names."""
+    """Fixes LA Assessor query logic and handles non-JSON error responses gracefully."""
     try:
         clean_addr = re.sub(r"[^\w\s]", "", address).strip()
         parts = clean_addr.split()
@@ -105,18 +105,21 @@ def lookup_tax_assessor(address):
             params = {"$where": f"situshouse_no='{street_num}' AND situsstreetname LIKE '%{street_name}%'", "$limit": "1"}
             res = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
             
-            if res.status_code == 200 and "json" in res.headers.get("Content-Type", ""):
-                records = res.json()
-                if isinstance(records, list) and len(records) > 0:
-                    rec = records[0]
-                    return {
-                        "owner_name": str(rec.get("owner1") or rec.get("ain_owner1") or "PROPERTY OWNER / MANAGER").upper(),
-                        "mail_address": str(rec.get("mail_address") or address).upper(),
-                        "apn": str(rec.get("ain") or rec.get("apn") or "N/A"),
-                        "zip": rec.get("situszip") or rec.get("zip") or None
-                    }
+            if res.status_code == 200:
+                try:
+                    records = res.json()
+                    if isinstance(records, list) and len(records) > 0:
+                        rec = records[0]
+                        return {
+                            "owner_name": str(rec.get("owner1") or rec.get("ain_owner1") or "PROPERTY OWNER / MANAGER").upper(),
+                            "mail_address": str(rec.get("mail_address") or address).upper(),
+                            "apn": str(rec.get("ain") or rec.get("apn") or "N/A"),
+                            "zip": rec.get("situszip") or rec.get("zip") or None
+                        }
+                except ValueError:
+                    pass  # Suppress JSON parse errors when Socrata returns non-JSON responses
     except Exception as e:
-        print(f"[Assessor Query Warning] {address}: {e}")
+        pass
 
     return {"owner_name": "PROPERTY OWNER / MANAGER", "mail_address": address, "apn": "N/A", "zip": None}
 
@@ -129,7 +132,7 @@ def unmask_entity_owner(owner_name, mail_address):
     return owner_name
 
 def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90012"):
-    """Tracerfy Skip-tracing API call."""
+    """Tracerfy Skip-tracing API call with DNS fail-safe."""
     if not ENABLE_TRACERFY or not TRACERFY_API_KEY:
         return {"phone": None, "status": "HOLDING_MODE"}
 
@@ -141,8 +144,8 @@ def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90
             data = res.json()
             phones = data.get("mobile_phones") or data.get("phones") or []
             return {"phone": phones[0] if phones else None, "status": "VERIFIED"}
-    except Exception as e:
-        print(f"[Tracerfy Warning] Exception: {e}")
+    except requests.exceptions.RequestException:
+        return {"phone": None, "status": "DNS_FAILED"}
 
     return {"phone": None, "status": "FAILED"}
 
@@ -158,7 +161,6 @@ def send_twilio_sms(to_phone, address_text, case_url, case_no):
         return False
 
     try:
-        # Format phone to E.164 standard
         clean_phone = re.sub(r"[^\d+]", "", to_phone)
         if not clean_phone.startswith("+"):
             clean_phone = f"+1{clean_phone}" if len(clean_phone) == 10 else f"+{clean_phone}"
@@ -266,7 +268,6 @@ def run_pipeline():
                     if res_push.status_code == 200:
                         processed_count += 1
 
-                        # Trigger Twilio SMS if phone number exists and pipeline is active
                         if phone_number:
                             if send_twilio_sms(phone_number, address, case_url, case_no):
                                 sms_sent_count += 1

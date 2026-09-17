@@ -3,7 +3,8 @@
 ============================================================================
 EmergencyAudit.com | AUTOMATED PAY-PER-CALL PIPELINE & SCRAPER
 ============================================================================
-Architecture : GitHub Actions -> Socrata Municipal -> LA Assessor -> Tracerfy -> EmergencyAudit/case
+Architecture : GitHub Actions -> Socrata Municipal -> LA Assessor -> Tracerfy 
+               -> Cloudflare Worker -> Twilio SMS -> EmergencyAudit/case
 ============================================================================
 """
 
@@ -21,6 +22,12 @@ WORKER_URL = os.getenv("WORKER_URL", "https://emergencyaudit.com")
 MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY", "SecretKey_2026_Dispatch!")
 TRACERFY_API_KEY = os.getenv("TRACERFY_API_KEY", "")
 ENABLE_TRACERFY = os.getenv("ENABLE_TRACERFY", "false").lower() == "true"
+
+# TWILIO CONFIGURATION
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
+TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "")
+ENABLE_TWILIO_SMS = os.getenv("ENABLE_TWILIO_SMS", "false").lower() == "true"
 
 # PIPELINE KILL SWITCH: Set PAUSE_PIPELINE="true" in GitHub Secrets / Env to pause execution instantly
 PAUSE_PIPELINE = os.getenv("PAUSE_PIPELINE", "false").lower() == "true"
@@ -75,7 +82,6 @@ def extract_zip(item, address_text=""):
     if match:
         return match.group(1)
 
-    # Clean default for central LA instead of randomized fake zip assignment
     return "90012"
 
 def extract_violation_desc(item):
@@ -93,7 +99,6 @@ def lookup_tax_assessor(address):
         parts = clean_addr.split()
         if len(parts) >= 2:
             street_num = parts[0]
-            # Skip directionals (N, S, E, W) to match street name accurately
             street_name = parts[2] if parts[1] in ["N", "S", "E", "W"] and len(parts) > 2 else parts[1]
             
             url = "https://data.lacounty.gov/resource/28ee-2bgz.json"
@@ -142,7 +147,53 @@ def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90
     return {"phone": None, "status": "FAILED"}
 
 # =====================================================================
-# 3. PAY-PER-CALL ENGINE DISPATCH & REMOTE CHECK
+# 3. TWILIO SMS ENGINE DISPATCH
+# =====================================================================
+def send_twilio_sms(to_phone, address_text, case_url, case_no):
+    """Dispatches automated SMS notice containing Door 2 case link."""
+    if not ENABLE_TWILIO_SMS or not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN or not TWILIO_PHONE_NUMBER:
+        return False
+
+    if not to_phone or len(to_phone.strip()) < 10:
+        return False
+
+    try:
+        # Format phone to E.164 standard
+        clean_phone = re.sub(r"[^\d+]", "", to_phone)
+        if not clean_phone.startswith("+"):
+            clean_phone = f"+1{clean_phone}" if len(clean_phone) == 10 else f"+{clean_phone}"
+
+        sms_body = (
+            f"NOTICE: A municipal record flag (#{case_no}) has been indexed regarding property parcel "
+            f"{address_text}. Review case details & resolution options: {case_url}"
+        )
+
+        twilio_url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Messages.json"
+        data = {
+            "From": TWILIO_PHONE_NUMBER,
+            "To": clean_phone,
+            "Body": sms_body
+        }
+
+        res = requests.post(
+            twilio_url,
+            data=data,
+            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+            timeout=8
+        )
+
+        if res.status_code in [200, 201]:
+            print(f"[Twilio SMS Sent] -> {clean_phone} (Case: {case_no})")
+            return True
+        else:
+            print(f"[Twilio Error] {res.status_code}: {res.text}")
+    except Exception as e:
+        print(f"[Twilio Exception] {e}")
+
+    return False
+
+# =====================================================================
+# 4. PAY-PER-CALL ENGINE DISPATCH & REMOTE CHECK
 # =====================================================================
 def is_remote_paused():
     """Checks Cloudflare Worker endpoint to see if Pause Toggle is active on back office."""
@@ -157,7 +208,6 @@ def is_remote_paused():
     return False
 
 def run_pipeline():
-    # 1. Kill switch evaluation
     if is_remote_paused():
         print("=====================================================")
         print(" PIPELINE STATUS: PAUSED (Kill-Switch Active)")
@@ -167,6 +217,7 @@ def run_pipeline():
 
     print("[Pipeline] Running municipal extraction & routing...")
     processed_count = 0
+    sms_sent_count = 0
 
     for feed in SOCRATA_FEEDS:
         try:
@@ -186,16 +237,19 @@ def run_pipeline():
                 human_owner = unmask_entity_owner(assessor_data["owner_name"], assessor_data["mail_address"])
                 trace_data = skip_trace(human_owner, address, "Los Angeles", "CA", zip_code)
 
-                # 2. Build Pay-Per-Call Dynamic URL
-                encoded_address = quote(address)
+                # Build Pay-Per-Call Dynamic URL (Door 2 Case Link)
+                encoded_address = quote(f"{address}, Los Angeles, CA {zip_code}")
                 case_url = f"{WORKER_URL}/case?id={case_no}&address={encoded_address}&phone={NETWORK_1800_NUMBER}"
 
-                # 3. Payload for EmergencyAudit Pay-Per-Call System
+                phone_number = trace_data["phone"]
+
+                # Payload for EmergencyAudit Back Office KV Store
                 payload = {
                     "citation_id": case_no,
                     "address": f"{address}, Los Angeles, CA {zip_code}",
                     "owner_name": human_owner,
-                    "phone": trace_data["phone"],
+                    "phone": phone_number,
+                    "customerPhone": phone_number or "Unmasked Upon Purchase",
                     "violation": violation[:180],
                     "case_url": case_url,
                     "apn": assessor_data["apn"]
@@ -211,14 +265,20 @@ def run_pipeline():
                     )
                     if res_push.status_code == 200:
                         processed_count += 1
-                except Exception:
-                    pass
+
+                        # Trigger Twilio SMS if phone number exists and pipeline is active
+                        if phone_number:
+                            if send_twilio_sms(phone_number, address, case_url, case_no):
+                                sms_sent_count += 1
+
+                except Exception as e:
+                    print(f"[Dispatch Error] {e}")
 
                 time.sleep(0.05)
         except Exception as e:
             print(f"[Feed Exception] {feed['name']}: {e}")
 
-    print(f"[Batch Complete] Successfully processed {processed_count} municipal leads.")
+    print(f"[Batch Complete] Processed {processed_count} records | Sent {sms_sent_count} SMS notices.")
 
 if __name__ == "__main__":
     run_pipeline()

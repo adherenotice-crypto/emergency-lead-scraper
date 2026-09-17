@@ -19,7 +19,7 @@ from urllib.parse import quote
 # 1. ENVIRONMENT CONFIGURATION & REMOTE KILL-SWITCH
 # =====================================================================
 WORKER_URL = os.getenv("WORKER_URL", "https://emergencyaudit.com")
-MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY", "SecretKey_2026_Dispatch!")
+MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY", "EmergencyAudit_Master_Key_2027!")
 TRACERFY_API_KEY = os.getenv("TRACERFY_API_KEY", "")
 ENABLE_TRACERFY = os.getenv("ENABLE_TRACERFY", "false").lower() == "true"
 
@@ -118,7 +118,7 @@ def lookup_tax_assessor(address):
                         }
                 except ValueError:
                     pass  # Suppress JSON parse errors when Socrata returns non-JSON responses
-    except Exception as e:
+    except Exception:
         pass
 
     return {"owner_name": "PROPERTY OWNER / MANAGER", "mail_address": address, "apn": "N/A", "zip": None}
@@ -271,6 +271,8 @@ def run_pipeline():
                         if phone_number:
                             if send_twilio_sms(phone_number, address, case_url, case_no):
                                 sms_sent_count += 1
+                    else:
+                        print(f"❌ DISPATCH REJECTED [{res_push.status_code}]: {res_push.text}")
 
                 except Exception as e:
                     print(f"[Dispatch Error] {e}")

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ============================================================================
-EMERGENCYAUDIT.com! | AUTOMATED PAY-PER-CALL PIPELINE & SCRAPER (DRY-RUN)
+EMERGENCYAUDIT.com! | AUTOMATED PAY-PER-CALL PIPELINE & SCRAPER
 ============================================================================
 Architecture : GitHub Actions -> Socrata Municipal -> LA Assessor -> Tracerfy 
                -> Cloudflare Worker -> Twilio SMS -> EMERGENCYAUDIT.com! /c/AUD-XXXXXX
@@ -37,7 +37,7 @@ ENABLE_TWILIO_SMS = os.getenv("ENABLE_TWILIO_SMS", "false").lower() == "true"
 
 # SYSTEM CONTROLS & SAFETY FLAGS
 PAUSE_PIPELINE = os.getenv("PAUSE_PIPELINE", "false").lower() == "true"
-DRY_RUN = True  # FORCE SAFETY DRY-RUN MODE ($0 TRACERFY CREDITS CONSUMED)
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() in ["true", "1", "yes"]
 STAGING_MODE = os.getenv("STAGING_MODE", "false").lower() == "true"
 
 # PHONE & WEBHOOK CONFIGURATION
@@ -201,6 +201,7 @@ def translate_municipal_code(raw_violation_string, default_category="COMMERCIAL"
     return raw_violation_string, default_category
 
 def lookup_tax_assessor(address):
+    """Queries LA County Assessor API for APN, owner, and structural property specifications ($0 cost)."""
     try:
         clean_addr = re.sub(r"[^\w\s]", "", address).strip().upper()
         parts = clean_addr.split()
@@ -213,32 +214,37 @@ def lookup_tax_assessor(address):
                 "$where": f"situshouse_no='{street_num}' AND situsstreetname LIKE '%{street_name}%'", 
                 "$limit": "1"
             }
-            res = requests.get(url, params=params, headers={"User-Agent": "EmergencyAudit/2.0"}, timeout=6)
+            # Rate limit protection: small delay prevents LA County Socrata API throttling
+            time.sleep(0.12)
+            res = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}, timeout=6)
             
-            if res.status_code == 200:
-                records = res.json()
-                if isinstance(records, list) and len(records) > 0:
-                    rec = records[0]
-                    apn_raw = str(rec.get("ain") or rec.get("apn") or "").strip()
-                    formatted_apn = f"{apn_raw[:4]}-{apn_raw[4:7]}-{apn_raw[7:]}" if len(apn_raw) == 10 else (apn_raw if apn_raw else "N/A")
-                    
-                    owner_raw = str(rec.get("owner1") or rec.get("ain_owner1") or "").strip().upper()
-                    
-                    year_built = str(rec.get("yearbuilt") or rec.get("effectiveyearbuilt") or "N/A").strip()
-                    sqft = str(rec.get("sqftmain") or rec.get("squarefeet") or "N/A").strip()
-                    use_desc = str(rec.get("usedesc") or rec.get("usecode") or "COMMERCIAL / RESIDENTIAL").strip().upper()
-                    zoning = str(rec.get("zoning") or rec.get("usecode") or "N/A").strip().upper()
+            if res.status_code == 200 and res.text.strip():
+                try:
+                    records = res.json()
+                    if isinstance(records, list) and len(records) > 0:
+                        rec = records[0]
+                        apn_raw = str(rec.get("ain") or rec.get("apn") or "").strip()
+                        formatted_apn = f"{apn_raw[:4]}-{apn_raw[4:7]}-{apn_raw[7:]}" if len(apn_raw) == 10 else (apn_raw if apn_raw else "N/A")
+                        
+                        owner_raw = str(rec.get("owner1") or rec.get("ain_owner1") or "").strip().upper()
+                        
+                        year_built = str(rec.get("yearbuilt") or rec.get("effectiveyearbuilt") or "N/A").strip()
+                        sqft = str(rec.get("sqftmain") or rec.get("squarefeet") or "N/A").strip()
+                        use_desc = str(rec.get("usedesc") or rec.get("usecode") or "COMMERCIAL / RESIDENTIAL").strip().upper()
+                        zoning = str(rec.get("zoning") or rec.get("usecode") or "N/A").strip().upper()
 
-                    return {
-                        "owner_name": owner_raw if len(owner_raw) > 2 else "PROPERTY OWNER / MANAGER",
-                        "mail_address": str(rec.get("mail_address") or address).upper(),
-                        "apn": formatted_apn if len(formatted_apn) > 3 else "N/A",
-                        "zip": rec.get("situszip") or rec.get("zip") or None,
-                        "year_built": year_built if year_built != "0" else "N/A",
-                        "sqft": f"{int(sqft):,} sqft" if sqft.isdigit() and int(sqft) > 0 else "N/A",
-                        "property_use": use_desc,
-                        "zoning": zoning
-                    }
+                        return {
+                            "owner_name": owner_raw if len(owner_raw) > 2 else "PROPERTY OWNER / MANAGER",
+                            "mail_address": str(rec.get("mail_address") or address).upper(),
+                            "apn": formatted_apn if len(formatted_apn) > 3 else "N/A",
+                            "zip": rec.get("situszip") or rec.get("zip") or None,
+                            "year_built": year_built if year_built != "0" else "N/A",
+                            "sqft": f"{int(sqft):,} sqft" if sqft.isdigit() and int(sqft) > 0 else "N/A",
+                            "property_use": use_desc,
+                            "zoning": zoning
+                        }
+                except json.decoder.JSONDecodeError:
+                    pass
     except Exception as e:
         print(f"[Assessor Error] {e}")
 
@@ -273,7 +279,7 @@ def is_corporate_entity(name):
 # =====================================================================
 def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90012"):
     if DRY_RUN or not (ENABLE_TRACERFY or TRACERFY_API_KEY):
-        return {"phone": "3235550199", "email": "dryrun@emergencyaudit.com", "status": "DRY_RUN_MODE", "phone_type": "MOBILE", "unmasked_owner": human_name}
+        return {"phone": None, "email": None, "status": "HOLDING_MODE", "phone_type": "UNKNOWN", "unmasked_owner": human_name}
 
     headers = {
         "Authorization": f"Bearer {TRACERFY_API_KEY}",

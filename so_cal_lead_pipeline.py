@@ -13,6 +13,7 @@ import re
 import json
 import time
 import datetime
+import hashlib
 from zoneinfo import ZoneInfo
 import requests
 from urllib.parse import quote
@@ -67,18 +68,12 @@ CORPORATE_KEYWORDS = [
     "TRUST", "LP", "PARTNERSHIP", "REALTY", "BANK", "CITY OF", "DEPT"
 ]
 
-# MUNICIPAL CODE TRANSLATION DICTIONARY
 MUNICIPAL_CODE_MAP = {
-    # Building & Structural (Commercial)
     "91.8104": {"desc": "Unsafe Building Maintenance & Structural Hazard Notice", "category": "COMMERCIAL"},
     "91.103.1": {"desc": "Unpermitted Construction & Alteration Order", "category": "COMMERCIAL"},
     "17920.3": {"desc": "Substandard Structure & Building Compliance Order", "category": "COMMERCIAL"},
-    
-    # Emergency & Hazard Remediation
     "57.105.1": {"desc": "Fire Safety Violation & Hazardous Material Storage Order", "category": "EMERGENCY"},
     "91.8903": {"desc": "Emergency Abatement & Secure Building Notice", "category": "EMERGENCY"},
-    
-    # Lot Clean-Up & Exterior Trade
     "64.70": {"desc": "Water Quality & Environmental Discharge Violation", "category": "TRADE"},
     "22.110": {"desc": "Zoning Non-Compliance & Overgrown Lot Clean-Up Order", "category": "TRADE"}
 }
@@ -88,7 +83,6 @@ MUNICIPAL_CODE_MAP = {
 # 2. SYSTEM HEALTH & SAFETY GUARDRAILS
 # =====================================================================
 def send_webhook_alert(message):
-    """Dispatches instant failure notifications to Discord or Slack."""
     if not WEBHOOK_URL:
         return
     try:
@@ -98,7 +92,6 @@ def send_webhook_alert(message):
         print(f"[Webhook Exception] {e}")
 
 def is_remote_paused():
-    """Checks Cloudflare Worker endpoint to see if Pause Toggle is active on back office."""
     if PAUSE_PIPELINE:
         return True
     try:
@@ -110,16 +103,36 @@ def is_remote_paused():
     return False
 
 def is_compliant_sms_window(tz_name="America/Los_Angeles", start_hour=8, end_hour=20):
-    """TCPA Guardrail: Returns True only between 8:00 AM and 8:00 PM Pacific Time."""
     local_now = datetime.datetime.now(ZoneInfo(tz_name))
     return start_hour <= local_now.hour < end_hour
+
+def purge_unmasked_kv_records():
+    """Sweeps Back Office KV memory and deletes stale or unmasked records."""
+    try:
+        res = requests.get(f"{WORKER_URL}/api/leads", headers={"X-Emergency-Key": MASTER_ADMIN_KEY}, timeout=6)
+        if res.status_code == 200:
+            leads = res.json().get("leads", [])
+            unmasked_keys = [
+                l.get("citation_id") or l.get("id") 
+                for l in leads 
+                if l.get("phone") in ["PENDING UNMASK", "Unmasked Upon Purchase", "", None] or l.get("phone_type") != "MOBILE"
+            ]
+            if unmasked_keys:
+                print(f"[KV Auto-Cleanup] Purging {len(unmasked_keys)} stale/unmasked records from Back Office...")
+                requests.post(
+                    f"{WORKER_URL}/api/delete-batch", 
+                    json={"keys": unmasked_keys}, 
+                    headers={"X-Emergency-Key": MASTER_ADMIN_KEY}, 
+                    timeout=6
+                )
+    except Exception as e:
+        print(f"[KV Auto-Cleanup Exception] {e}")
 
 
 # =====================================================================
 # 3. MUNICIPAL EXTRACTION & DATA PARSING
 # =====================================================================
 def extract_address(item):
-    """Extracts clean street address from Socrata record."""
     for field in ["address", "primary_address", "prop_address", "site_address", "location_address", "street_address"]:
         val = item.get(field)
         if val and isinstance(val, str) and len(val.strip()) >= 5:
@@ -132,7 +145,6 @@ def extract_address(item):
     return combined.upper() if len(combined) >= 5 else None
 
 def extract_zip(item, address_text=""):
-    """Extracts valid 5-digit California ZIP code without random hash fallbacks."""
     for field in ["zip_code", "zipcode", "zip", "postal_code", "site_zip", "prop_zip", "zip_code_1"]:
         val = str(item.get(field, "")).strip()
         if re.match(r"^9\d{4}$", val):
@@ -144,29 +156,49 @@ def extract_zip(item, address_text=""):
 
     return "90012"
 
+def extract_case_id(item, address):
+    """Generates a guaranteed unique 6-digit Case Reference ID per parcel address using MD5 hashing."""
+    for key in ["case_number", "order_number", "cn_id", "citation_number", "apno", "case_no"]:
+        val = item.get(key)
+        if val and isinstance(val, str) and len(val.strip()) > 3:
+            return val.strip().upper()
+    
+    md5_hash = hashlib.md5(address.encode("utf-8")).hexdigest()
+    unique_int = int(md5_hash[:8], 16) % 899999 + 100000
+    return f"AUD-{unique_int}"
+
 def extract_violation_desc(item):
-    """Searches comprehensive Socrata text fields to pull precise municipal violation descriptions."""
+    """Extracts exact municipal order details and ordinance codes from Socrata payloads."""
+    primary = item.get("primary_violation") or item.get("order_type") or item.get("case_type") or ""
+    secondary = item.get("violation_description") or item.get("description") or item.get("comments") or item.get("sub_type") or ""
+    code_sec = item.get("code_section") or item.get("ordinance") or item.get("section") or ""
+
+    details = []
+    if primary:
+        details.append(str(primary).strip())
+    if secondary and secondary != primary:
+        details.append(str(secondary).strip())
+    if code_sec:
+        details.append(f"(LAMC Sec. {str(code_sec).strip()})")
+
+    if details:
+        return " — ".join(details)
+    
     search_fields = [
-        "primary_violation", "violation_description", "order_type", "sub_type", 
-        "description", "case_type", "comments", "violation_code", "violation_type", 
-        "violation_detail", "order_title", "notes", "prop_type", "case_type_desc",
-        "order_type_desc", "sub_type_desc", "action_taken", "reason", "code_section"
+        "violation_code", "violation_type", "violation_detail", "order_title", 
+        "notes", "prop_type", "case_type_desc", "order_type_desc", "sub_type_desc", 
+        "action_taken", "reason"
     ]
     for key in search_fields:
         val = item.get(key)
         if val and isinstance(val, str) and len(val.strip()) > 3:
             return val.strip()
-            
-    code_val = item.get("code") or item.get("ordinance") or item.get("section")
-    if code_val and isinstance(code_val, str):
-        return f"Municipal Code Notice (Sec. {code_val.strip()})"
-        
-    return "Municipal Building & Safety Citation Notice"
+
+    return "Order to Comply & Notice of Fee Assessment"
 
 def translate_municipal_code(raw_violation_string, default_category="COMMERCIAL"):
-    """Parses raw ordinance numbers, returning plain English descriptions and revenue categories."""
     if not raw_violation_string or raw_violation_string.strip() == "":
-        return "Municipal Building & Safety Citation Notice", default_category
+        return "Order to Comply & Notice of Fee Assessment", default_category
 
     for code, info in MUNICIPAL_CODE_MAP.items():
         if code in raw_violation_string:
@@ -175,39 +207,41 @@ def translate_municipal_code(raw_violation_string, default_category="COMMERCIAL"
     return raw_violation_string, default_category
 
 def lookup_tax_assessor(address):
-    """Queries LA County Assessor endpoint for parcel APN and owner details."""
+    """Queries LA County Assessor API with robust street direction parsing & formatted APN output."""
     try:
-        clean_addr = re.sub(r"[^\w\s]", "", address).strip()
+        clean_addr = re.sub(r"[^\w\s]", "", address).strip().upper()
         parts = clean_addr.split()
         if len(parts) >= 2:
             street_num = parts[0]
             street_name = parts[2] if parts[1] in ["N", "S", "E", "W"] and len(parts) > 2 else parts[1]
             
             url = "https://data.lacounty.gov/resource/28ee-2bgz.json"
-            params = {"$where": f"situshouse_no='{street_num}' AND situsstreetname LIKE '%{street_name}%'", "$limit": "1"}
-            res = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
+            params = {
+                "$where": f"situshouse_no='{street_num}' AND situsstreetname LIKE '%{street_name}%'", 
+                "$limit": "1"
+            }
+            res = requests.get(url, params=params, headers={"User-Agent": "EmergencyAudit/2.0"}, timeout=6)
             
             if res.status_code == 200:
-                try:
-                    records = res.json()
-                    if isinstance(records, list) and len(records) > 0:
-                        rec = records[0]
-                        owner_raw = str(rec.get("owner1") or rec.get("ain_owner1") or "").strip().upper()
-                        return {
-                            "owner_name": owner_raw if len(owner_raw) > 2 else "PROPERTY OWNER / MANAGER",
-                            "mail_address": str(rec.get("mail_address") or address).upper(),
-                            "apn": str(rec.get("ain") or rec.get("apn") or "N/A"),
-                            "zip": rec.get("situszip") or rec.get("zip") or None
-                        }
-                except ValueError:
-                    pass
+                records = res.json()
+                if isinstance(records, list) and len(records) > 0:
+                    rec = records[0]
+                    apn_raw = str(rec.get("ain") or rec.get("apn") or "").strip()
+                    formatted_apn = f"{apn_raw[:4]}-{apn_raw[4:7]}-{apn_raw[7:]}" if len(apn_raw) == 10 else (apn_raw if apn_raw else "N/A")
+                    
+                    owner_raw = str(rec.get("owner1") or rec.get("ain_owner1") or "").strip().upper()
+                    return {
+                        "owner_name": owner_raw if len(owner_raw) > 2 else "PROPERTY OWNER / MANAGER",
+                        "mail_address": str(rec.get("mail_address") or address).upper(),
+                        "apn": formatted_apn if len(formatted_apn) > 3 else "N/A",
+                        "zip": rec.get("situszip") or rec.get("zip") or None
+                    }
     except Exception as e:
-        print(f"[Assessor Exception] {e}")
+        print(f"[Assessor Error] {e}")
 
     return {"owner_name": "PROPERTY OWNER / MANAGER", "mail_address": address, "apn": "N/A", "zip": None}
 
 def unmask_entity_owner(owner_name, mail_address):
-    """Extracts human contact name if C/O entity is present."""
     if "C/O" in owner_name or "C/O" in mail_address:
         parts = owner_name.split("C/O") if "C/O" in owner_name else mail_address.split("C/O")
         possible_human = parts[-1].strip().split(",")[0]
@@ -216,7 +250,6 @@ def unmask_entity_owner(owner_name, mail_address):
     return owner_name
 
 def is_corporate_entity(name):
-    """Pre-scrubbing filter: Returns True if owner name contains corporate keywords."""
     if not name or name == "PROPERTY OWNER / MANAGER":
         return False
     upper_name = name.upper()
@@ -227,7 +260,6 @@ def is_corporate_entity(name):
 # 4. SKIP-TRACING & TWILIO DISPATCH ENGINES
 # =====================================================================
 def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90012"):
-    """Tracerfy Synchronous Skip-tracing API call using /v1/api/trace/lookup/."""
     if not (ENABLE_TRACERFY or TRACERFY_API_KEY):
         return {"phone": None, "status": "HOLDING_MODE", "phone_type": "UNKNOWN", "unmasked_owner": human_name}
 
@@ -253,7 +285,7 @@ def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90
         else:
             payload["find_owner"] = True
     else:
-        payload["find_owner"] = True  # Auto-resolves real property owner by address
+        payload["find_owner"] = True
 
     try:
         res = requests.post(TRACERFY_URL, json=payload, headers=headers, timeout=10)
@@ -284,7 +316,6 @@ def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90
     return {"phone": None, "status": "FAILED", "phone_type": "NO_MOBILE", "unmasked_owner": human_name}
 
 def send_twilio_sms(to_phone, case_no, case_url):
-    """Dispatches automated SMS notice containing Door 2 case link."""
     if not ENABLE_TWILIO_SMS:
         print(f"[SMS Skipped] ENABLE_TWILIO_SMS=false for Case #{case_no}")
         return False
@@ -347,11 +378,13 @@ def run_pipeline():
         send_webhook_alert("Pipeline execution skipped because System Remote Kill-Switch is ACTIVE.")
         return
 
+    # STEP 1: AUTO-PURGE UNMASKED/STALE RECORDS
+    purge_unmasked_kv_records()
+
     print("[Pipeline] Running municipal extraction & routing...")
     processed_count = 0
     sms_sent_count = 0
 
-    # Step A: Collect and Deduplicate Scraped Leads by Parcel Address
     grouped_properties = {}
 
     for feed in SOCRATA_FEEDS:
@@ -368,7 +401,7 @@ def run_pipeline():
 
                 raw_violation = extract_violation_desc(item)
                 plain_violation, category = translate_municipal_code(raw_violation, feed["default_cat"])
-                case_no = item.get("case_number") or item.get("apno") or f"AUD-{int(time.time() * 1000) % 100000}"
+                case_no = extract_case_id(item, address)
 
                 if address not in grouped_properties:
                     grouped_properties[address] = {
@@ -391,41 +424,43 @@ def run_pipeline():
 
     print(f"[Deduplication Complete] Grouped into {len(grouped_properties)} unique property parcels.")
 
-    # Step B: Process Grouped Parcels
+    # STEP 2: PROCESS & DISPATCH ONLY VERIFIED UNMASKED LEADS
     for address, prop in grouped_properties.items():
         case_no = prop["case_no"]
         assessor_data = lookup_tax_assessor(address)
         zip_code = assessor_data["zip"] or prop["zip_code"]
         human_owner = unmask_entity_owner(assessor_data["owner_name"], assessor_data["mail_address"])
 
-        # 1. Pre-Scrub Filter: Corporate Entities
         if is_corporate_entity(human_owner):
             print(f"[Pre-Scrub] Skipping corporate entity '{human_owner}' for Case #{case_no}")
             continue
 
-        # 2. Skip-Trace Owner Cell Phone & Unmask Full Name
         trace_data = skip_trace(human_owner, address, "Los Angeles", "CA", zip_code)
         phone_number = trace_data["phone"]
         phone_type = trace_data["phone_type"]
         final_owner = trace_data.get("unmasked_owner") or human_owner
 
-        # 3. Construct Case Notice URL
-        encoded_address = quote(f"{address}, Los Angeles, CA {zip_code}")
-        case_url = f"{WORKER_URL}/case?id={case_no}&address={encoded_address}&phone={NETWORK_1800_NUMBER}"
+        # STRICT GUARDRAIL: Skip any property without a verified mobile phone number
+        if not phone_number or phone_number in ["PENDING UNMASK", "Unmasked Upon Purchase"] or phone_type != "MOBILE":
+            print(f"[Clean Data Guardrail] Dropping lead without verified mobile number for Case #{case_no}")
+            continue
 
-        # 4. Format Combined Violation Strings
+        encoded_address = quote(f"{address}, Los Angeles, CA {zip_code}")
         combined_violations = " • ".join(prop["violations"])
         combined_raw_codes = " | ".join(prop["raw_codes"])
+        encoded_violation = quote(combined_violations[:250])
 
-        # 5. Determine Initial Staging Status
+        # CONSTRUCT DYNAMIC DOOR 2 URL
+        case_url = f"{WORKER_URL}/case?id={case_no}&address={encoded_address}&apn={assessor_data['apn']}&violation={encoded_violation}&phone={NETWORK_1800_NUMBER}"
+
         initial_status = "PENDING_REVIEW" if STAGING_MODE else "INDEXED"
 
         payload = {
             "citation_id": case_no,
             "address": f"{address}, Los Angeles, CA {zip_code}",
             "owner_name": final_owner,
-            "phone": phone_number or "PENDING UNMASK",
-            "customerPhone": phone_number or "Unmasked Upon Purchase",
+            "phone": phone_number,
+            "customerPhone": phone_number,
             "phone_type": phone_type,
             "violation": combined_violations[:250],
             "raw_code": combined_raw_codes[:250],
@@ -435,12 +470,10 @@ def run_pipeline():
             "status": initial_status
         }
 
-        # 6. Dry-Run Check
         if DRY_RUN:
             print(f"[DRY-RUN EXECUTION] Case #{case_no} | Category: {prop['category']} | Phone: {phone_number} ({phone_type})")
             continue
 
-        # 7. Push Lead Payload to Cloudflare KV Store
         try:
             res_push = requests.post(
                 f"{WORKER_URL}/api/dispatch", 
@@ -451,7 +484,6 @@ def run_pipeline():
             if res_push.status_code == 200:
                 processed_count += 1
 
-                # 8. Dispatch SMS (Skipped if STAGING_MODE is True)
                 if not STAGING_MODE and phone_number and phone_type == "MOBILE":
                     if send_twilio_sms(phone_number, case_no, case_url):
                         sms_sent_count += 1
@@ -470,7 +502,7 @@ def run_pipeline():
 
         time.sleep(0.05)
 
-    print(f"[Batch Complete] Processed {processed_count} records | Sent {sms_sent_count} SMS notices.")
+    print(f"[Batch Complete] Processed {processed_count} verified records | Sent {sms_sent_count} SMS notices.")
 
 if __name__ == "__main__":
     run_pipeline()

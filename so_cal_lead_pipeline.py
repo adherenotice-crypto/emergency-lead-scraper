@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 ============================================================================
-EmergencyAudit.com | AUTOMATED PAY-PER-CALL PIPELINE & SCRAPER
+EMERGENCYAUDIT.com! | AUTOMATED PAY-PER-CALL PIPELINE & SCRAPER
 ============================================================================
 Architecture : GitHub Actions -> Socrata Municipal -> LA Assessor -> Tracerfy 
-               -> Cloudflare Worker -> Twilio SMS -> EmergencyAudit /case
+               -> Cloudflare Worker -> Twilio SMS -> EMERGENCYAUDIT.com! /case
 ============================================================================
 """
 
@@ -22,7 +22,10 @@ from urllib.parse import quote
 # =====================================================================
 WORKER_URL = os.getenv("WORKER_URL", "https://emergencyaudit.com")
 MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY", "EmergencyAudit_Master_Key_2027!")
+
+# TRACERFY CONFIGURATION (CORRECTED BASE ENDPOINT)
 TRACERFY_API_KEY = os.getenv("TRACERFY_API_KEY", "")
+TRACERFY_URL = os.getenv("TRACERFY_URL", "https://tracerfy.com/v1/api/property/skip-trace")
 ENABLE_TRACERFY = os.getenv("ENABLE_TRACERFY", "false").lower() == "true"
 
 # TWILIO CONFIGURATION
@@ -89,7 +92,7 @@ def send_webhook_alert(message):
     if not WEBHOOK_URL:
         return
     try:
-        payload = {"content": f"🚨 **EmergencyAudit Pipeline Alert:** {message}"}
+        payload = {"content": f"🚨 **EMERGENCYAUDIT.com! Pipeline Alert:** {message}"}
         requests.post(WEBHOOK_URL, json=payload, timeout=5)
     except Exception as e:
         print(f"[Webhook Exception] {e}")
@@ -217,16 +220,30 @@ def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90
         return {"phone": None, "status": "HOLDING_MODE", "phone_type": "UNKNOWN"}
 
     try:
-        url = "https://api.tracerfy.com/v1/search"
-        payload = {"name": human_name, "address": address, "city": city, "state": state, "zip": zip_code}
-        headers = {"Authorization": f"Bearer {TRACERFY_API_KEY}", "Content-Type": "application/json"}
-        res = requests.post(url, json=payload, headers=headers, timeout=8)
+        payload = {
+            "name": human_name,
+            "address": address,
+            "city": city,
+            "state": state,
+            "zip": zip_code
+        }
+        headers = {
+            "Authorization": f"Bearer {TRACERFY_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        res = requests.post(TRACERFY_URL, json=payload, headers=headers, timeout=8)
         
         if res.status_code == 200:
             data = res.json()
-            for phone_obj in data.get("phones", []):
-                if phone_obj.get("type", "").lower() == "mobile":
-                    return {"phone": phone_obj.get("number"), "status": "VERIFIED", "phone_type": "MOBILE"}
+            # Extract phone records from Tracerfy response
+            phones = data.get("phones", []) or data.get("results", [{}])[0].get("phones", [])
+            for phone_obj in phones:
+                p_type = str(phone_obj.get("type", "")).lower()
+                p_num = phone_obj.get("number") or phone_obj.get("phone")
+                if p_num and (p_type == "mobile" or p_type == "cell" or not p_type):
+                    return {"phone": p_num, "status": "VERIFIED", "phone_type": "MOBILE"}
+        else:
+            print(f"[Tracerfy HTTP {res.status_code}] {res.text}")
     except Exception as e:
         print(f"[Tracerfy Error] {e}")
         send_webhook_alert(f"Tracerfy API lookup failed for {address}: {e}")

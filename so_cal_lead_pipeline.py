@@ -44,23 +44,24 @@ STAGING_MODE = os.getenv("STAGING_MODE", "false").lower() == "true"
 NETWORK_1800_NUMBER = os.getenv("NETWORK_1800_NUMBER", "18005550199")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")  # Discord/Slack Webhook for alerts
 
-# ACTIVE SOCAL MUNICIPAL ENDPOINTS
+# ACTIVE SOCAL MUNICIPAL ENDPOINTS (CONFIGURED FOR 1-LEAD MICRO TEST)
 SOCRATA_FEEDS = [
     {
         "name": "LA Building & Safety - Code Enforcement",
-        "url": "https://data.lacity.org/resource/u82d-eh7z.json?$limit=150",
+        "url": "https://data.lacity.org/resource/u82d-eh7z.json?$limit=1",
         "default_cat": "COMMERCIAL"
-    },
-    {
-        "name": "LA Building & Safety - Vacant Abatement",
-        "url": "https://data.lacity.org/resource/q3ak-s5hy.json?$limit=150",
-        "default_cat": "EMERGENCY"
-    },
-    {
-        "name": "LA City Active Code Citations & Orders",
-        "url": "https://data.lacity.org/resource/2n62-383m.json?$limit=150",
-        "default_cat": "TRADE"
     }
+    # Feeds 2 & 3 temporarily commented out for 1-lead safety test:
+    # {
+    #     "name": "LA Building & Safety - Vacant Abatement",
+    #     "url": "https://data.lacity.org/resource/q3ak-s5hy.json?$limit=150",
+    #     "default_cat": "EMERGENCY"
+    # },
+    # {
+    #     "name": "LA City Active Code Citations & Orders",
+    #     "url": "https://data.lacity.org/resource/2n62-383m.json?$limit=150",
+    #     "default_cat": "TRADE"
+    # }
 ]
 
 CORPORATE_KEYWORDS = [
@@ -111,7 +112,6 @@ def fetch_existing_kv_cache():
     kv_cache = {}
     try:
         res = requests.get(f"{WORKER_URL}/api/status", headers={"X-Emergency-Key": MASTER_ADMIN_KEY}, timeout=5)
-        # Fallback to query Worker KV if leads endpoint exists
     except Exception as e:
         print(f"[KV Cache Info] Cache check initialized: {e}")
     return kv_cache

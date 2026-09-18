@@ -16,7 +16,6 @@ import datetime
 import hashlib
 from zoneinfo import ZoneInfo
 import requests
-from urllib.parse import quote
 
 # =====================================================================
 # 1. ENVIRONMENT CONFIGURATION & SYSTEM CONTROLS
@@ -44,7 +43,7 @@ STAGING_MODE = os.getenv("STAGING_MODE", "false").lower() == "true"
 NETWORK_1800_NUMBER = os.getenv("NETWORK_1800_NUMBER", "18005550199")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 
-# ACTIVE SOCAL MUNICIPAL ENDPOINTS (FULL PRODUCTION FEEDS RESTORED)
+# ACTIVE SOCAL MUNICIPAL ENDPOINTS
 SOCRATA_FEEDS = [
     {
         "name": "LA Building & Safety - Code Enforcement",
@@ -201,7 +200,7 @@ def translate_municipal_code(raw_violation_string, default_category="COMMERCIAL"
     return raw_violation_string, default_category
 
 def lookup_tax_assessor(address):
-    """Queries LA County Assessor API for APN, owner, and structural property specifications ($0 cost)."""
+    """Queries LA County Assessor API with rate-limiting and response validation ($0 cost)."""
     try:
         clean_addr = re.sub(r"[^\w\s]", "", address).strip().upper()
         parts = clean_addr.split()
@@ -214,8 +213,7 @@ def lookup_tax_assessor(address):
                 "$where": f"situshouse_no='{street_num}' AND situsstreetname LIKE '%{street_name}%'", 
                 "$limit": "1"
             }
-            # Rate limit protection: small delay prevents LA County Socrata API throttling
-            time.sleep(0.12)
+            time.sleep(0.12)  # Throttle to keep LA Assessor API happy
             res = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}, timeout=6)
             
             if res.status_code == 200 and res.text.strip():
@@ -227,7 +225,6 @@ def lookup_tax_assessor(address):
                         formatted_apn = f"{apn_raw[:4]}-{apn_raw[4:7]}-{apn_raw[7:]}" if len(apn_raw) == 10 else (apn_raw if apn_raw else "N/A")
                         
                         owner_raw = str(rec.get("owner1") or rec.get("ain_owner1") or "").strip().upper()
-                        
                         year_built = str(rec.get("yearbuilt") or rec.get("effectiveyearbuilt") or "N/A").strip()
                         sqft = str(rec.get("sqftmain") or rec.get("squarefeet") or "N/A").strip()
                         use_desc = str(rec.get("usedesc") or rec.get("usecode") or "COMMERCIAL / RESIDENTIAL").strip().upper()
@@ -278,8 +275,15 @@ def is_corporate_entity(name):
 # 4. SKIP-TRACING & TWILIO DISPATCH ENGINES
 # =====================================================================
 def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90012"):
-    if DRY_RUN or not (ENABLE_TRACERFY or TRACERFY_API_KEY):
-        return {"phone": None, "email": None, "status": "HOLDING_MODE", "phone_type": "UNKNOWN", "unmasked_owner": human_name}
+    """Tracerfy Skip-tracing API call with strict Zero-Credit Dry Run protection."""
+    if DRY_RUN or not (ENABLE_TRACERFY and TRACERFY_API_KEY):
+        return {
+            "phone": "3235550199", 
+            "email": "dryrun@emergencyaudit.com", 
+            "status": "MOCK_DRY_RUN", 
+            "phone_type": "MOBILE", 
+            "unmasked_owner": human_name
+        }
 
     headers = {
         "Authorization": f"Bearer {TRACERFY_API_KEY}",
@@ -307,13 +311,11 @@ def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90
 
     try:
         res = requests.post(TRACERFY_URL, json=payload, headers=headers, timeout=10)
-        
         if res.status_code == 200:
             data = res.json()
             if data.get("hit") and data.get("persons"):
                 for person in data["persons"]:
                     unmasked_name = person.get("full_name") or human_name
-                    
                     emails = person.get("emails", [])
                     primary_email = emails[0].get("email") if isinstance(emails, list) and len(emails) > 0 else None
                     
@@ -321,7 +323,6 @@ def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90
                     for p in phones:
                         p_num = p.get("number")
                         p_type = str(p.get("type", "")).lower()
-                        
                         if p_num and (p_type in ["mobile", "cell"] or not p_type):
                             return {
                                 "phone": p_num,
@@ -456,6 +457,14 @@ def run_pipeline():
             print(f"[Pre-Scrub] Skipping corporate entity '{human_owner}' for Case #{case_no}")
             continue
 
+        case_url = f"{WORKER_URL}/c/{case_no}"
+
+        # STRICT GUARANTEED ZERO-CREDIT HARD STOP FOR DRY RUNS
+        if DRY_RUN:
+            print(f"[DRY-RUN EXECUTION - $0 CREDITS] Case #{case_no} | Owner: {human_owner} | APN: {assessor_data['apn']} | Link: {case_url}")
+            continue
+
+        # CREDIT GUARDRAIL: REUSE KV CACHE BEFORE CALLING TRACERFY ($0 COST)
         cached_lead = kv_cache.get(address) or kv_cache.get(case_no)
         if cached_lead and cached_lead.get("phone") and cached_lead.get("phone_type") == "MOBILE":
             print(f"[Credit Guardrail] Reusing cached mobile for {address} ($0 Tracerfy Credits)")
@@ -480,8 +489,6 @@ def run_pipeline():
         combined_violations = " • ".join(prop["violations"])
         combined_raw_codes = " | ".join(prop["raw_codes"])
 
-        case_url = f"{WORKER_URL}/c/{case_no}"
-
         initial_status = "PENDING_REVIEW" if STAGING_MODE else "INDEXED"
 
         payload = {
@@ -504,10 +511,6 @@ def run_pipeline():
             "zoning": assessor_data["zoning"],
             "status": initial_status
         }
-
-        if DRY_RUN:
-            print(f"[DRY-RUN EXECUTION] Case #{case_no} | Owner: {final_owner} | APN: {assessor_data['apn']} | Link: {case_url}")
-            continue
 
         try:
             res_push = requests.post(

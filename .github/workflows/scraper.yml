@@ -28,6 +28,7 @@ jobs:
           WORKER_URL: "https://emergencyaudit.com"
           MASTER_ADMIN_KEY: ${{ secrets.MASTER_ADMIN_KEY }}
           TRACERFY_API_KEY: ${{ secrets.TRACERFY_API_KEY }}
+          TRACERFY_URL: "https://tracerfy.com/v1/api/trace/lookup/"
           ENABLE_TRACERFY: "true"
           PAUSE_PIPELINE: ${{ secrets.PAUSE_PIPELINE }}
           DRY_RUN: ${{ secrets.DRY_RUN }}

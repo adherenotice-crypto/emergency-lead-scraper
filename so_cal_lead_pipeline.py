@@ -23,9 +23,9 @@ from urllib.parse import quote
 WORKER_URL = os.getenv("WORKER_URL", "https://emergencyaudit.com")
 MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY", "EmergencyAudit_Master_Key_2027!")
 
-# TRACERFY CONFIGURATION (CORRECTED BASE ENDPOINT)
+# TRACERFY CONFIGURATION (SYNCHRONOUS LOOKUP ENDPOINT)
 TRACERFY_API_KEY = os.getenv("TRACERFY_API_KEY", "")
-TRACERFY_URL = os.getenv("TRACERFY_URL", "https://tracerfy.com/v1/api/property/skip-trace")
+TRACERFY_URL = os.getenv("TRACERFY_URL", "https://tracerfy.com/v1/api/trace/lookup/")
 ENABLE_TRACERFY = os.getenv("ENABLE_TRACERFY", "false").lower() in ["true", "1", "yes"]
 
 # TWILIO CONFIGURATION
@@ -157,7 +157,6 @@ def extract_violation_desc(item):
         if val and isinstance(val, str) and len(val.strip()) > 3:
             return val.strip()
             
-    # Check for raw municipal ordinance code numbers in record
     code_val = item.get("code") or item.get("ordinance") or item.get("section")
     if code_val and isinstance(code_val, str):
         return f"Municipal Code Notice (Sec. {code_val.strip()})"
@@ -228,42 +227,61 @@ def is_corporate_entity(name):
 # 4. SKIP-TRACING & TWILIO DISPATCH ENGINES
 # =====================================================================
 def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90012"):
-    """Tracerfy Skip-tracing API call for mobile unmasking."""
-    if not ENABLE_TRACERFY and not TRACERFY_API_KEY:
-        return {"phone": None, "status": "HOLDING_MODE", "phone_type": "UNKNOWN"}
+    """Tracerfy Synchronous Skip-tracing API call using /v1/api/trace/lookup/."""
+    if not (ENABLE_TRACERFY or TRACERFY_API_KEY):
+        return {"phone": None, "status": "HOLDING_MODE", "phone_type": "UNKNOWN", "unmasked_owner": human_name}
 
-    # Use clean owner name if available, otherwise pass empty string for property address lookup
-    search_name = human_name if human_name != "PROPERTY OWNER / MANAGER" else ""
+    headers = {
+        "Authorization": f"Bearer {TRACERFY_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "address": address,
+        "city": city,
+        "state": state,
+        "zip": str(zip_code) if zip_code else "90012"
+    }
+
+    clean_name = human_name.strip() if human_name else ""
+    if clean_name and clean_name != "PROPERTY OWNER / MANAGER":
+        name_parts = clean_name.split()
+        if len(name_parts) >= 2:
+            payload["find_owner"] = False
+            payload["first_name"] = name_parts[0]
+            payload["last_name"] = name_parts[-1]
+        else:
+            payload["find_owner"] = True
+    else:
+        payload["find_owner"] = True  # Auto-resolves real property owner by address
 
     try:
-        payload = {
-            "name": search_name,
-            "address": address,
-            "city": city,
-            "state": state,
-            "zip": zip_code
-        }
-        headers = {
-            "Authorization": f"Bearer {TRACERFY_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        res = requests.post(TRACERFY_URL, json=payload, headers=headers, timeout=8)
+        res = requests.post(TRACERFY_URL, json=payload, headers=headers, timeout=10)
         
-        if res.status_code in [200, 201]:
+        if res.status_code == 200:
             data = res.json()
-            phones = data.get("phones", []) or data.get("results", [{}])[0].get("phones", []) or data.get("data", {}).get("phones", [])
-            for phone_obj in phones:
-                p_type = str(phone_obj.get("type", "")).lower()
-                p_num = phone_obj.get("number") or phone_obj.get("phone")
-                if p_num and (p_type in ["mobile", "cell"] or not p_type):
-                    return {"phone": p_num, "status": "VERIFIED", "phone_type": "MOBILE"}
+            if data.get("hit") and data.get("persons"):
+                for person in data["persons"]:
+                    unmasked_name = person.get("full_name") or human_name
+                    phones = person.get("phones", [])
+                    
+                    for p in phones:
+                        p_num = p.get("number")
+                        p_type = str(p.get("type", "")).lower()
+                        
+                        if p_num and (p_type in ["mobile", "cell"] or not p_type):
+                            return {
+                                "phone": p_num,
+                                "status": "VERIFIED",
+                                "phone_type": "MOBILE",
+                                "unmasked_owner": unmasked_name
+                            }
         else:
-            print(f"[Tracerfy HTTP {res.status_code}] {res.text}")
+            print(f"[Tracerfy HTTP {res.status_code}] {res.text[:200]}")
     except Exception as e:
-        print(f"[Tracerfy Error] {e}")
-        send_webhook_alert(f"Tracerfy API lookup failed for {address}: {e}")
+        print(f"[Tracerfy Exception] {e}")
 
-    return {"phone": None, "status": "FAILED", "phone_type": "NO_MOBILE"}
+    return {"phone": None, "status": "FAILED", "phone_type": "NO_MOBILE", "unmasked_owner": human_name}
 
 def send_twilio_sms(to_phone, case_no, case_url):
     """Dispatches automated SMS notice containing Door 2 case link."""
@@ -385,10 +403,11 @@ def run_pipeline():
             print(f"[Pre-Scrub] Skipping corporate entity '{human_owner}' for Case #{case_no}")
             continue
 
-        # 2. Skip-Trace Owner Cell Phone
+        # 2. Skip-Trace Owner Cell Phone & Unmask Full Name
         trace_data = skip_trace(human_owner, address, "Los Angeles", "CA", zip_code)
         phone_number = trace_data["phone"]
         phone_type = trace_data["phone_type"]
+        final_owner = trace_data.get("unmasked_owner") or human_owner
 
         # 3. Construct Case Notice URL
         encoded_address = quote(f"{address}, Los Angeles, CA {zip_code}")
@@ -404,7 +423,7 @@ def run_pipeline():
         payload = {
             "citation_id": case_no,
             "address": f"{address}, Los Angeles, CA {zip_code}",
-            "owner_name": human_owner,
+            "owner_name": final_owner,
             "phone": phone_number or "PENDING UNMASK",
             "customerPhone": phone_number or "Unmasked Upon Purchase",
             "phone_type": phone_type,

@@ -3,7 +3,7 @@
 ============================================================================
 EMERGENCYAUDIT.com! | AUTOMATED PAY-PER-CALL PIPELINE & SCRAPER
 ============================================================================
-Architecture : GitHub Actions -> Socrata Municipal -> LA Assessor -> Cloudflare KV
+Architecture : GitHub Actions -> Socrata Municipal -> LA County GIS -> Cloudflare KV
                -> Twilio SMS -> EMERGENCYAUDIT.com! /c/AUD-XXXXXX
 ============================================================================
 """
@@ -119,16 +119,6 @@ def fetch_existing_kv_cache():
         print(f"[KV Cache Info] Cache check exception: {e}")
     return kv_cache
 
-def purge_unmasked_kv_records():
-    try:
-        requests.post(
-            f"{WORKER_URL}/api/admin/purge-unmasked", 
-            headers={"X-Emergency-Key": MASTER_ADMIN_KEY}, 
-            timeout=6
-        )
-    except Exception as e:
-        print(f"[KV Auto-Cleanup Exception] {e}")
-
 
 # =====================================================================
 # 3. MUNICIPAL EXTRACTION & DATA PARSING
@@ -206,57 +196,54 @@ def translate_municipal_code(raw_violation_string, default_category="COMMERCIAL"
     return raw_violation_string, default_category
 
 def lookup_tax_assessor(address):
-    """Queries LA County Assessor API ($0 free public data) with multi-stage fallback search."""
+    """Queries official LA County GIS ArcGIS REST API ($0 free public government data)."""
     try:
         clean_addr = re.sub(r"[^\w\s]", "", address).strip().upper()
         parts = clean_addr.split()
         if len(parts) >= 2:
             street_num = parts[0]
-            # Strip directionals & suffixes to isolate core street name
             ignore_words = {"N", "S", "E", "W", "NORTH", "SOUTH", "EAST", "WEST", "ST", "STREET", "AVE", "AVENUE", "BLVD", "BOULEVARD", "RD", "ROAD", "DR", "DRIVE", "WAY", "LN", "LANE", "CT", "COURT", "PL", "PLACE"}
             street_parts = [p for p in parts[1:] if p not in ignore_words]
             street_name = street_parts[0] if street_parts else parts[1]
 
-            url = "https://data.lacounty.gov/resource/28ee-2bgz.json"
-            
-            # Attempt 1: Direct SoQL Query
+            # OFFICIAL UNTHROTTLED LA COUNTY GIS MAPSERVER ENDPOINT
+            gis_url = "https://public.gis.lacounty.gov/public/rest/services/LACounty_Cache/LACounty_Parcel/MapServer/0/query"
             params = {
-                "$where": f"situshouse_no='{street_num}' AND situsstreetname LIKE '%{street_name}%'",
-                "$limit": "5"
+                "where": f"SitusFullAddress LIKE '%{street_num}%{street_name}%'",
+                "outFields": "*",
+                "f": "json"
             }
-            time.sleep(0.12)  # Throttle for Assessor API
-            res = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
-            records = res.json() if res.status_code == 200 else []
-
-            # Attempt 2: Full-Text $q Search Fallback
-            if not records or not isinstance(records, list):
-                params_q = {"$q": f"{street_num} {street_name}", "$limit": "5"}
-                res_q = requests.get(url, params=params_q, headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
-                records = res_q.json() if res_q.status_code == 200 else []
-
-            if isinstance(records, list) and len(records) > 0:
-                for rec in records:
-                    rec_num = str(rec.get("situshouse_no") or "").strip()
-                    if rec_num == street_num or street_num in rec_num:
-                        apn_raw = str(rec.get("ain") or rec.get("apn") or "").strip()
+            time.sleep(0.05)
+            res = requests.get(gis_url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
+            
+            if res.status_code == 200:
+                try:
+                    data = res.json()
+                    features = data.get("features", [])
+                    if features and len(features) > 0:
+                        attrs = features[0].get("attributes", {})
+                        apn_raw = str(attrs.get("AIN") or attrs.get("APN") or "").strip()
                         formatted_apn = f"{apn_raw[:4]}-{apn_raw[4:7]}-{apn_raw[7:]}" if len(apn_raw) == 10 else (apn_raw if apn_raw else "N/A")
                         
-                        owner_raw = str(rec.get("owner1") or rec.get("ain_owner1") or "").strip().upper()
-                        year_built = str(rec.get("yearbuilt") or rec.get("effectiveyearbuilt") or "N/A").strip()
-                        sqft = str(rec.get("sqftmain") or rec.get("squarefeet") or "N/A").strip()
-                        use_desc = str(rec.get("usedesc") or rec.get("usecode") or "REAL ESTATE PARCEL").strip().upper()
-                        zoning = str(rec.get("zoning") or rec.get("usecode") or "N/A").strip().upper()
+                        owner_raw = str(attrs.get("OwnerName") or attrs.get("OWNER") or attrs.get("SitusFullAddress") or "RECORDED OWNER").strip().upper()
+                        year_built = str(attrs.get("YearBuilt") or attrs.get("YEAR_BUILT") or attrs.get("EffectiveYearBuilt") or "N/A").strip()
+                        sqft = str(attrs.get("SqftMain") or attrs.get("SQFT_MAIN") or attrs.get("SquareFeet") or "N/A").strip()
+                        use_desc = str(attrs.get("UseDescription") or attrs.get("USE_DESC") or attrs.get("UseCode") or "REAL ESTATE PARCEL").strip().upper()
+                        zoning = str(attrs.get("Zoning") or attrs.get("ZONING") or "N/A").strip().upper()
 
                         return {
                             "owner_name": owner_raw if len(owner_raw) > 2 else "PROPERTY OWNER / MANAGER",
-                            "mail_address": str(rec.get("mail_address") or address).upper(),
+                            "mail_address": str(attrs.get("SitusFullAddress") or address).upper(),
                             "apn": formatted_apn if len(formatted_apn) > 3 else "N/A",
-                            "zip": rec.get("situszip") or rec.get("zip") or None,
-                            "year_built": year_built if year_built not in ["0", "", "None"] else "N/A",
+                            "zip": attrs.get("SitusZip") or attrs.get("ZIP") or None,
+                            "year_built": year_built if year_built not in ["0", "", "None", "null"] else "N/A",
                             "sqft": f"{int(sqft):,} sqft" if sqft.isdigit() and int(sqft) > 0 else "N/A",
                             "property_use": use_desc,
                             "zoning": zoning
                         }
+                except Exception as ex:
+                    print(f"[GIS JSON Parsing Exception] {ex}")
+
     except Exception as e:
         print(f"[Assessor Error] {e}")
 
@@ -465,7 +452,7 @@ def run_pipeline():
             "raw_code": combined_raw_codes[:250],
             "category": prop["category"],
             "case_url": case_url,
-            "apn": assessor_data["apn"],            # Real APN from Assessor lookup
+            "apn": assessor_data["apn"],            # Real APN from GIS MapServer lookup
             "year_built": assessor_data["year_built"],
             "sqft": assessor_data["sqft"],
             "property_use": assessor_data["property_use"],

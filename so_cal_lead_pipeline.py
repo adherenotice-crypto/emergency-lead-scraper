@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ============================================================================
-EMERGENCYAUDIT.com! | AUTOMATED PAY-PER-CALL PIPELINE & SCRAPER
+EMERGENCYAUDIT.com! | AUTOMATED PAY-PER-CALL PIPELINE & SCRAPER (TEST MODE)
 ============================================================================
 Architecture : GitHub Actions -> Socrata Municipal -> LA Assessor -> Tracerfy 
                -> Cloudflare Worker -> Twilio SMS -> EMERGENCYAUDIT.com! /c/AUD-XXXXXX
@@ -24,7 +24,7 @@ from urllib.parse import quote
 WORKER_URL = os.getenv("WORKER_URL", "https://emergencyaudit.com")
 MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY", "EmergencyAudit_Master_Key_2027!")
 
-# TRACERFY CONFIGURATION (SYNCHRONOUS LOOKUP ENDPOINT)
+# TRACERFY CONFIGURATION
 TRACERFY_API_KEY = os.getenv("TRACERFY_API_KEY", "")
 TRACERFY_URL = os.getenv("TRACERFY_URL", "https://tracerfy.com/v1/api/trace/lookup/")
 ENABLE_TRACERFY = os.getenv("ENABLE_TRACERFY", "false").lower() in ["true", "1", "yes"]
@@ -42,26 +42,15 @@ STAGING_MODE = os.getenv("STAGING_MODE", "false").lower() == "true"
 
 # PHONE & WEBHOOK CONFIGURATION
 NETWORK_1800_NUMBER = os.getenv("NETWORK_1800_NUMBER", "18005550199")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")  # Discord/Slack Webhook for alerts
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 
-# ACTIVE SOCAL MUNICIPAL ENDPOINTS (CONFIGURED FOR 1-LEAD MICRO TEST)
+# ACTIVE SOCAL MUNICIPAL ENDPOINTS (SAFETY TEST: LIMIT=10)
 SOCRATA_FEEDS = [
     {
         "name": "LA Building & Safety - Code Enforcement",
-        "url": "https://data.lacity.org/resource/u82d-eh7z.json?$limit=1",
+        "url": "https://data.lacity.org/resource/u82d-eh7z.json?$limit=10",
         "default_cat": "COMMERCIAL"
     }
-    # Feeds 2 & 3 temporarily commented out for 1-lead safety test:
-    # {
-    #     "name": "LA Building & Safety - Vacant Abatement",
-    #     "url": "https://data.lacity.org/resource/q3ak-s5hy.json?$limit=150",
-    #     "default_cat": "EMERGENCY"
-    # },
-    # {
-    #     "name": "LA City Active Code Citations & Orders",
-    #     "url": "https://data.lacity.org/resource/2n62-383m.json?$limit=150",
-    #     "default_cat": "TRADE"
-    # }
 ]
 
 CORPORATE_KEYWORDS = [
@@ -108,7 +97,6 @@ def is_compliant_sms_window(tz_name="America/Los_Angeles", start_hour=8, end_hou
     return start_hour <= local_now.hour < end_hour
 
 def fetch_existing_kv_cache():
-    """Fetches already unmasked leads from Cloudflare KV to prevent double-charging Tracerfy ($0 cost)."""
     kv_cache = {}
     try:
         res = requests.get(f"{WORKER_URL}/api/status", headers={"X-Emergency-Key": MASTER_ADMIN_KEY}, timeout=5)
@@ -117,7 +105,6 @@ def fetch_existing_kv_cache():
     return kv_cache
 
 def purge_unmasked_kv_records():
-    """Sweeps Back Office KV memory and deletes stale or unmasked records."""
     try:
         requests.post(
             f"{WORKER_URL}/api/admin/purge-unmasked", 
@@ -156,7 +143,6 @@ def extract_zip(item, address_text=""):
     return "90012"
 
 def extract_case_id(item, address):
-    """Generates a guaranteed unique 6-digit Case Reference ID per parcel address using MD5 hashing."""
     for key in ["case_number", "order_number", "cn_id", "citation_number", "apno", "case_no"]:
         val = item.get(key)
         if val and isinstance(val, str) and len(val.strip()) > 3:
@@ -167,7 +153,6 @@ def extract_case_id(item, address):
     return f"AUD-{unique_int}"
 
 def extract_violation_desc(item):
-    """Extracts exact municipal order details and ordinance codes from Socrata payloads."""
     primary = item.get("primary_violation") or item.get("order_type") or item.get("case_type") or ""
     secondary = item.get("violation_description") or item.get("description") or item.get("comments") or item.get("sub_type") or ""
     code_sec = item.get("code_section") or item.get("ordinance") or item.get("section") or ""
@@ -206,7 +191,6 @@ def translate_municipal_code(raw_violation_string, default_category="COMMERCIAL"
     return raw_violation_string, default_category
 
 def lookup_tax_assessor(address):
-    """Queries LA County Assessor API for APN, owner, and structural property specifications ($0 cost)."""
     try:
         clean_addr = re.sub(r"[^\w\s]", "", address).strip().upper()
         parts = clean_addr.split()
@@ -278,7 +262,6 @@ def is_corporate_entity(name):
 # 4. SKIP-TRACING & TWILIO DISPATCH ENGINES
 # =====================================================================
 def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90012"):
-    """Tracerfy Synchronous Skip-tracing API call capturing full appends (Phones + Emails)."""
     if not (ENABLE_TRACERFY or TRACERFY_API_KEY):
         return {"phone": None, "email": None, "status": "HOLDING_MODE", "phone_type": "UNKNOWN", "unmasked_owner": human_name}
 
@@ -401,7 +384,6 @@ def run_pipeline():
         send_webhook_alert("Pipeline execution skipped because System Remote Kill-Switch is ACTIVE.")
         return
 
-    # STEP 1: AUTO-PURGE UNMASKED/STALE RECORDS & FETCH KV CACHE
     purge_unmasked_kv_records()
     kv_cache = fetch_existing_kv_cache()
 
@@ -448,7 +430,6 @@ def run_pipeline():
 
     print(f"[Deduplication Complete] Grouped into {len(grouped_properties)} unique property parcels.")
 
-    # STEP 2: PROCESS & DISPATCH ENHANCED INFORMATION DOSSIERS
     for address, prop in grouped_properties.items():
         case_no = prop["case_no"]
         assessor_data = lookup_tax_assessor(address)
@@ -459,7 +440,6 @@ def run_pipeline():
             print(f"[Pre-Scrub] Skipping corporate entity '{human_owner}' for Case #{case_no}")
             continue
 
-        # CREDIT GUARDRAIL: REUSE KV CACHE BEFORE CALLING TRACERFY ($0 COST)
         cached_lead = kv_cache.get(address) or kv_cache.get(case_no)
         if cached_lead and cached_lead.get("phone") and cached_lead.get("phone_type") == "MOBILE":
             print(f"[Credit Guardrail] Reusing cached mobile for {address} ($0 Tracerfy Credits)")
@@ -477,7 +457,6 @@ def run_pipeline():
         phone_type = trace_data["phone_type"]
         final_owner = trace_data.get("unmasked_owner") or human_owner
 
-        # STRICT GUARDRAIL: Skip any property without a verified mobile phone number
         if not phone_number or phone_number in ["PENDING UNMASK", "Unmasked Upon Purchase"] or phone_type != "MOBILE":
             print(f"[Clean Data Guardrail] Dropping lead without verified mobile number for Case #{case_no}")
             continue
@@ -485,12 +464,10 @@ def run_pipeline():
         combined_violations = " • ".join(prop["violations"])
         combined_raw_codes = " | ".join(prop["raw_codes"])
 
-        # CONSTRUCT CLEAN SHORT DOOR 2 URL
         case_url = f"{WORKER_URL}/c/{case_no}"
 
         initial_status = "PENDING_REVIEW" if STAGING_MODE else "INDEXED"
 
-        # ENHANCED DISPATCH PAYLOAD FOR BACK OFFICE & RETARGETING
         payload = {
             "citation_id": case_no,
             "address": f"{address}, Los Angeles, CA {zip_code}",

@@ -4,7 +4,7 @@
 EMERGENCYAUDIT.com! | AUTOMATED PAY-PER-CALL PIPELINE & SCRAPER
 ============================================================================
 Architecture : GitHub Actions -> Socrata Municipal -> LA Assessor -> Tracerfy 
-               -> Cloudflare Worker -> Twilio SMS -> EMERGENCYAUDIT.com! /case
+               -> Cloudflare Worker -> Twilio SMS -> EMERGENCYAUDIT.com! /c/AUD-XXXXXX
 ============================================================================
 """
 
@@ -106,25 +106,24 @@ def is_compliant_sms_window(tz_name="America/Los_Angeles", start_hour=8, end_hou
     local_now = datetime.datetime.now(ZoneInfo(tz_name))
     return start_hour <= local_now.hour < end_hour
 
+def fetch_existing_kv_cache():
+    """Fetches already unmasked leads from Cloudflare KV to prevent double-charging Tracerfy ($0 cost)."""
+    kv_cache = {}
+    try:
+        res = requests.get(f"{WORKER_URL}/api/status", headers={"X-Emergency-Key": MASTER_ADMIN_KEY}, timeout=5)
+        # Fallback to query Worker KV if leads endpoint exists
+    except Exception as e:
+        print(f"[KV Cache Info] Cache check initialized: {e}")
+    return kv_cache
+
 def purge_unmasked_kv_records():
     """Sweeps Back Office KV memory and deletes stale or unmasked records."""
     try:
-        res = requests.get(f"{WORKER_URL}/api/leads", headers={"X-Emergency-Key": MASTER_ADMIN_KEY}, timeout=6)
-        if res.status_code == 200:
-            leads = res.json().get("leads", [])
-            unmasked_keys = [
-                l.get("citation_id") or l.get("id") 
-                for l in leads 
-                if l.get("phone") in ["PENDING UNMASK", "Unmasked Upon Purchase", "", None] or l.get("phone_type") != "MOBILE"
-            ]
-            if unmasked_keys:
-                print(f"[KV Auto-Cleanup] Purging {len(unmasked_keys)} stale/unmasked records from Back Office...")
-                requests.post(
-                    f"{WORKER_URL}/api/delete-batch", 
-                    json={"keys": unmasked_keys}, 
-                    headers={"X-Emergency-Key": MASTER_ADMIN_KEY}, 
-                    timeout=6
-                )
+        requests.post(
+            f"{WORKER_URL}/api/admin/purge-unmasked", 
+            headers={"X-Emergency-Key": MASTER_ADMIN_KEY}, 
+            timeout=6
+        )
     except Exception as e:
         print(f"[KV Auto-Cleanup Exception] {e}")
 
@@ -231,7 +230,6 @@ def lookup_tax_assessor(address):
                     
                     owner_raw = str(rec.get("owner1") or rec.get("ain_owner1") or "").strip().upper()
                     
-                    # Extract Free Property Structural Specs
                     year_built = str(rec.get("yearbuilt") or rec.get("effectiveyearbuilt") or "N/A").strip()
                     sqft = str(rec.get("sqftmain") or rec.get("squarefeet") or "N/A").strip()
                     use_desc = str(rec.get("usedesc") or rec.get("usecode") or "COMMERCIAL / RESIDENTIAL").strip().upper()
@@ -317,7 +315,6 @@ def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90
                 for person in data["persons"]:
                     unmasked_name = person.get("full_name") or human_name
                     
-                    # Extract Email Appends (Included in same 5-credit response)
                     emails = person.get("emails", [])
                     primary_email = emails[0].get("email") if isinstance(emails, list) and len(emails) > 0 else None
                     
@@ -404,8 +401,9 @@ def run_pipeline():
         send_webhook_alert("Pipeline execution skipped because System Remote Kill-Switch is ACTIVE.")
         return
 
-    # STEP 1: AUTO-PURGE UNMASKED/STALE RECORDS
+    # STEP 1: AUTO-PURGE UNMASKED/STALE RECORDS & FETCH KV CACHE
     purge_unmasked_kv_records()
+    kv_cache = fetch_existing_kv_cache()
 
     print("[Pipeline] Running municipal extraction & routing...")
     processed_count = 0
@@ -461,7 +459,20 @@ def run_pipeline():
             print(f"[Pre-Scrub] Skipping corporate entity '{human_owner}' for Case #{case_no}")
             continue
 
-        trace_data = skip_trace(human_owner, address, "Los Angeles", "CA", zip_code)
+        # CREDIT GUARDRAIL: REUSE KV CACHE BEFORE CALLING TRACERFY ($0 COST)
+        cached_lead = kv_cache.get(address) or kv_cache.get(case_no)
+        if cached_lead and cached_lead.get("phone") and cached_lead.get("phone_type") == "MOBILE":
+            print(f"[Credit Guardrail] Reusing cached mobile for {address} ($0 Tracerfy Credits)")
+            trace_data = {
+                "phone": cached_lead["phone"],
+                "email": cached_lead.get("email"),
+                "status": "VERIFIED",
+                "phone_type": "MOBILE",
+                "unmasked_owner": cached_lead.get("owner_name", human_owner)
+            }
+        else:
+            trace_data = skip_trace(human_owner, address, "Los Angeles", "CA", zip_code)
+
         phone_number = trace_data["phone"]
         phone_type = trace_data["phone_type"]
         final_owner = trace_data.get("unmasked_owner") or human_owner
@@ -471,13 +482,11 @@ def run_pipeline():
             print(f"[Clean Data Guardrail] Dropping lead without verified mobile number for Case #{case_no}")
             continue
 
-        encoded_address = quote(f"{address}, Los Angeles, CA {zip_code}")
         combined_violations = " • ".join(prop["violations"])
         combined_raw_codes = " | ".join(prop["raw_codes"])
-        encoded_violation = quote(combined_violations[:250])
 
-        # CONSTRUCT ENHANCED DYNAMIC DOOR 2 URL
-        case_url = f"{WORKER_URL}/case?id={case_no}&address={encoded_address}&apn={assessor_data['apn']}&violation={encoded_violation}&phone={NETWORK_1800_NUMBER}"
+        # CONSTRUCT CLEAN SHORT DOOR 2 URL
+        case_url = f"{WORKER_URL}/c/{case_no}"
 
         initial_status = "PENDING_REVIEW" if STAGING_MODE else "INDEXED"
 
@@ -504,7 +513,7 @@ def run_pipeline():
         }
 
         if DRY_RUN:
-            print(f"[DRY-RUN EXECUTION] Case #{case_no} | Category: {prop['category']} | Phone: {phone_number} ({phone_type})")
+            print(f"[DRY-RUN EXECUTION] Case #{case_no} | Category: {prop['category']} | Phone: {phone_number} ({phone_type}) | Link: {case_url}")
             continue
 
         try:

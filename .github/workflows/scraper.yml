@@ -3,7 +3,7 @@ name: EmergencyAudit Pay-Per-Call Pipeline
 on:
   schedule:
     - cron: '0 */6 * * *'  # Runs automatically every 6 hours
-  workflow_dispatch:         # Enables manual "Run workflow" button in GitHub
+  workflow_dispatch:         # Enables manual trigger button in GitHub
 
 jobs:
   scrub-and-dispatch:
@@ -21,7 +21,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          pip install requests beautifulsoup4
 
       - name: Execute Scraper Pipeline
         env:
@@ -29,7 +29,7 @@ jobs:
           MASTER_ADMIN_KEY: ${{ secrets.MASTER_ADMIN_KEY }}
           TRACERFY_API_KEY: ${{ secrets.TRACERFY_API_KEY }}
           TRACERFY_URL: "https://tracerfy.com/v1/api/trace/lookup/"
-          ENABLE_TRACERFY: "true"
+          ENABLE_TRACERFY: ${{ secrets.ENABLE_TRACERFY || 'false' }}
           PAUSE_PIPELINE: ${{ secrets.PAUSE_PIPELINE }}
           DRY_RUN: ${{ secrets.DRY_RUN }}
           STAGING_MODE: ${{ secrets.STAGING_MODE }}

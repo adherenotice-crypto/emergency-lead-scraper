@@ -3,8 +3,8 @@
 ============================================================================
 EMERGENCYAUDIT.com! | AUTOMATED PAY-PER-CALL PIPELINE & SCRAPER
 ============================================================================
-Architecture : GitHub Actions -> Socrata Municipal -> LA Assessor -> Tracerfy 
-               -> Cloudflare Worker -> Twilio SMS -> EMERGENCYAUDIT.com! /c/AUD-XXXXXX
+Architecture : GitHub Actions -> Socrata Municipal -> LA Assessor -> Cloudflare KV
+               -> Twilio SMS -> EMERGENCYAUDIT.com! /c/AUD-XXXXXX
 ============================================================================
 """
 
@@ -23,7 +23,7 @@ import requests
 WORKER_URL = os.getenv("WORKER_URL", "https://emergencyaudit.com")
 MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY", "EmergencyAudit_Master_Key_2027!")
 
-# TRACERFY CONFIGURATION
+# TRACERFY CONFIGURATION (DEFAULTED TO FALSE TO PROTECT CREDITS)
 TRACERFY_API_KEY = os.getenv("TRACERFY_API_KEY", "")
 TRACERFY_URL = os.getenv("TRACERFY_URL", "https://tracerfy.com/v1/api/trace/lookup/")
 ENABLE_TRACERFY = os.getenv("ENABLE_TRACERFY", "false").lower() in ["true", "1", "yes"]
@@ -204,34 +204,45 @@ def translate_municipal_code(raw_violation_string, default_category="COMMERCIAL"
     return raw_violation_string, default_category
 
 def lookup_tax_assessor(address):
-    """Queries LA County Assessor API with rate-limiting and response validation ($0 cost)."""
+    """Queries LA County Assessor API ($0 free public data) with multi-stage fallback search."""
     try:
         clean_addr = re.sub(r"[^\w\s]", "", address).strip().upper()
         parts = clean_addr.split()
         if len(parts) >= 2:
             street_num = parts[0]
-            street_name = parts[2] if parts[1] in ["N", "S", "E", "W"] and len(parts) > 2 else parts[1]
-            
+            # Strip directionals & suffixes (N, S, E, W, AVE, BLVD, ST, etc.) to isolate core street name
+            ignore_words = {"N", "S", "E", "W", "NORTH", "SOUTH", "EAST", "WEST", "ST", "STREET", "AVE", "AVENUE", "BLVD", "BOULEVARD", "RD", "ROAD", "DR", "DRIVE", "WAY", "LN", "LANE", "CT", "COURT", "PL", "PLACE"}
+            street_parts = [p for p in parts[1:] if p not in ignore_words]
+            street_name = street_parts[0] if street_parts else parts[1]
+
             url = "https://data.lacounty.gov/resource/28ee-2bgz.json"
+            
+            # Attempt 1: Direct SoQL Query
             params = {
-                "$where": f"situshouse_no='{street_num}' AND situsstreetname LIKE '%{street_name}%'", 
-                "$limit": "1"
+                "$where": f"situshouse_no='{street_num}' AND situsstreetname LIKE '%{street_name}%'",
+                "$limit": "5"
             }
             time.sleep(0.12)  # Throttle to keep LA Assessor API happy
-            res = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}, timeout=6)
-            
-            if res.status_code == 200 and res.text.strip():
-                try:
-                    records = res.json()
-                    if isinstance(records, list) and len(records) > 0:
-                        rec = records[0]
+            res = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
+            records = res.json() if res.status_code == 200 else []
+
+            # Attempt 2: Full-Text $q Search Fallback if direct query was empty
+            if not records or not isinstance(records, list):
+                params_q = {"$q": f"{street_num} {street_name}", "$limit": "5"}
+                res_q = requests.get(url, params=params_q, headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
+                records = res_q.json() if res_q.status_code == 200 else []
+
+            if isinstance(records, list) and len(records) > 0:
+                for rec in records:
+                    rec_num = str(rec.get("situshouse_no") or "").strip()
+                    if rec_num == street_num or street_num in rec_num:
                         apn_raw = str(rec.get("ain") or rec.get("apn") or "").strip()
                         formatted_apn = f"{apn_raw[:4]}-{apn_raw[4:7]}-{apn_raw[7:]}" if len(apn_raw) == 10 else (apn_raw if apn_raw else "N/A")
                         
                         owner_raw = str(rec.get("owner1") or rec.get("ain_owner1") or "").strip().upper()
                         year_built = str(rec.get("yearbuilt") or rec.get("effectiveyearbuilt") or "N/A").strip()
                         sqft = str(rec.get("sqftmain") or rec.get("squarefeet") or "N/A").strip()
-                        use_desc = str(rec.get("usedesc") or rec.get("usecode") or "COMMERCIAL / RESIDENTIAL").strip().upper()
+                        use_desc = str(rec.get("usedesc") or rec.get("usecode") or "REAL ESTATE PARCEL").strip().upper()
                         zoning = str(rec.get("zoning") or rec.get("usecode") or "N/A").strip().upper()
 
                         return {
@@ -239,13 +250,11 @@ def lookup_tax_assessor(address):
                             "mail_address": str(rec.get("mail_address") or address).upper(),
                             "apn": formatted_apn if len(formatted_apn) > 3 else "N/A",
                             "zip": rec.get("situszip") or rec.get("zip") or None,
-                            "year_built": year_built if year_built != "0" else "N/A",
+                            "year_built": year_built if year_built not in ["0", "", "None"] else "N/A",
                             "sqft": f"{int(sqft):,} sqft" if sqft.isdigit() and int(sqft) > 0 else "N/A",
                             "property_use": use_desc,
                             "zoning": zoning
                         }
-                except json.decoder.JSONDecodeError:
-                    pass
     except Exception as e:
         print(f"[Assessor Error] {e}")
 
@@ -279,13 +288,13 @@ def is_corporate_entity(name):
 # 4. SKIP-TRACING & TWILIO DISPATCH ENGINES
 # =====================================================================
 def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90012"):
-    """Tracerfy Skip-tracing API call with strict Zero-Credit Dry Run protection."""
+    """Tracerfy Skip-tracing API call with strict Zero-Credit protection."""
     if DRY_RUN or not (ENABLE_TRACERFY and TRACERFY_API_KEY):
         return {
-            "phone": "3235550199", 
-            "email": "dryrun@emergencyaudit.com", 
-            "status": "MOCK_DRY_RUN", 
-            "phone_type": "MOBILE", 
+            "phone": "PENDING UNMASK", 
+            "email": "N/A", 
+            "status": "PUBLIC_DATA_INDEXED", 
+            "phone_type": "PENDING", 
             "unmasked_owner": human_name
         }
 
@@ -340,7 +349,7 @@ def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90
     except Exception as e:
         print(f"[Tracerfy Exception] {e}")
 
-    return {"phone": None, "email": None, "status": "FAILED", "phone_type": "NO_MOBILE", "unmasked_owner": human_name}
+    return {"phone": "PENDING UNMASK", "email": "N/A", "status": "FAILED", "phone_type": "PENDING", "unmasked_owner": human_name}
 
 def send_twilio_sms(to_phone, case_no, case_url):
     if DRY_RUN or not ENABLE_TWILIO_SMS:
@@ -356,7 +365,7 @@ def send_twilio_sms(to_phone, case_no, case_url):
         send_webhook_alert("Twilio dispatch failed due to missing API credentials.")
         return False
 
-    if not to_phone or len(to_phone.strip()) < 10:
+    if not to_phone or to_phone in ["PENDING UNMASK", "Unmasked Upon Purchase"] or len(to_phone.strip()) < 10:
         return False
 
     try:
@@ -405,7 +414,6 @@ def run_pipeline():
         send_webhook_alert("Pipeline execution skipped because System Remote Kill-Switch is ACTIVE.")
         return
 
-    purge_unmasked_kv_records()
     kv_cache = fetch_existing_kv_cache()
 
     print("[Pipeline] Running municipal extraction & routing...")
@@ -470,25 +478,36 @@ def run_pipeline():
 
         # CREDIT GUARDRAIL: REUSE KV CACHE BEFORE CALLING TRACERFY ($0 COST)
         cached_lead = kv_cache.get(address) or kv_cache.get(case_no)
-        if cached_lead and cached_lead.get("phone") and cached_lead.get("phone_type") == "MOBILE":
-            print(f"[Credit Guardrail] Reusing cached mobile for {address} ($0 Tracerfy Credits)")
+        if cached_lead and cached_lead.get("phone") and cached_lead.get("phone") != "PENDING UNMASK":
+            print(f"[Credit Guardrail] Reusing cached phone for {address} ($0 Tracerfy Credits)")
             trace_data = {
                 "phone": cached_lead["phone"],
-                "email": cached_lead.get("email"),
+                "email": cached_lead.get("email", "N/A"),
                 "status": "VERIFIED",
-                "phone_type": "MOBILE",
+                "phone_type": cached_lead.get("phone_type", "MOBILE"),
                 "unmasked_owner": cached_lead.get("owner_name", human_owner)
             }
-        else:
+            # PRESERVE EXISTING KV SPECS IF LIVE ASSESSOR LOOKUP RETURNED N/A
+            if assessor_data["apn"] == "N/A" and cached_lead.get("apn") and cached_lead.get("apn") != "N/A":
+                assessor_data["apn"] = cached_lead["apn"]
+                assessor_data["year_built"] = cached_lead.get("year_built", "N/A")
+                assessor_data["sqft"] = cached_lead.get("sqft", "N/A")
+                assessor_data["property_use"] = cached_lead.get("property_use", "REAL ESTATE PARCEL")
+                assessor_data["zoning"] = cached_lead.get("zoning", "N/A")
+        elif ENABLE_TRACERFY:
             trace_data = skip_trace(human_owner, address, "Los Angeles", "CA", zip_code)
+        else:
+            trace_data = {
+                "phone": "PENDING UNMASK",
+                "email": "N/A",
+                "status": "PUBLIC_DATA_INDEXED",
+                "phone_type": "PENDING",
+                "unmasked_owner": human_owner
+            }
 
-        phone_number = trace_data["phone"]
-        phone_type = trace_data["phone_type"]
+        phone_number = trace_data.get("phone", "PENDING UNMASK")
+        phone_type = trace_data.get("phone_type", "PENDING")
         final_owner = trace_data.get("unmasked_owner") or human_owner
-
-        if not phone_number or phone_number in ["PENDING UNMASK", "Unmasked Upon Purchase"] or phone_type != "MOBILE":
-            print(f"[Clean Data Guardrail] Dropping lead without verified mobile number for Case #{case_no}")
-            continue
 
         combined_violations = " • ".join(prop["violations"])
         combined_raw_codes = " | ".join(prop["raw_codes"])
@@ -501,7 +520,7 @@ def run_pipeline():
             "owner_name": final_owner,
             "phone": phone_number,
             "customerPhone": phone_number,
-            "support_phone": NETWORK_1800_NUMBER,   # Inbound 1-800 support line rendered on landing page
+            "support_phone": NETWORK_1800_NUMBER,   # Inbound 1-800 support line
             "email": trace_data.get("email") or "N/A",
             "mail_address": assessor_data["mail_address"],
             "phone_type": phone_type,
@@ -527,7 +546,7 @@ def run_pipeline():
             if res_push.status_code == 200:
                 processed_count += 1
 
-                if not STAGING_MODE and phone_number and phone_type == "MOBILE":
+                if not STAGING_MODE and phone_number and phone_number != "PENDING UNMASK" and phone_type == "MOBILE":
                     if send_twilio_sms(phone_number, case_no, case_url):
                         sms_sent_count += 1
                         payload["status"] = "SENT"

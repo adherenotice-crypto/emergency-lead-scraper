@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ============================================================================
-EMERGENCYAUDIT.com! | AUTOMATED PAY-PER-CALL PIPELINE & SCRAPER (TEST MODE)
+EMERGENCYAUDIT.com! | AUTOMATED PAY-PER-CALL PIPELINE & SCRAPER (DRY-RUN)
 ============================================================================
 Architecture : GitHub Actions -> Socrata Municipal -> LA Assessor -> Tracerfy 
                -> Cloudflare Worker -> Twilio SMS -> EMERGENCYAUDIT.com! /c/AUD-XXXXXX
@@ -37,19 +37,29 @@ ENABLE_TWILIO_SMS = os.getenv("ENABLE_TWILIO_SMS", "false").lower() == "true"
 
 # SYSTEM CONTROLS & SAFETY FLAGS
 PAUSE_PIPELINE = os.getenv("PAUSE_PIPELINE", "false").lower() == "true"
-DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
+DRY_RUN = True  # FORCE SAFETY DRY-RUN MODE ($0 TRACERFY CREDITS CONSUMED)
 STAGING_MODE = os.getenv("STAGING_MODE", "false").lower() == "true"
 
 # PHONE & WEBHOOK CONFIGURATION
 NETWORK_1800_NUMBER = os.getenv("NETWORK_1800_NUMBER", "18005550199")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 
-# ACTIVE SOCAL MUNICIPAL ENDPOINTS (SAFETY TEST: FILTERED FOR VALID ADDRESSES)
+# ACTIVE SOCAL MUNICIPAL ENDPOINTS (FULL PRODUCTION FEEDS RESTORED)
 SOCRATA_FEEDS = [
     {
         "name": "LA Building & Safety - Code Enforcement",
-        "url": "https://data.lacity.org/resource/u82d-eh7z.json?$limit=20&$where=primary_address%20IS%20NOT%20NULL",
+        "url": "https://data.lacity.org/resource/u82d-eh7z.json?$limit=150",
         "default_cat": "COMMERCIAL"
+    },
+    {
+        "name": "LA Building & Safety - Vacant Abatement",
+        "url": "https://data.lacity.org/resource/q3ak-s5hy.json?$limit=150",
+        "default_cat": "EMERGENCY"
+    },
+    {
+        "name": "LA City Active Code Citations & Orders",
+        "url": "https://data.lacity.org/resource/2n62-383m.json?$limit=150",
+        "default_cat": "TRADE"
     }
 ]
 
@@ -262,8 +272,8 @@ def is_corporate_entity(name):
 # 4. SKIP-TRACING & TWILIO DISPATCH ENGINES
 # =====================================================================
 def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90012"):
-    if not (ENABLE_TRACERFY or TRACERFY_API_KEY):
-        return {"phone": None, "email": None, "status": "HOLDING_MODE", "phone_type": "UNKNOWN", "unmasked_owner": human_name}
+    if DRY_RUN or not (ENABLE_TRACERFY or TRACERFY_API_KEY):
+        return {"phone": "3235550199", "email": "dryrun@emergencyaudit.com", "status": "DRY_RUN_MODE", "phone_type": "MOBILE", "unmasked_owner": human_name}
 
     headers = {
         "Authorization": f"Bearer {TRACERFY_API_KEY}",
@@ -322,8 +332,8 @@ def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90
     return {"phone": None, "email": None, "status": "FAILED", "phone_type": "NO_MOBILE", "unmasked_owner": human_name}
 
 def send_twilio_sms(to_phone, case_no, case_url):
-    if not ENABLE_TWILIO_SMS:
-        print(f"[SMS Skipped] ENABLE_TWILIO_SMS=false for Case #{case_no}")
+    if DRY_RUN or not ENABLE_TWILIO_SMS:
+        print(f"[SMS Skipped - Dry Run/Disabled] Case #{case_no}")
         return False
 
     if not is_compliant_sms_window():
@@ -490,7 +500,7 @@ def run_pipeline():
         }
 
         if DRY_RUN:
-            print(f"[DRY-RUN EXECUTION] Case #{case_no} | Category: {prop['category']} | Phone: {phone_number} ({phone_type}) | Link: {case_url}")
+            print(f"[DRY-RUN EXECUTION] Case #{case_no} | Owner: {final_owner} | APN: {assessor_data['apn']} | Link: {case_url}")
             continue
 
         try:

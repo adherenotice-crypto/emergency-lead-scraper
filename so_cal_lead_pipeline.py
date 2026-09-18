@@ -106,11 +106,15 @@ def is_compliant_sms_window(tz_name="America/Los_Angeles", start_hour=8, end_hou
     return start_hour <= local_now.hour < end_hour
 
 def fetch_existing_kv_cache():
+    """Fetches all stored unmasked leads from Cloudflare KV ($0 cost lookup)."""
     kv_cache = {}
     try:
-        res = requests.get(f"{WORKER_URL}/api/status", headers={"X-Emergency-Key": MASTER_ADMIN_KEY}, timeout=5)
+        res = requests.get(f"{WORKER_URL}/api/leads", headers={"X-Emergency-Key": MASTER_ADMIN_KEY}, timeout=6)
+        if res.status_code == 200:
+            kv_cache = res.json()
+            print(f"[KV Cache Info] Loaded {len(kv_cache)} cached records from Cloudflare KV.")
     except Exception as e:
-        print(f"[KV Cache Info] Cache check initialized: {e}")
+        print(f"[KV Cache Info] Cache check exception: {e}")
     return kv_cache
 
 def purge_unmasked_kv_records():

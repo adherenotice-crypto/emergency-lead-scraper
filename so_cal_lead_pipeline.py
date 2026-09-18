@@ -497,6 +497,7 @@ def run_pipeline():
             "owner_name": final_owner,
             "phone": phone_number,
             "customerPhone": phone_number,
+            "support_phone": NETWORK_1800_NUMBER,   # Inbound 1-800 support line rendered on landing page
             "email": trace_data.get("email") or "N/A",
             "mail_address": assessor_data["mail_address"],
             "phone_type": phone_type,
@@ -504,7 +505,7 @@ def run_pipeline():
             "raw_code": combined_raw_codes[:250],
             "category": prop["category"],
             "case_url": case_url,
-            "apn": assessor_data["apn"],
+            "apn": assessor_data["apn"],            # Real APN from Assessor lookup
             "year_built": assessor_data["year_built"],
             "sqft": assessor_data["sqft"],
             "property_use": assessor_data["property_use"],

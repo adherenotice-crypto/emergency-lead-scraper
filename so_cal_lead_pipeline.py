@@ -44,11 +44,11 @@ STAGING_MODE = os.getenv("STAGING_MODE", "false").lower() == "true"
 NETWORK_1800_NUMBER = os.getenv("NETWORK_1800_NUMBER", "18005550199")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 
-# ACTIVE SOCAL MUNICIPAL ENDPOINTS (SAFETY TEST: LIMIT=10)
+# ACTIVE SOCAL MUNICIPAL ENDPOINTS (SAFETY TEST: LIMIT=30)
 SOCRATA_FEEDS = [
     {
         "name": "LA Building & Safety - Code Enforcement",
-        "url": "https://data.lacity.org/resource/u82d-eh7z.json?$limit=10",
+        "url": "https://data.lacity.org/resource/u82d-eh7z.json?$limit=30",
         "default_cat": "COMMERCIAL"
     }
 ]

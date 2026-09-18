@@ -207,7 +207,7 @@ def translate_municipal_code(raw_violation_string, default_category="COMMERCIAL"
     return raw_violation_string, default_category
 
 def lookup_tax_assessor(address):
-    """Queries LA County Assessor API with robust street direction parsing & formatted APN output."""
+    """Queries LA County Assessor API for APN, owner, and structural property specifications ($0 cost)."""
     try:
         clean_addr = re.sub(r"[^\w\s]", "", address).strip().upper()
         parts = clean_addr.split()
@@ -230,16 +230,36 @@ def lookup_tax_assessor(address):
                     formatted_apn = f"{apn_raw[:4]}-{apn_raw[4:7]}-{apn_raw[7:]}" if len(apn_raw) == 10 else (apn_raw if apn_raw else "N/A")
                     
                     owner_raw = str(rec.get("owner1") or rec.get("ain_owner1") or "").strip().upper()
+                    
+                    # Extract Free Property Structural Specs
+                    year_built = str(rec.get("yearbuilt") or rec.get("effectiveyearbuilt") or "N/A").strip()
+                    sqft = str(rec.get("sqftmain") or rec.get("squarefeet") or "N/A").strip()
+                    use_desc = str(rec.get("usedesc") or rec.get("usecode") or "COMMERCIAL / RESIDENTIAL").strip().upper()
+                    zoning = str(rec.get("zoning") or rec.get("usecode") or "N/A").strip().upper()
+
                     return {
                         "owner_name": owner_raw if len(owner_raw) > 2 else "PROPERTY OWNER / MANAGER",
                         "mail_address": str(rec.get("mail_address") or address).upper(),
                         "apn": formatted_apn if len(formatted_apn) > 3 else "N/A",
-                        "zip": rec.get("situszip") or rec.get("zip") or None
+                        "zip": rec.get("situszip") or rec.get("zip") or None,
+                        "year_built": year_built if year_built != "0" else "N/A",
+                        "sqft": f"{int(sqft):,} sqft" if sqft.isdigit() and int(sqft) > 0 else "N/A",
+                        "property_use": use_desc,
+                        "zoning": zoning
                     }
     except Exception as e:
         print(f"[Assessor Error] {e}")
 
-    return {"owner_name": "PROPERTY OWNER / MANAGER", "mail_address": address, "apn": "N/A", "zip": None}
+    return {
+        "owner_name": "PROPERTY OWNER / MANAGER", 
+        "mail_address": address, 
+        "apn": "N/A", 
+        "zip": None,
+        "year_built": "N/A",
+        "sqft": "N/A",
+        "property_use": "REAL ESTATE PARCEL",
+        "zoning": "N/A"
+    }
 
 def unmask_entity_owner(owner_name, mail_address):
     if "C/O" in owner_name or "C/O" in mail_address:
@@ -260,8 +280,9 @@ def is_corporate_entity(name):
 # 4. SKIP-TRACING & TWILIO DISPATCH ENGINES
 # =====================================================================
 def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90012"):
+    """Tracerfy Synchronous Skip-tracing API call capturing full appends (Phones + Emails)."""
     if not (ENABLE_TRACERFY or TRACERFY_API_KEY):
-        return {"phone": None, "status": "HOLDING_MODE", "phone_type": "UNKNOWN", "unmasked_owner": human_name}
+        return {"phone": None, "email": None, "status": "HOLDING_MODE", "phone_type": "UNKNOWN", "unmasked_owner": human_name}
 
     headers = {
         "Authorization": f"Bearer {TRACERFY_API_KEY}",
@@ -295,8 +316,12 @@ def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90
             if data.get("hit") and data.get("persons"):
                 for person in data["persons"]:
                     unmasked_name = person.get("full_name") or human_name
-                    phones = person.get("phones", [])
                     
+                    # Extract Email Appends (Included in same 5-credit response)
+                    emails = person.get("emails", [])
+                    primary_email = emails[0].get("email") if isinstance(emails, list) and len(emails) > 0 else None
+                    
+                    phones = person.get("phones", [])
                     for p in phones:
                         p_num = p.get("number")
                         p_type = str(p.get("type", "")).lower()
@@ -304,6 +329,7 @@ def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90
                         if p_num and (p_type in ["mobile", "cell"] or not p_type):
                             return {
                                 "phone": p_num,
+                                "email": primary_email,
                                 "status": "VERIFIED",
                                 "phone_type": "MOBILE",
                                 "unmasked_owner": unmasked_name
@@ -313,7 +339,7 @@ def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90
     except Exception as e:
         print(f"[Tracerfy Exception] {e}")
 
-    return {"phone": None, "status": "FAILED", "phone_type": "NO_MOBILE", "unmasked_owner": human_name}
+    return {"phone": None, "email": None, "status": "FAILED", "phone_type": "NO_MOBILE", "unmasked_owner": human_name}
 
 def send_twilio_sms(to_phone, case_no, case_url):
     if not ENABLE_TWILIO_SMS:
@@ -424,7 +450,7 @@ def run_pipeline():
 
     print(f"[Deduplication Complete] Grouped into {len(grouped_properties)} unique property parcels.")
 
-    # STEP 2: PROCESS & DISPATCH ONLY VERIFIED UNMASKED LEADS
+    # STEP 2: PROCESS & DISPATCH ENHANCED INFORMATION DOSSIERS
     for address, prop in grouped_properties.items():
         case_no = prop["case_no"]
         assessor_data = lookup_tax_assessor(address)
@@ -450,23 +476,30 @@ def run_pipeline():
         combined_raw_codes = " | ".join(prop["raw_codes"])
         encoded_violation = quote(combined_violations[:250])
 
-        # CONSTRUCT DYNAMIC DOOR 2 URL
+        # CONSTRUCT ENHANCED DYNAMIC DOOR 2 URL
         case_url = f"{WORKER_URL}/case?id={case_no}&address={encoded_address}&apn={assessor_data['apn']}&violation={encoded_violation}&phone={NETWORK_1800_NUMBER}"
 
         initial_status = "PENDING_REVIEW" if STAGING_MODE else "INDEXED"
 
+        # ENHANCED DISPATCH PAYLOAD FOR BACK OFFICE & RETARGETING
         payload = {
             "citation_id": case_no,
             "address": f"{address}, Los Angeles, CA {zip_code}",
             "owner_name": final_owner,
             "phone": phone_number,
             "customerPhone": phone_number,
+            "email": trace_data.get("email") or "N/A",
+            "mail_address": assessor_data["mail_address"],
             "phone_type": phone_type,
             "violation": combined_violations[:250],
             "raw_code": combined_raw_codes[:250],
             "category": prop["category"],
             "case_url": case_url,
             "apn": assessor_data["apn"],
+            "year_built": assessor_data["year_built"],
+            "sqft": assessor_data["sqft"],
+            "property_use": assessor_data["property_use"],
+            "zoning": assessor_data["zoning"],
             "status": initial_status
         }
 

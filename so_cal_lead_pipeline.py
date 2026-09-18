@@ -23,10 +23,12 @@ import requests
 WORKER_URL = os.getenv("WORKER_URL", "https://emergencyaudit.com")
 MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY", "EmergencyAudit_Master_Key_2027!")
 
-# TRACERFY CONFIGURATION (DEFAULTED TO FALSE TO PROTECT CREDITS)
-TRACERFY_API_KEY = os.getenv("TRACERFY_API_KEY", "")
-TRACERFY_URL = os.getenv("TRACERFY_URL", "https://tracerfy.com/v1/api/trace/lookup/")
-ENABLE_TRACERFY = os.getenv("ENABLE_TRACERFY", "false").lower() in ["true", "1", "yes"]
+# ---------------------------------------------------------------------
+# TRACERFY HARD-LOCK: FORCED OFF AT CODE LEVEL ($0 CREDITS SPENT)
+# ---------------------------------------------------------------------
+TRACERFY_API_KEY = ""
+TRACERFY_URL = "https://tracerfy.com/v1/api/trace/lookup/"
+ENABLE_TRACERFY = False  # HARD-LOCKED TO FALSE
 
 # TWILIO CONFIGURATION
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
@@ -210,7 +212,7 @@ def lookup_tax_assessor(address):
         parts = clean_addr.split()
         if len(parts) >= 2:
             street_num = parts[0]
-            # Strip directionals & suffixes (N, S, E, W, AVE, BLVD, ST, etc.) to isolate core street name
+            # Strip directionals & suffixes to isolate core street name
             ignore_words = {"N", "S", "E", "W", "NORTH", "SOUTH", "EAST", "WEST", "ST", "STREET", "AVE", "AVENUE", "BLVD", "BOULEVARD", "RD", "ROAD", "DR", "DRIVE", "WAY", "LN", "LANE", "CT", "COURT", "PL", "PLACE"}
             street_parts = [p for p in parts[1:] if p not in ignore_words]
             street_name = street_parts[0] if street_parts else parts[1]
@@ -222,11 +224,11 @@ def lookup_tax_assessor(address):
                 "$where": f"situshouse_no='{street_num}' AND situsstreetname LIKE '%{street_name}%'",
                 "$limit": "5"
             }
-            time.sleep(0.12)  # Throttle to keep LA Assessor API happy
+            time.sleep(0.12)  # Throttle for Assessor API
             res = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
             records = res.json() if res.status_code == 200 else []
 
-            # Attempt 2: Full-Text $q Search Fallback if direct query was empty
+            # Attempt 2: Full-Text $q Search Fallback
             if not records or not isinstance(records, list):
                 params_q = {"$q": f"{street_num} {street_name}", "$limit": "5"}
                 res_q = requests.get(url, params=params_q, headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
@@ -285,71 +287,18 @@ def is_corporate_entity(name):
 
 
 # =====================================================================
-# 4. SKIP-TRACING & TWILIO DISPATCH ENGINES
+# 4. SKIP-TRACING ENGINE (HARD-LOCKED OFF — $0 COST)
 # =====================================================================
 def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90012"):
-    """Tracerfy Skip-tracing API call with strict Zero-Credit protection."""
-    if DRY_RUN or not (ENABLE_TRACERFY and TRACERFY_API_KEY):
-        return {
-            "phone": "PENDING UNMASK", 
-            "email": "N/A", 
-            "status": "PUBLIC_DATA_INDEXED", 
-            "phone_type": "PENDING", 
-            "unmasked_owner": human_name
-        }
-
-    headers = {
-        "Authorization": f"Bearer {TRACERFY_API_KEY}",
-        "Content-Type": "application/json"
+    """GUARANTEED $0 COST: TRACERFY IS TOTALLY BYPASSED."""
+    print(f"[TRACERFY HARD-LOCKED OFF] Skipping API call for {address}")
+    return {
+        "phone": "PENDING UNMASK", 
+        "email": "N/A", 
+        "status": "PUBLIC_DATA_INDEXED", 
+        "phone_type": "PENDING", 
+        "unmasked_owner": human_name
     }
-
-    payload = {
-        "address": address,
-        "city": city,
-        "state": state,
-        "zip": str(zip_code) if zip_code else "90012"
-    }
-
-    clean_name = human_name.strip() if human_name else ""
-    if clean_name and clean_name != "PROPERTY OWNER / MANAGER":
-        name_parts = clean_name.split()
-        if len(name_parts) >= 2:
-            payload["find_owner"] = False
-            payload["first_name"] = name_parts[0]
-            payload["last_name"] = name_parts[-1]
-        else:
-            payload["find_owner"] = True
-    else:
-        payload["find_owner"] = True
-
-    try:
-        res = requests.post(TRACERFY_URL, json=payload, headers=headers, timeout=10)
-        if res.status_code == 200:
-            data = res.json()
-            if data.get("hit") and data.get("persons"):
-                for person in data["persons"]:
-                    unmasked_name = person.get("full_name") or human_name
-                    emails = person.get("emails", [])
-                    primary_email = emails[0].get("email") if isinstance(emails, list) and len(emails) > 0 else None
-                    
-                    phones = person.get("phones", [])
-                    for p in phones:
-                        p_num = p.get("number")
-                        p_type = str(p.get("type", "")).lower()
-                        if p_num and (p_type in ["mobile", "cell"] or not p_type):
-                            return {
-                                "phone": p_num,
-                                "email": primary_email,
-                                "status": "VERIFIED",
-                                "phone_type": "MOBILE",
-                                "unmasked_owner": unmasked_name
-                            }
-        else:
-            print(f"[Tracerfy HTTP {res.status_code}] {res.text[:200]}")
-    except Exception as e:
-        print(f"[Tracerfy Exception] {e}")
-
-    return {"phone": "PENDING UNMASK", "email": "N/A", "status": "FAILED", "phone_type": "PENDING", "unmasked_owner": human_name}
 
 def send_twilio_sms(to_phone, case_no, case_url):
     if DRY_RUN or not ENABLE_TWILIO_SMS:
@@ -471,12 +420,7 @@ def run_pipeline():
 
         case_url = f"{WORKER_URL}/c/{case_no}"
 
-        # STRICT GUARANTEED ZERO-CREDIT HARD STOP FOR DRY RUNS
-        if DRY_RUN:
-            print(f"[DRY-RUN EXECUTION - $0 CREDITS] Case #{case_no} | Owner: {human_owner} | APN: {assessor_data['apn']} | Link: {case_url}")
-            continue
-
-        # CREDIT GUARDRAIL: REUSE KV CACHE BEFORE CALLING TRACERFY ($0 COST)
+        # CREDIT GUARDRAIL: REUSE EXISTING UNMASKED PHONE FROM KV ($0 COST)
         cached_lead = kv_cache.get(address) or kv_cache.get(case_no)
         if cached_lead and cached_lead.get("phone") and cached_lead.get("phone") != "PENDING UNMASK":
             print(f"[Credit Guardrail] Reusing cached phone for {address} ($0 Tracerfy Credits)")
@@ -494,16 +438,9 @@ def run_pipeline():
                 assessor_data["sqft"] = cached_lead.get("sqft", "N/A")
                 assessor_data["property_use"] = cached_lead.get("property_use", "REAL ESTATE PARCEL")
                 assessor_data["zoning"] = cached_lead.get("zoning", "N/A")
-        elif ENABLE_TRACERFY:
-            trace_data = skip_trace(human_owner, address, "Los Angeles", "CA", zip_code)
         else:
-            trace_data = {
-                "phone": "PENDING UNMASK",
-                "email": "N/A",
-                "status": "PUBLIC_DATA_INDEXED",
-                "phone_type": "PENDING",
-                "unmasked_owner": human_owner
-            }
+            # NO TRACERFY CALL POSSIBLE
+            trace_data = skip_trace(human_owner, address, "Los Angeles", "CA", zip_code)
 
         phone_number = trace_data.get("phone", "PENDING UNMASK")
         phone_type = trace_data.get("phone_type", "PENDING")

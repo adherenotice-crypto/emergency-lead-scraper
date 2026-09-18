@@ -26,7 +26,7 @@ MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY", "EmergencyAudit_Master_Key_2027
 # TRACERFY CONFIGURATION (CORRECTED BASE ENDPOINT)
 TRACERFY_API_KEY = os.getenv("TRACERFY_API_KEY", "")
 TRACERFY_URL = os.getenv("TRACERFY_URL", "https://tracerfy.com/v1/api/property/skip-trace")
-ENABLE_TRACERFY = os.getenv("ENABLE_TRACERFY", "false").lower() == "true"
+ENABLE_TRACERFY = os.getenv("ENABLE_TRACERFY", "false").lower() in ["true", "1", "yes"]
 
 # TWILIO CONFIGURATION
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
@@ -145,17 +145,29 @@ def extract_zip(item, address_text=""):
     return "90012"
 
 def extract_violation_desc(item):
-    """Searches text fields to pull actual violation details."""
-    for key in ["primary_violation", "violation_description", "order_type", "sub_type", "description", "case_type", "comments"]:
+    """Searches comprehensive Socrata text fields to pull precise municipal violation descriptions."""
+    search_fields = [
+        "primary_violation", "violation_description", "order_type", "sub_type", 
+        "description", "case_type", "comments", "violation_code", "violation_type", 
+        "violation_detail", "order_title", "notes", "prop_type", "case_type_desc",
+        "order_type_desc", "sub_type_desc", "action_taken", "reason", "code_section"
+    ]
+    for key in search_fields:
         val = item.get(key)
-        if val and isinstance(val, str) and len(val.strip()) > 5:
+        if val and isinstance(val, str) and len(val.strip()) > 3:
             return val.strip()
-    return "Municipal Hazard & Compliance Order"
+            
+    # Check for raw municipal ordinance code numbers in record
+    code_val = item.get("code") or item.get("ordinance") or item.get("section")
+    if code_val and isinstance(code_val, str):
+        return f"Municipal Code Notice (Sec. {code_val.strip()})"
+        
+    return "Municipal Building & Safety Citation Notice"
 
 def translate_municipal_code(raw_violation_string, default_category="COMMERCIAL"):
     """Parses raw ordinance numbers, returning plain English descriptions and revenue categories."""
     if not raw_violation_string or raw_violation_string.strip() == "":
-        return "Municipal Hazard & Code Compliance Order", default_category
+        return "Municipal Building & Safety Citation Notice", default_category
 
     for code, info in MUNICIPAL_CODE_MAP.items():
         if code in raw_violation_string:
@@ -181,8 +193,9 @@ def lookup_tax_assessor(address):
                     records = res.json()
                     if isinstance(records, list) and len(records) > 0:
                         rec = records[0]
+                        owner_raw = str(rec.get("owner1") or rec.get("ain_owner1") or "").strip().upper()
                         return {
-                            "owner_name": str(rec.get("owner1") or rec.get("ain_owner1") or "PROPERTY OWNER / MANAGER").upper(),
+                            "owner_name": owner_raw if len(owner_raw) > 2 else "PROPERTY OWNER / MANAGER",
                             "mail_address": str(rec.get("mail_address") or address).upper(),
                             "apn": str(rec.get("ain") or rec.get("apn") or "N/A"),
                             "zip": rec.get("situszip") or rec.get("zip") or None
@@ -205,7 +218,7 @@ def unmask_entity_owner(owner_name, mail_address):
 
 def is_corporate_entity(name):
     """Pre-scrubbing filter: Returns True if owner name contains corporate keywords."""
-    if not name:
+    if not name or name == "PROPERTY OWNER / MANAGER":
         return False
     upper_name = name.upper()
     return any(keyword in upper_name for keyword in CORPORATE_KEYWORDS)
@@ -216,12 +229,15 @@ def is_corporate_entity(name):
 # =====================================================================
 def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90012"):
     """Tracerfy Skip-tracing API call for mobile unmasking."""
-    if not ENABLE_TRACERFY or not TRACERFY_API_KEY:
+    if not ENABLE_TRACERFY and not TRACERFY_API_KEY:
         return {"phone": None, "status": "HOLDING_MODE", "phone_type": "UNKNOWN"}
+
+    # Use clean owner name if available, otherwise pass empty string for property address lookup
+    search_name = human_name if human_name != "PROPERTY OWNER / MANAGER" else ""
 
     try:
         payload = {
-            "name": human_name,
+            "name": search_name,
             "address": address,
             "city": city,
             "state": state,
@@ -233,14 +249,13 @@ def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90
         }
         res = requests.post(TRACERFY_URL, json=payload, headers=headers, timeout=8)
         
-        if res.status_code == 200:
+        if res.status_code in [200, 201]:
             data = res.json()
-            # Extract phone records from Tracerfy response
-            phones = data.get("phones", []) or data.get("results", [{}])[0].get("phones", [])
+            phones = data.get("phones", []) or data.get("results", [{}])[0].get("phones", []) or data.get("data", {}).get("phones", [])
             for phone_obj in phones:
                 p_type = str(phone_obj.get("type", "")).lower()
                 p_num = phone_obj.get("number") or phone_obj.get("phone")
-                if p_num and (p_type == "mobile" or p_type == "cell" or not p_type):
+                if p_num and (p_type in ["mobile", "cell"] or not p_type):
                     return {"phone": p_num, "status": "VERIFIED", "phone_type": "MOBILE"}
         else:
             print(f"[Tracerfy HTTP {res.status_code}] {res.text}")
@@ -348,7 +363,6 @@ def run_pipeline():
                         "zip_code": extract_zip(item, address)
                     }
                 else:
-                    # Append additional violation to existing property record
                     if plain_violation not in grouped_properties[address]["violations"]:
                         grouped_properties[address]["violations"].append(plain_violation)
                         grouped_properties[address]["raw_codes"].append(raw_violation)

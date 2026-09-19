@@ -102,7 +102,7 @@ def free_public_phone_lookup(name, address, city="Los Angeles", state="CA"):
 
         # Route request through ScraperAPI proxy if key is present
         if SCRAPERAPI_KEY:
-            request_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={target_url}"
+            request_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={target_url}&render=true"
         else:
             request_url = target_url
 
@@ -110,7 +110,8 @@ def free_public_phone_lookup(name, address, city="Los Angeles", state="CA"):
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         }
 
-        res = requests.get(request_url, headers=headers, timeout=15)
+        # 45-second timeout handles ScraperAPI residential proxy rendering
+        res = requests.get(request_url, headers=headers, timeout=45)
         if res.status_code == 200:
             phones = re.findall(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}", res.text)
             valid_phones = [re.sub(r"\D", "", p) for p in phones if not p.startswith(("800", "888", "877", "866"))]

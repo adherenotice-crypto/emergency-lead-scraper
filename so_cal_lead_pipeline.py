@@ -114,7 +114,13 @@ def free_public_phone_lookup(name, address, city="Los Angeles", state="CA"):
         res = requests.get(request_url, headers=headers, timeout=45)
         if res.status_code == 200:
             phones = re.findall(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}", res.text)
-            valid_phones = [re.sub(r"\D", "", p) for p in phones if not p.startswith(("800", "888", "877", "866"))]
+            
+            # Filter out toll-free AND generic site numbers (like 202 D.C. area codes)
+            valid_phones = [
+                re.sub(r"\D", "", p) for p in phones 
+                if not p.startswith(("800", "888", "877", "866", "202", "(202)"))
+            ]
+            
             if valid_phones:
                 phone_num = valid_phones[0]
                 if len(phone_num) == 10:

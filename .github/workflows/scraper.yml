@@ -27,6 +27,7 @@ jobs:
         env:
           WORKER_URL: "https://emergencyaudit.com"
           MASTER_ADMIN_KEY: ${{ secrets.MASTER_ADMIN_KEY }}
+          SCRAPERAPI_KEY: ${{ secrets.SCRAPERAPI_KEY }}
           TRACERFY_API_KEY: ${{ secrets.TRACERFY_API_KEY }}
           TRACERFY_URL: "https://tracerfy.com/v1/api/trace/lookup/"
           ENABLE_TRACERFY: ${{ secrets.ENABLE_TRACERFY || 'false' }}

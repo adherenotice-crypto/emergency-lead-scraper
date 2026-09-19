@@ -4,6 +4,8 @@ import requests
 import time
 import json
 import csv
+import pandas as pd
+import pdfplumber
 
 # =====================================================================
 # 1. ENVIRONMENT CONFIGURATION & SYSTEM CONTROLS
@@ -179,38 +181,92 @@ def dispatch_to_worker(parcel_record):
 
 
 # =====================================================================
-# 4. REAL DATA INGESTION ENGINE (CSV & LIVE SCRAPER)
+# 4. UNIVERSAL MULTI-FORMAT DATA INGESTION ENGINE
 # =====================================================================
-def load_csv_records(file_path="leads.csv"):
-    """Reads real property records from a local CSV file in the repo."""
-    records = []
-    if not os.path.exists(file_path):
-        return records
+def normalize_lead_dict(raw_dict):
+    """Maps varying county column headers into standard Worker schema keys."""
+    clean = {}
+    for k, v in raw_dict.items():
+        if k:
+            clean_key = str(k).strip().lower().replace(" ", "_").replace("-", "_")
+            clean[clean_key] = str(v).strip() if v is not None else ""
 
-    print(f"📁 Found real data file: {file_path}. Parsing records...")
-    with open(file_path, mode="r", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            records.append({
-                "citation_id": row.get("citation_id") or row.get("case_id"),
-                "owner_name": row.get("owner_name") or row.get("owner"),
-                "address": row.get("address") or row.get("property_address"),
-                "city": row.get("city", "Los Angeles"),
-                "state": row.get("state", "CA"),
-                "zip": row.get("zip", "90012"),
-                "apn": row.get("apn", "ON FILE"),
-                "category": row.get("category", "EXCESS PROCEEDS"),
-                "amount_logged": row.get("amount_logged") or row.get("amount", "$24,500.00 Logged"),
-                "violation": row.get("violation") or row.get("description", "Public index record logged."),
-                "phone": row.get("phone"),
-                "email": row.get("email")
-            })
-    return records
+    return {
+        "citation_id": clean.get("citation_id") or clean.get("case_id") or clean.get("notice_no"),
+        "owner_name": clean.get("owner_name") or clean.get("owner") or clean.get("taxpayer_name") or "RECORDED OWNER",
+        "address": clean.get("address") or clean.get("property_address") or clean.get("site_address") or "Recorded Parcel Location",
+        "city": clean.get("city", "Los Angeles"),
+        "state": clean.get("state", "CA"),
+        "zip": clean.get("zip") or clean.get("zip_code", "90012"),
+        "apn": clean.get("apn") or clean.get("parcel_id") or clean.get("pin", "ON FILE"),
+        "category": clean.get("category", "EXCESS PROCEEDS"),
+        "amount_logged": clean.get("amount_logged") or clean.get("amount") or clean.get("surplus", "$24,500.00 Logged"),
+        "violation": clean.get("violation") or clean.get("description", "Public index record logged."),
+        "phone": clean.get("phone"),
+        "email": clean.get("email")
+    }
+
+
+def parse_any_file(file_path):
+    """Parses CSV, Excel (.xlsx/.xls), PDF, or JSON files into normalized leads."""
+    ext = os.path.splitext(file_path)[1].lower()
+    raw_records = []
+
+    try:
+        if ext == ".csv":
+            with open(file_path, mode="r", encoding="utf-8-sig") as f:
+                raw_records = list(csv.DictReader(f))
+
+        elif ext in [".xlsx", ".xls"]:
+            df = pd.read_excel(file_path).fillna("")
+            raw_records = df.to_dict(orient="records")
+
+        elif ext == ".json":
+            with open(file_path, mode="r", encoding="utf-8") as f:
+                data = json.load(f)
+                raw_records = data if isinstance(data, list) else [data]
+
+        elif ext == ".pdf":
+            with pdfplumber.open(file_path) as pdf:
+                for page in pdf.pages:
+                    table = page.extract_table()
+                    if table and len(table) > 1:
+                        headers = [str(h).strip().lower().replace(" ", "_") for h in table[0]]
+                        for row in table[1:]:
+                            if len(row) == len(headers):
+                                raw_records.append(dict(zip(headers, row)))
+
+    except Exception as e:
+        print(f"❌ Error reading {file_path}: {e}")
+        return []
+
+    return [normalize_lead_dict(rec) for rec in raw_records if rec]
+
+
+def load_all_lead_datasets():
+    """Scans root and /data directory for CSV, Excel, PDF, or JSON datasets."""
+    all_leads = []
+    valid_exts = (".csv", ".xlsx", ".xls", ".json", ".pdf")
+
+    # Check root level standalone files first
+    root_files = [f for f in os.listdir(".") if f.lower().startswith("leads") and f.lower().endswith(valid_exts)]
+    for f in root_files:
+        print(f"📁 Found root dataset file: {f}")
+        all_leads.extend(parse_any_file(f))
+
+    # Check /data folder
+    data_dir = "./data"
+    if os.path.exists(data_dir):
+        data_files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.lower().endswith(valid_exts)]
+        for f in data_files:
+            print(f"📂 Found /data dataset file: {f}")
+            all_leads.extend(parse_any_file(f))
+
+    return all_leads
 
 
 def fetch_live_county_records():
-    """Hook for direct web scraping or live public portal API queries."""
-    # Place live county web scrapers here if scraping directly from public portals
+    """Hook for direct web scraping or live public portal queries."""
     return []
 
 
@@ -218,21 +274,21 @@ def fetch_live_county_records():
 # 5. LIVE RUN EXECUTION LOOP
 # =====================================================================
 if __name__ == "__main__":
-    print("🚀 Ingress Engine Active. Checking for real lead datasets...")
+    print("🚀 Universal Ingress Engine Active. Checking for lead datasets...")
 
-    # Step 1: Check for CSV file
-    real_leads = load_csv_records("leads.csv")
+    # Load from any format (CSV, XLSX, PDF, JSON) in root or /data
+    real_leads = load_all_lead_datasets()
 
-    # Step 2: Fall back to live portal scraper if no CSV exists
+    # Fall back to live portal scraper if no static datasets exist
     if not real_leads:
         real_leads = fetch_live_county_records()
 
     if not real_leads:
-        print("⚠️ No real leads found in 'leads.csv' or live scraper feed.")
-        print("💡 Tip: Add a 'leads.csv' file to your GitHub repository to run batch ingestion.")
+        print("⚠️ No datasets found (CSV, Excel, PDF, JSON) in root or /data folder.")
+        print("💡 Tip: Drop any dataset into the repo to run automated batch ingestion.")
     else:
-        print(f"📥 Loaded {len(real_leads)} real records. Beginning skip-trace & worker dispatch...\n")
+        print(f"📥 Loaded {len(real_leads)} total record(s). Beginning skip-trace & worker dispatch...\n")
         for idx, parcel in enumerate(real_leads, 1):
             print(f"[{idx}/{len(real_leads)}] Processing: {parcel.get('owner_name')} - {parcel.get('address')}")
             dispatch_to_worker(parcel)
-            time.sleep(0.5)  # Throttling POST requests
+            time.sleep(0.5)

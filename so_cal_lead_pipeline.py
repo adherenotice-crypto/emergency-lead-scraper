@@ -3,6 +3,7 @@ import re
 import requests
 import time
 import json
+import csv
 
 # =====================================================================
 # 1. ENVIRONMENT CONFIGURATION & SYSTEM CONTROLS
@@ -32,7 +33,7 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 
 
 # =====================================================================
-# 4. PHONE UNMASKING & SKIP-TRACING ENGINE ($0 SEARCH INTEGRATED)
+# 2. PHONE UNMASKING & SKIP-TRACING ENGINE ($0 SEARCH INTEGRATED)
 # =====================================================================
 def free_public_phone_lookup(name, address, city="Los Angeles", state="CA"):
     """Queries free open public whitepages feeds for verified personal numbers."""
@@ -40,7 +41,6 @@ def free_public_phone_lookup(name, address, city="Los Angeles", state="CA"):
         clean_name = re.sub(r"[^\w\s]", "", name).strip().replace(" ", "-")
         clean_addr = re.sub(r"[^\w\s]", "", address).strip().replace(" ", "-")
         
-        # Open web directory query
         search_url = f"https://www.truepeoplesearch.com/results?name={clean_name}&citystatezip={city}-{state}"
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -51,7 +51,6 @@ def free_public_phone_lookup(name, address, city="Los Angeles", state="CA"):
             phones = re.findall(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}", res.text)
             valid_phones = [re.sub(r"\D", "", p) for p in phones if not p.startswith("800") and not p.startswith("888")]
             if valid_phones:
-                # Format to standard 11-digit string starting with country code 1 if 10 digits
                 phone_num = valid_phones[0]
                 if len(phone_num) == 10:
                     phone_num = f"1{phone_num}"
@@ -64,7 +63,6 @@ def free_public_phone_lookup(name, address, city="Los Angeles", state="CA"):
 def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90012"):
     """UNMASKS CELL PHONES FOR $0 OR CALLS TRACERFY IF ENABLED."""
     
-    # Path A: Tracerfy Paid Skip-Tracing (If ENABLE_TRACERFY = true)
     if ENABLE_TRACERFY and TRACERFY_API_KEY:
         try:
             payload = {
@@ -93,7 +91,6 @@ def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90
         except Exception as e:
             print(f"[Tracerfy Exception] {e}")
 
-    # Path B: $0 Free Public Search Unmasking
     print(f"[$0 Public Search] Unmasking cell contact for {human_name} at {address}...")
     found_phone = free_public_phone_lookup(human_name, address, city, state)
     
@@ -116,13 +113,10 @@ def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90
 
 
 # =====================================================================
-# 5. WORKER DISPATCH ENGINE (POST TO EMERGENCYAUDIT.COM)
+# 3. WORKER DISPATCH ENGINE (POST TO EMERGENCYAUDIT.COM)
 # =====================================================================
 def dispatch_to_worker(parcel_record):
-    """
-    Takes raw parcel/scraped record, runs skip-trace unmasking,
-    and posts directly to Cloudflare Worker KV storage.
-    """
+    """Takes raw parcel/scraped record, runs skip-tracing, and posts to Cloudflare Worker KV."""
     if PAUSE_PIPELINE:
         print("⏸️ Pipeline paused. Skipping dispatch.")
         return False
@@ -133,7 +127,6 @@ def dispatch_to_worker(parcel_record):
     state = parcel_record.get("state", "CA")
     zip_code = parcel_record.get("zip", "90012")
 
-    # Run unmasking unless valid phone is already present
     existing_phone = parcel_record.get("phone")
     if not existing_phone or existing_phone in ["PENDING UNMASK", "Unmasked Upon Purchase"]:
         trace_res = skip_trace(owner, address, city, state, zip_code)
@@ -175,32 +168,71 @@ def dispatch_to_worker(parcel_record):
     try:
         res = requests.post(endpoint, json=payload, headers=headers, timeout=10)
         if res.status_code == 200:
-            print(f"✅ Dispatched to Worker [{citation_id}] -> Door 2 URL: {WORKER_URL}/c/{citation_id}")
+            print(f"✅ Dispatched [{citation_id}] -> Door 2 URL: {WORKER_URL}/c/{citation_id}")
             return True
         else:
             print(f"❌ Worker Error [{res.status_code}]: {res.text}")
             return False
     except Exception as e:
-        print(f"⚠️ Dispatch Network Exception: {e}")
+        print(f"⚠️ Dispatch Exception: {e}")
         return False
 
 
 # =====================================================================
-# DEMO EXECUTION
+# 4. REAL DATA INGESTION ENGINE (CSV & LIVE SCRAPER)
+# =====================================================================
+def load_csv_records(file_path="leads.csv"):
+    """Reads real property records from a local CSV file in the repo."""
+    records = []
+    if not os.path.exists(file_path):
+        return records
+
+    print(f"📁 Found real data file: {file_path}. Parsing records...")
+    with open(file_path, mode="r", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            records.append({
+                "citation_id": row.get("citation_id") or row.get("case_id"),
+                "owner_name": row.get("owner_name") or row.get("owner"),
+                "address": row.get("address") or row.get("property_address"),
+                "city": row.get("city", "Los Angeles"),
+                "state": row.get("state", "CA"),
+                "zip": row.get("zip", "90012"),
+                "apn": row.get("apn", "ON FILE"),
+                "category": row.get("category", "EXCESS PROCEEDS"),
+                "amount_logged": row.get("amount_logged") or row.get("amount", "$24,500.00 Logged"),
+                "violation": row.get("violation") or row.get("description", "Public index record logged."),
+                "phone": row.get("phone"),
+                "email": row.get("email")
+            })
+    return records
+
+
+def fetch_live_county_records():
+    """Hook for direct web scraping or live public portal API queries."""
+    # Place live county web scrapers here if scraping directly from public portals
+    return []
+
+
+# =====================================================================
+# 5. LIVE RUN EXECUTION LOOP
 # =====================================================================
 if __name__ == "__main__":
-    sample_lead = {
-        "citation_id": "AUD-882101",
-        "owner_name": "JOHN DOE",
-        "address": "1234 Wilshire Blvd",
-        "city": "Los Angeles",
-        "state": "CA",
-        "zip": "90017",
-        "apn": "5144-012-008",
-        "category": "EXCESS PROCEEDS",
-        "amount_logged": "$48,900.00 Logged",
-        "violation": "County surplus funds logged under tax auction index."
-    }
+    print("🚀 Ingress Engine Active. Checking for real lead datasets...")
 
-    print("🚀 Pipeline Active. Processing sample lead...")
-    dispatch_to_worker(sample_lead)
+    # Step 1: Check for CSV file
+    real_leads = load_csv_records("leads.csv")
+
+    # Step 2: Fall back to live portal scraper if no CSV exists
+    if not real_leads:
+        real_leads = fetch_live_county_records()
+
+    if not real_leads:
+        print("⚠️ No real leads found in 'leads.csv' or live scraper feed.")
+        print("💡 Tip: Add a 'leads.csv' file to your GitHub repository to run batch ingestion.")
+    else:
+        print(f"📥 Loaded {len(real_leads)} real records. Beginning skip-trace & worker dispatch...\n")
+        for idx, parcel in enumerate(real_leads, 1):
+            print(f"[{idx}/{len(real_leads)}] Processing: {parcel.get('owner_name')} - {parcel.get('address')}")
+            dispatch_to_worker(parcel)
+            time.sleep(0.5)  # Throttling POST requests

@@ -89,10 +89,10 @@ def validate_lead_record(record):
 
 
 # =====================================================================
-# 3. PHONE UNMASKING & SKIP-TRACING ENGINE ($0 PROXY SEARCH INTEGRATED)
+# 3. PHONE UNMASKING & SKIP-TRACING ENGINE (FAST PROXY INTEGRATED)
 # =====================================================================
 def free_public_phone_lookup(name, address, city="Los Angeles", state="CA"):
-    """Queries public search directories through ScraperAPI residential proxies."""
+    """Queries public search directories through ScraperAPI residential proxies without heavy JS rendering."""
     try:
         clean_name = re.sub(r"[^\w\s]", "", name).strip().replace(" ", "-").lower()
         clean_city = city.strip().replace(" ", "-").lower()
@@ -100,9 +100,9 @@ def free_public_phone_lookup(name, address, city="Los Angeles", state="CA"):
         
         target_url = f"https://www.fastpeoplesearch.com/name/{clean_name}_{clean_city}-{clean_state}"
 
-        # Route request through ScraperAPI proxy if key is present
+        # Fast proxy call without heavy browser headless overhead
         if SCRAPERAPI_KEY:
-            request_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={target_url}&render=true"
+            request_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={target_url}&country_code=us"
         else:
             request_url = target_url
 
@@ -110,8 +110,7 @@ def free_public_phone_lookup(name, address, city="Los Angeles", state="CA"):
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         }
 
-        # 45-second timeout handles ScraperAPI residential proxy rendering
-        res = requests.get(request_url, headers=headers, timeout=45)
+        res = requests.get(request_url, headers=headers, timeout=25)
         if res.status_code == 200:
             phones = re.findall(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}", res.text)
             

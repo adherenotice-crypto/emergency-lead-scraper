@@ -1,9 +1,16 @@
 name: EmergencyAudit Pay-Per-Call Pipeline
 
 on:
+  push:
+    paths:
+      - 'data/**'
+      - 'leads*.csv'
+      - 'leads*.xlsx'
+      - 'leads*.pdf'
+      - 'leads*.json'
   schedule:
     - cron: '0 */6 * * *'  # Runs automatically every 6 hours
-  workflow_dispatch:         # Enables manual trigger button in GitHub
+  workflow_dispatch:         # Enables manual trigger button in GitHub UI
 
 jobs:
   scrub-and-dispatch:
@@ -23,7 +30,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Execute Scraper Pipeline
+      - name: Execute Scraper & Ingestion Pipeline
         env:
           WORKER_URL: "https://emergencyaudit.com"
           MASTER_ADMIN_KEY: ${{ secrets.MASTER_ADMIN_KEY }}
@@ -31,14 +38,13 @@ jobs:
           TRACERFY_API_KEY: ${{ secrets.TRACERFY_API_KEY }}
           TRACERFY_URL: "https://tracerfy.com/v1/api/trace/lookup/"
           ENABLE_TRACERFY: ${{ secrets.ENABLE_TRACERFY || 'false' }}
-          PAUSE_PIPELINE: ${{ secrets.PAUSE_PIPELINE }}
-          DRY_RUN: ${{ secrets.DRY_RUN }}
-          STAGING_MODE: ${{ secrets.STAGING_MODE }}
+          PAUSE_PIPELINE: ${{ secrets.PAUSE_PIPELINE || 'false' }}
+          DRY_RUN: ${{ secrets.DRY_RUN || 'false' }}
+          STAGING_MODE: ${{ secrets.STAGING_MODE || 'false' }}
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           NETWORK_1800_NUMBER: ${{ secrets.NETWORK_1800_NUMBER }}
           ENABLE_TWILIO_SMS: "true"
           TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
           TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
           TWILIO_PHONE_NUMBER: ${{ secrets.TWILIO_PHONE_NUMBER }}
-        run: |
-          python so_cal_lead_pipeline.py
+        run: python main.py

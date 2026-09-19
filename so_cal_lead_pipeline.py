@@ -13,6 +13,9 @@ import pdfplumber
 WORKER_URL = os.getenv("WORKER_URL", "https://emergencyaudit.com")
 MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY", "EmergencyAudit_Master_Key_2027!")
 
+# SCRAPERAPI PROXY CONFIGURATION
+SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY", "")
+
 # TRACERFY & PHONE UNMASK CONFIGURATION
 TRACERFY_API_KEY = os.getenv("TRACERFY_API_KEY", "")
 TRACERFY_URL = os.getenv("TRACERFY_URL", "https://tracerfy.com/v1/api/trace/lookup/")
@@ -86,30 +89,38 @@ def validate_lead_record(record):
 
 
 # =====================================================================
-# 3. PHONE UNMASKING & SKIP-TRACING ENGINE ($0 SEARCH INTEGRATED)
+# 3. PHONE UNMASKING & SKIP-TRACING ENGINE ($0 PROXY SEARCH INTEGRATED)
 # =====================================================================
 def free_public_phone_lookup(name, address, city="Los Angeles", state="CA"):
-    """Queries free open public whitepages feeds for verified personal numbers."""
+    """Queries public search directories through ScraperAPI residential proxies."""
     try:
-        clean_name = re.sub(r"[^\w\s]", "", name).strip().replace(" ", "-")
-        clean_addr = re.sub(r"[^\w\s]", "", address).strip().replace(" ", "-")
+        clean_name = re.sub(r"[^\w\s]", "", name).strip().replace(" ", "-").lower()
+        clean_city = city.strip().replace(" ", "-").lower()
+        clean_state = state.strip().lower()
         
-        search_url = f"https://www.truepeoplesearch.com/results?name={clean_name}&citystatezip={city}-{state}"
+        target_url = f"https://www.fastpeoplesearch.com/name/{clean_name}_{clean_city}-{clean_state}"
+
+        # Route request through ScraperAPI proxy if key is present
+        if SCRAPERAPI_KEY:
+            request_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={target_url}"
+        else:
+            request_url = target_url
+
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         }
-        
-        res = requests.get(search_url, headers=headers, timeout=5)
+
+        res = requests.get(request_url, headers=headers, timeout=15)
         if res.status_code == 200:
             phones = re.findall(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}", res.text)
-            valid_phones = [re.sub(r"\D", "", p) for p in phones if not p.startswith("800") and not p.startswith("888")]
+            valid_phones = [re.sub(r"\D", "", p) for p in phones if not p.startswith(("800", "888", "877", "866"))]
             if valid_phones:
                 phone_num = valid_phones[0]
                 if len(phone_num) == 10:
                     phone_num = f"1{phone_num}"
                 return phone_num
     except Exception as e:
-        print(f"[Public Search Lookup Exception] {e}")
+        print(f"[Public Search Proxy Exception] {e}")
     return None
 
 
@@ -152,7 +163,7 @@ def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90
         except Exception as e:
             print(f"[Tracerfy Exception] {e}")
 
-    # Path B: $0 Free Public Search Unmasking
+    # Path B: $0 Free Public Search Unmasking (Proxy-Backed)
     print(f"[$0 Public Search] Unmasking contact for [{owner_type}] {target_name} at {address}...")
     found_phone = free_public_phone_lookup(target_name, address, city, state)
     

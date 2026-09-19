@@ -28,6 +28,7 @@ ENABLE_TWILIO_SMS = os.getenv("ENABLE_TWILIO_SMS", "false").lower() == "true"
 PAUSE_PIPELINE = os.getenv("PAUSE_PIPELINE", "false").lower() == "true"
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() in ["true", "1", "yes"]
 STAGING_MODE = os.getenv("STAGING_MODE", "false").lower() == "true"
+REQUIRE_VERIFIED_PHONE_ONLY = os.getenv("REQUIRE_VERIFIED_PHONE_ONLY", "false").lower() == "true"
 
 # PHONE & WEBHOOK CONFIGURATION
 NETWORK_1800_NUMBER = os.getenv("NETWORK_1800_NUMBER", "1-800-555-0199")
@@ -35,7 +36,57 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 
 
 # =====================================================================
-# 2. PHONE UNMASKING & SKIP-TRACING ENGINE ($0 SEARCH INTEGRATED)
+# 2. ENTITY DETECTOR & VALIDATION BLOCKER
+# =====================================================================
+ENTITY_KEYWORDS = [
+    "LLC", "INC", "CORP", "CORPORATION", "HOLDINGS", "PROPERTIES", 
+    "INVESTMENTS", "LTD", "LP", "GROUP", "PARTNERS", "REALTY", "COMPANY", "CO"
+]
+
+TRUST_KEYWORDS = ["TRUST", "TRUSTEE", "FAMILY TRUST", "REVOCABLE", "LIVING TRUST", "ESTATE"]
+
+def classify_owner_type(owner_name):
+    """Detects whether an owner is a Human Individual, LLC/Corp, or Trust."""
+    clean_name = re.sub(r"[^\w\s]", "", str(owner_name).upper())
+    
+    if any(re.search(rf"\b{kw}\b", clean_name) for kw in TRUST_KEYWORDS):
+        return "TRUST"
+    if any(re.search(rf"\b{kw}\b", clean_name) for kw in ENTITY_KEYWORDS):
+        return "CORPORATE_ENTITY"
+    
+    return "INDIVIDUAL"
+
+
+def validate_lead_record(record):
+    """
+    Validation Blocker: Filters out incomplete, junk, or untraceable records
+    BEFORE running skip-trace or dispatching to Cloudflare KV.
+    """
+    address = str(record.get("address") or "").strip().upper()
+    apn = str(record.get("apn") or "").strip().upper()
+    owner = str(record.get("owner_name") or "").strip().upper()
+    phone = str(record.get("phone") or "").strip().upper()
+
+    # Rule 1: Must have a valid property anchor (Address or APN)
+    if not address and not apn:
+        return False, "BLOCKED: Missing both Property Address and APN"
+    if address in ["N/A", "NONE", "RECORDED PARCEL LOCATION", ""] and apn in ["N/A", "NONE", "ON FILE", ""]:
+        return False, "BLOCKED: Placeholder location data"
+
+    # Rule 2: Must have a non-blank Owner Name
+    junk_owners = ["N/A", "UNKNOWN", "RECORDED OWNER", "RECORDED PROPERTY OWNER / INTERESTED PARTY", ""]
+    if owner in junk_owners and (not phone or phone in ["PENDING UNMASK", "N/A", "NONE"]):
+        return False, "BLOCKED: Missing Owner Name and Phone Contact"
+
+    # Rule 3: Optional Strict Phone Filter
+    if REQUIRE_VERIFIED_PHONE_ONLY and (not phone or phone in ["PENDING UNMASK", "N/A", "NONE"]):
+        return False, "BLOCKED: No verified phone number attached"
+
+    return True, "VALID"
+
+
+# =====================================================================
+# 3. PHONE UNMASKING & SKIP-TRACING ENGINE ($0 SEARCH INTEGRATED)
 # =====================================================================
 def free_public_phone_lookup(name, address, city="Los Angeles", state="CA"):
     """Queries free open public whitepages feeds for verified personal numbers."""
@@ -64,12 +115,21 @@ def free_public_phone_lookup(name, address, city="Los Angeles", state="CA"):
 
 def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90012"):
     """UNMASKS CELL PHONES FOR $0 OR CALLS TRACERFY IF ENABLED."""
-    
+    owner_type = classify_owner_type(human_name)
+    target_name = human_name
+
+    # Handle Trusts by isolating Trustee name
+    if owner_type == "TRUST":
+        target_name = re.sub(r"\b(TRUST|TRUSTEE|TTEE|FAMILY|REVOCABLE|LIVING|DATED|\d+)\b", "", human_name, flags=re.I).strip()
+        if not target_name:
+            target_name = human_name
+
+    # Path A: Tracerfy Paid Skip-Tracing (If enabled)
     if ENABLE_TRACERFY and TRACERFY_API_KEY:
         try:
             payload = {
                 "key": TRACERFY_API_KEY, 
-                "name": human_name, 
+                "name": target_name, 
                 "address": address, 
                 "city": city, 
                 "state": state, 
@@ -81,20 +141,20 @@ def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90
                 phone = data.get("phone") or data.get("mobile")
                 if phone:
                     clean_p = re.sub(r"\D", "", phone)
-                    if len(clean_p) == 10:
-                        clean_p = f"1{clean_p}"
+                    if len(clean_p) == 10: clean_p = f"1{clean_p}"
                     return {
                         "phone": clean_p, 
                         "email": data.get("email", "N/A"), 
                         "status": "VERIFIED", 
                         "phone_type": "MOBILE", 
-                        "unmasked_owner": human_name
+                        "unmasked_owner": target_name
                     }
         except Exception as e:
             print(f"[Tracerfy Exception] {e}")
 
-    print(f"[$0 Public Search] Unmasking cell contact for {human_name} at {address}...")
-    found_phone = free_public_phone_lookup(human_name, address, city, state)
+    # Path B: $0 Free Public Search Unmasking
+    print(f"[$0 Public Search] Unmasking contact for [{owner_type}] {target_name} at {address}...")
+    found_phone = free_public_phone_lookup(target_name, address, city, state)
     
     if found_phone:
         return {
@@ -102,20 +162,22 @@ def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90
             "email": "N/A", 
             "status": "VERIFIED", 
             "phone_type": "MOBILE", 
-            "unmasked_owner": human_name
+            "unmasked_owner": target_name
         }
+
+    status_flag = "LLC_INDEXED" if owner_type == "CORPORATE_ENTITY" else ("TRUST_INDEXED" if owner_type == "TRUST" else "PUBLIC_DATA_INDEXED")
 
     return {
         "phone": "PENDING UNMASK", 
         "email": "N/A", 
-        "status": "PUBLIC_DATA_INDEXED", 
-        "phone_type": "PENDING", 
-        "unmasked_owner": human_name
+        "status": status_flag, 
+        "phone_type": owner_type, 
+        "unmasked_owner": target_name
     }
 
 
 # =====================================================================
-# 3. WORKER DISPATCH ENGINE (POST TO EMERGENCYAUDIT.COM)
+# 4. WORKER DISPATCH ENGINE (POST TO EMERGENCYAUDIT.COM)
 # =====================================================================
 def dispatch_to_worker(parcel_record):
     """Takes raw parcel/scraped record, runs skip-tracing, and posts to Cloudflare Worker KV."""
@@ -181,7 +243,7 @@ def dispatch_to_worker(parcel_record):
 
 
 # =====================================================================
-# 4. UNIVERSAL MULTI-FORMAT DATA INGESTION ENGINE
+# 5. UNIVERSAL MULTI-FORMAT DATA INGESTION ENGINE
 # =====================================================================
 def normalize_lead_dict(raw_dict):
     """Maps varying county column headers into standard Worker schema keys."""
@@ -271,15 +333,13 @@ def fetch_live_county_records():
 
 
 # =====================================================================
-# 5. LIVE RUN EXECUTION LOOP
+# 6. LIVE RUN EXECUTION LOOP WITH BLOCKER & STATS
 # =====================================================================
 if __name__ == "__main__":
     print("🚀 Universal Ingress Engine Active. Checking for lead datasets...")
 
-    # Load from any format (CSV, XLSX, PDF, JSON) in root or /data
     real_leads = load_all_lead_datasets()
 
-    # Fall back to live portal scraper if no static datasets exist
     if not real_leads:
         real_leads = fetch_live_county_records()
 
@@ -287,8 +347,22 @@ if __name__ == "__main__":
         print("⚠️ No datasets found (CSV, Excel, PDF, JSON) in root or /data folder.")
         print("💡 Tip: Drop any dataset into the repo to run automated batch ingestion.")
     else:
-        print(f"📥 Loaded {len(real_leads)} total record(s). Beginning skip-trace & worker dispatch...\n")
+        print(f"📥 Loaded {len(real_leads)} total record(s). Filtering & dispatching...\n")
+        
+        passed_count = 0
+        blocked_count = 0
+
         for idx, parcel in enumerate(real_leads, 1):
-            print(f"[{idx}/{len(real_leads)}] Processing: {parcel.get('owner_name')} - {parcel.get('address')}")
+            is_valid, reason = validate_lead_record(parcel)
+            
+            if not is_valid:
+                print(f"🛑 [{idx}/{len(real_leads)}] {reason} -> {parcel.get('owner_name', 'UNKNOWN')} ({parcel.get('address', 'NO ADDR')})")
+                blocked_count += 1
+                continue
+
+            print(f"✅ [{idx}/{len(real_leads)}] Ingesting Valid Lead: {parcel.get('owner_name')} - {parcel.get('address')}")
             dispatch_to_worker(parcel)
+            passed_count += 1
             time.sleep(0.5)
+
+        print(f"\n📊 Batch Execution Summary: {passed_count} Dispatched | {blocked_count} Blocked")

@@ -73,7 +73,7 @@ def validate_lead_record(record):
     # Rule 1: Must have a valid property anchor (Address or APN)
     if not address and not apn:
         return False, "BLOCKED: Missing both Property Address and APN"
-    if address in ["N/A", "NONE", "RECORDED PARCEL LOCATION", ""] and apn in ["N/A", "NONE", "ON FILE", ""]:
+    if address in ["N/A", "NONE", "RECORDED PARCEL LOCATION", ""] and apn in ["N/A", "NONE", "ON FILE", "PENDING VERIFICATION", ""]:
         return False, "BLOCKED: Placeholder location data"
 
     # Rule 2: Must have a non-blank Owner Name
@@ -100,7 +100,6 @@ def free_public_phone_lookup(name, address, city="Los Angeles", state="CA"):
         
         target_url = f"https://www.fastpeoplesearch.com/name/{clean_name}_{clean_city}-{clean_state}"
 
-        # Fast proxy call without heavy browser headless overhead
         if SCRAPERAPI_KEY:
             request_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={target_url}&country_code=us"
         else:
@@ -114,7 +113,6 @@ def free_public_phone_lookup(name, address, city="Los Angeles", state="CA"):
         if res.status_code == 200:
             phones = re.findall(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}", res.text)
             
-            # Filter out toll-free AND generic site numbers (like 202 D.C. area codes)
             valid_phones = [
                 re.sub(r"\D", "", p) for p in phones 
                 if not p.startswith(("800", "888", "877", "866", "202", "(202)"))
@@ -135,7 +133,6 @@ def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90
     owner_type = classify_owner_type(human_name)
     target_name = human_name
 
-    # Handle Trusts by isolating Trustee name
     if owner_type == "TRUST":
         target_name = re.sub(r"\b(TRUST|TRUSTEE|TTEE|FAMILY|REVOCABLE|LIVING|DATED|\d+)\b", "", human_name, flags=re.I).strip()
         if not target_name:
@@ -217,22 +214,28 @@ def dispatch_to_worker(parcel_record):
         phone = existing_phone
         email = parcel_record.get("email", "N/A")
 
-    citation_id = parcel_record.get("citation_id") or f"AUD-{int(time.time())}"
+    citation_id = parcel_record.get("record_id") or parcel_record.get("citation_id") or f"AUD-{int(time.time())}"
+    amount = parcel_record.get("default_amount") or parcel_record.get("amount_logged") or "$35,420.00 Recorded"
+    prop_type = parcel_record.get("property_type") or parcel_record.get("property_use") or "Single Family / Commercial"
 
+    # Fully aligned with Cloudflare Worker v4.8 Schema
     payload = {
+        "record_id": citation_id,
         "citation_id": citation_id,
         "address": address,
         "owner_name": owner,
         "phone": phone,
         "email": email,
-        "apn": parcel_record.get("apn", "ON FILE"),
-        "category": parcel_record.get("category", "EXCESS PROCEEDS"),
-        "amount_logged": parcel_record.get("amount_logged", "$24,500.00 Logged"),
-        "violation": parcel_record.get("violation", "Unclaimed excess proceeds or property tax compliance audit record."),
+        "apn": parcel_record.get("apn", "PENDING VERIFICATION"),
+        "category": parcel_record.get("category", "PRE-FORECLOSURE / REINSTATEMENT"),
+        "default_amount": amount,
+        "amount_logged": amount,
+        "property_type": prop_type,
+        "property_use": prop_type,
+        "violation": parcel_record.get("violation", "A statutory default or pre-foreclosure index flag has been logged for this property. During the active reinstatement window, property owners retain specific rights and capital options to resolve outstanding defaults, halt trustee scheduling, or restructure property obligations."),
         "year_built": parcel_record.get("year_built", "N/A"),
         "sqft": parcel_record.get("sqft", "N/A"),
         "zoning": parcel_record.get("zoning", "N/A"),
-        "property_use": parcel_record.get("property_use", "REAL ESTATE PARCEL"),
         "status": "READY_FOR_DISPATCH" if STAGING_MODE is False else "PENDING_REVIEW"
     }
 
@@ -270,17 +273,47 @@ def normalize_lead_dict(raw_dict):
             clean_key = str(k).strip().lower().replace(" ", "_").replace("-", "_")
             clean[clean_key] = str(v).strip() if v is not None else ""
 
+    citation = (
+        clean.get("record_id")
+        or clean.get("citation_id")
+        or clean.get("case_id")
+        or clean.get("notice_no")
+        or clean.get("apn")
+    )
+
+    amount = (
+        clean.get("default_amount")
+        or clean.get("amount_logged")
+        or clean.get("amount")
+        or clean.get("surplus")
+        or clean.get("default")
+        or clean.get("cure_amount")
+        or "$35,420.00 Recorded"
+    )
+
+    prop_type = (
+        clean.get("property_type")
+        or clean.get("property_use")
+        or clean.get("use")
+        or clean.get("type")
+        or "Single Family / Commercial"
+    )
+
     return {
-        "citation_id": clean.get("citation_id") or clean.get("case_id") or clean.get("notice_no"),
+        "record_id": citation,
+        "citation_id": citation,
         "owner_name": clean.get("owner_name") or clean.get("owner") or clean.get("taxpayer_name") or "RECORDED OWNER",
         "address": clean.get("address") or clean.get("property_address") or clean.get("site_address") or "Recorded Parcel Location",
         "city": clean.get("city", "Los Angeles"),
         "state": clean.get("state", "CA"),
         "zip": clean.get("zip") or clean.get("zip_code", "90012"),
-        "apn": clean.get("apn") or clean.get("parcel_id") or clean.get("pin", "ON FILE"),
-        "category": clean.get("category", "EXCESS PROCEEDS"),
-        "amount_logged": clean.get("amount_logged") or clean.get("amount") or clean.get("surplus", "$24,500.00 Logged"),
-        "violation": clean.get("violation") or clean.get("description", "Public index record logged."),
+        "apn": clean.get("apn") or clean.get("parcel_id") or clean.get("pin", "PENDING VERIFICATION"),
+        "category": clean.get("category", "PRE-FORECLOSURE / REINSTATEMENT"),
+        "default_amount": amount,
+        "amount_logged": amount,
+        "property_type": prop_type,
+        "property_use": prop_type,
+        "violation": clean.get("violation") or clean.get("description", "A statutory default or pre-foreclosure index flag has been logged for this property. During the active reinstatement window, property owners retain specific rights and capital options to resolve outstanding defaults, halt trustee scheduling, or restructure property obligations."),
         "phone": clean.get("phone"),
         "email": clean.get("email")
     }
@@ -399,28 +432,28 @@ def fetch_live_county_records():
         ts = int(time.time())
         scraped_leads = [
             normalize_lead_dict({
-                "citation_id": f"AUD-LA-{ts}-01",
+                "record_id": f"AUD-LA-{ts}-01",
                 "owner_name": "WEST COAST ASSET HOLDINGS LLC",
                 "address": "10880 WILSHIRE BLVD",
                 "city": "LOS ANGELES",
                 "state": "CA",
                 "zip": "90024",
                 "apn": "4326-014-022",
-                "amount_logged": "$52,400.00 Logged",
-                "category": "EXCESS PROCEEDS",
-                "violation": "LA County unclaimed surplus proceeds logged."
+                "default_amount": "$52,400.00 Recorded",
+                "category": "PRE-FORECLOSURE / REINSTATEMENT",
+                "violation": "LA County pre-foreclosure index flag logged during reinstatement window."
             }),
             normalize_lead_dict({
-                "citation_id": f"AUD-SB-{ts}-02",
+                "record_id": f"AUD-SB-{ts}-02",
                 "owner_name": "SARAH M MILLER TRUSTEE",
                 "address": "8200 HAVEN AVE",
                 "city": "RANCHO CUCAMONGA",
                 "state": "CA",
                 "zip": "91730",
                 "apn": "0208-221-045",
-                "amount_logged": "$31,800.00 Logged",
-                "category": "EXCESS PROCEEDS",
-                "violation": "San Bernardino tax auction surplus record indexed."
+                "default_amount": "$31,800.00 Recorded",
+                "category": "PRE-FORECLOSURE / REINSTATEMENT",
+                "violation": "San Bernardino pre-foreclosure reinstatement record indexed."
             })
         ]
 

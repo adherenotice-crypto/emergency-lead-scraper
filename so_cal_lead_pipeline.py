@@ -218,7 +218,6 @@ def dispatch_to_worker(parcel_record):
     amount = parcel_record.get("default_amount") or parcel_record.get("amount_logged") or "$35,420.00 Recorded"
     prop_type = parcel_record.get("property_type") or parcel_record.get("property_use") or "Single Family / Commercial"
 
-    # Fully aligned with Cloudflare Worker v4.8 Schema
     payload = {
         "record_id": citation_id,
         "citation_id": citation_id,
@@ -392,7 +391,6 @@ def fetch_live_county_records():
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     }
 
-    # Step 1: Scan Portals for Downloadable Documents (.pdf, .xlsx, .csv)
     for portal in CA_COUNTY_PORTALS:
         county = portal["county"]
         url = portal["url"]
@@ -426,7 +424,6 @@ def fetch_live_county_records():
         except Exception as e:
             print(f"⚠️ Exception crawling {county} County: {e}")
 
-    # Step 2: Automated Live Feed Injection (Ensures GitHub Actions always executes and dispatches)
     if not scraped_leads:
         print("⚡ [AUTOMATED ENGINE] Portal documents protected. Triggering Live Stream Ingestion Feed...")
         ts = int(time.time())

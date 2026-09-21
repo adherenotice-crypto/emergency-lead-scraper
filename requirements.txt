@@ -3,3 +3,5 @@ pandas
 openpyxl
 xlrd
 pdfplumber
+playwright
+beautifulsoup4

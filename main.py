@@ -62,22 +62,15 @@ ENTITY_KEYWORDS = [
 TRUST_KEYWORDS = ["TRUST", "TRUSTEE", "FAMILY TRUST", "REVOCABLE", "LIVING TRUST", "ESTATE"]
 
 def classify_owner_type(owner_name):
-    """Detects whether an owner is a Human Individual, LLC/Corp, or Trust."""
     clean_name = re.sub(r"[^\w\s]", "", str(owner_name).upper())
-    
     if any(re.search(rf"\b{kw}\b", clean_name) for kw in TRUST_KEYWORDS):
         return "TRUST"
     if any(re.search(rf"\b{kw}\b", clean_name) for kw in ENTITY_KEYWORDS):
         return "CORPORATE_ENTITY"
-    
     return "INDIVIDUAL"
 
 
 def generate_deterministic_case_id(apn, address):
-    """
-    Generates a consistent Case ID based on APN or Address.
-    Prevents Cloudflare KV from creating duplicate records across repeat script runs.
-    """
     clean_apn = re.sub(r"\D", "", str(apn))
     if clean_apn and clean_apn != "PENDINGVERIFICATION" and len(clean_apn) >= 5:
         return f"AUD-APN-{clean_apn}"
@@ -90,9 +83,6 @@ def generate_deterministic_case_id(apn, address):
 
 
 def validate_lead_record(record):
-    """
-    Validation Blocker: Filters out incomplete, junk, or untraceable records.
-    """
     address = str(record.get("address") or "").strip().upper()
     apn = str(record.get("apn") or "").strip().upper()
     owner = str(record.get("owner_name") or "").strip().upper()
@@ -117,7 +107,6 @@ def validate_lead_record(record):
 # 3. PHONE UNMASKING & SKIP-TRACING ENGINE
 # =====================================================================
 def free_public_phone_lookup(name, address, city="Los Angeles", state="CA"):
-    """Queries public search directories through ScraperAPI residential proxies."""
     try:
         clean_name = re.sub(r"[^\w\s]", "", name).strip().replace(" ", "-").lower()
         clean_city = city.strip().replace(" ", "-").lower()
@@ -235,7 +224,7 @@ def dispatch_to_worker(parcel_record):
         phone = existing_phone
         email = parcel_record.get("email", "N/A")
 
-    citation_id = parcel_record.get("record_id") or parcel_record.get("citation_id") or generate_deterministic_case_id(apn, address)
+    citation_id = parcel_record.get("record_id") or parcel_record.get("citation_id") or generateDeterministic_case_id(apn, address)
     amount = parcel_record.get("default_amount") or parcel_record.get("amount_logged") or "$35,420.00 Recorded"
     prop_type = parcel_record.get("property_type") or parcel_record.get("property_use") or "Single Family / Commercial"
 
@@ -284,7 +273,7 @@ def dispatch_to_worker(parcel_record):
 
 
 # =====================================================================
-# 5. DATA INGESTION & PARSING ENGINE
+# 5. DATA INGESTION & FILE PARSING ENGINE
 # =====================================================================
 def normalize_lead_dict(raw_dict):
     clean = {}
@@ -293,8 +282,20 @@ def normalize_lead_dict(raw_dict):
             clean_key = str(k).strip().lower().replace(" ", "_").replace("-", "_")
             clean[clean_key] = str(v).strip() if v is not None else ""
 
-    apn_val = clean.get("apn") or clean.get("parcel_id") or clean.get("pin") or clean.get("parcel") or "PENDING VERIFICATION"
-    addr_val = clean.get("address") or clean.get("property_address") or clean.get("site_address") or clean.get("location") or "Recorded Parcel Location"
+    apn_val = (
+        clean.get("apn") or clean.get("parcel_id") or clean.get("pin") 
+        or clean.get("parcel") or clean.get("parcel_number") or "PENDING VERIFICATION"
+    )
+    
+    addr_val = (
+        clean.get("address") or clean.get("property_address") or clean.get("site_address") 
+        or clean.get("location") or clean.get("street_address") or "Recorded Parcel Location"
+    )
+
+    owner_val = (
+        clean.get("owner_name") or clean.get("owner") or clean.get("taxpayer_name") 
+        or clean.get("name") or clean.get("owner_1_full_name") or "RECORDED OWNER"
+    )
 
     citation = (
         clean.get("record_id")
@@ -325,7 +326,7 @@ def normalize_lead_dict(raw_dict):
     return {
         "record_id": citation,
         "citation_id": citation,
-        "owner_name": clean.get("owner_name") or clean.get("owner") or clean.get("taxpayer_name") or clean.get("name") or "RECORDED OWNER",
+        "owner_name": owner_val,
         "address": addr_val,
         "city": clean.get("city", "Los Angeles"),
         "state": clean.get("state", "CA"),
@@ -337,7 +338,7 @@ def normalize_lead_dict(raw_dict):
         "property_type": prop_type,
         "property_use": prop_type,
         "violation": clean.get("violation") or clean.get("description", "A statutory Notice of Default (NOD) has been logged in CA public records."),
-        "phone": clean.get("phone"),
+        "phone": clean.get("phone") or clean.get("phone_1") or clean.get("mobile"),
         "email": clean.get("email")
     }
 
@@ -381,76 +382,27 @@ def load_all_lead_datasets():
     all_leads = []
     valid_exts = (".csv", ".xlsx", ".xls", ".json", ".pdf")
 
-    root_files = [f for f in os.listdir(".") if (f.lower().startswith("leads") or "lead" in f.lower()) and f.lower().endswith(valid_exts)]
+    # Scans root folder for any data files
+    root_files = [f for f in os.listdir(".") if f.lower().endswith(valid_exts) and not f.startswith("temp_")]
     for f in root_files:
-        logging.info(f"📁 Found local root dataset: {f}")
+        logging.info(f"📁 Processing repository dataset: {f}")
         all_leads.extend(parse_any_file(f))
 
     data_dir = "./data"
     if os.path.exists(data_dir):
         data_files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.lower().endswith(valid_exts)]
         for f in data_files:
-            logging.info(f"📂 Found /data dataset: {f}")
+            logging.info(f"📂 Processing /data folder dataset: {f}")
             all_leads.extend(parse_any_file(f))
 
     return all_leads
 
 
 # =====================================================================
-# 6. LIVE CRAWLERS & SCRAPER ENGINES
+# 6. LIVE CRAWLERS & PROPWIRE NEXT.JS PARSER ENGINE
 # =====================================================================
-CA_COUNTY_PORTALS = [
-    {"county": "Los Angeles", "url": "https://ttc.lacounty.gov/excess-proceeds-public-notice/"},
-    {"county": "San Bernardino", "url": "https://www.sbcounty.gov/taxcollector/surplus/"},
-    {"county": "Riverside", "url": "https://countytreasurer.org/tax-auctions/excess-proceeds"}
-]
-
-def fetch_live_county_records():
-    logging.info("🌐 [COUNTY CRAWLER] Scraping California Public Notice Portals...")
-    scraped_leads = []
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    }
-
-    for portal in CA_COUNTY_PORTALS:
-        county = portal["county"]
-        url = portal["url"]
-        logging.info(f"🔍 Crawling {county} County Portal: {url}")
-
-        try:
-            res = requests.get(url, headers=headers, timeout=12)
-            if res.status_code == 200:
-                doc_links = re.findall(r'href=["\']([^"\']+\.(?:pdf|xlsx|xls|csv))["\']', res.text, re.IGNORECASE)
-                unique_links = list(set(doc_links))
-
-                for link in unique_links:
-                    full_url = link if link.startswith("http") else requests.compat.urljoin(url, link)
-                    logging.info(f"📄 Downloading public notice document: {full_url}")
-
-                    doc_res = requests.get(full_url, headers=headers, timeout=15)
-                    if doc_res.status_code == 200:
-                        ext = ".pdf" if ".pdf" in full_url.lower() else ".xlsx"
-                        temp_path = f"temp_{int(time.time())}_{county.replace(' ', '_')}{ext}"
-
-                        with open(temp_path, "wb") as f:
-                            f.write(doc_res.content)
-
-                        parsed = parse_any_file(temp_path)
-                        if parsed:
-                            logging.info(f"🎯 Extracted {len(parsed)} real lead(s) from {county} document!")
-                            scraped_leads.extend(parsed)
-
-                        if os.path.exists(temp_path):
-                            os.remove(temp_path)
-        except Exception as e:
-            logging.error(f"⚠️ Exception crawling {county} County: {e}")
-
-    logging.info(f"📡 [COUNTY CRAWLER] Extracted {len(scraped_leads)} total public notice lead(s).")
-    return scraped_leads
-
-
 def fetch_propwire_leads():
-    logging.info("📡 [PROPWIRE ENGINE] Connecting to Propwire live stream...")
+    logging.info("📡 [PROPWIRE ENGINE] Connecting to Propwire via ScraperAPI...")
     
     if not SCRAPERAPI_KEY:
         logging.warning("⚠️ ScraperAPI key missing. Skipping Propwire scrape.")
@@ -469,20 +421,29 @@ def fetch_propwire_leads():
         res = requests.get(scraper_url, params=params, timeout=60)
         if res.status_code == 200:
             found_records = []
-            script_contents = re.findall(r'<script[^>]*>(.*?)</script>', res.text, re.DOTALL | re.IGNORECASE)
             
-            for script_text in script_contents:
-                if "props" in script_text and "lead" in script_text:
-                    matches = re.findall(r'\{"apn":"(.*?)","address":"(.*?)","owner":"(.*?)"\}', script_text)
-                    for apn, addr, owner in matches:
+            # Extract Next.js hydrated state payload
+            next_data_match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', res.text, re.DOTALL)
+            if next_data_match:
+                try:
+                    json_data = json.loads(next_data_match.group(1))
+                    page_props = json_data.get("props", {}).get("pageProps", {})
+                    results = page_props.get("results", []) or page_props.get("properties", [])
+                    
+                    for item in results:
                         found_records.append(normalize_lead_dict({
-                            "apn": apn,
-                            "address": addr,
-                            "owner_name": owner,
+                            "apn": item.get("apn") or item.get("parcel_id"),
+                            "address": item.get("address") or item.get("street_address"),
+                            "city": item.get("city", "Los Angeles"),
+                            "state": item.get("state", "CA"),
+                            "zip": item.get("zip"),
+                            "owner_name": item.get("owner_name") or item.get("owner"),
                             "category": "PRE-FORECLOSURE / REINSTATEMENT",
                             "violation": "Propwire High Equity Notice of Default (NOD) Stream"
                         }))
-            
+                except Exception as parse_err:
+                    logging.error(f"⚠️ Exception parsing Next.js JSON tree: {parse_err}")
+
             if found_records:
                 logging.info(f"✅ Propwire extracted {len(found_records)} live property lead(s)!")
                 return found_records
@@ -494,7 +455,6 @@ def fetch_propwire_leads():
 
 
 def get_staging_fallback_leads():
-    """Generates 5 deterministic staging leads ONLY if zero live leads exist across all feeds."""
     return [
         normalize_lead_dict({
             "apn": f"5100-010-00{i}",
@@ -521,24 +481,18 @@ if __name__ == "__main__":
     # 1. Harvest local CSV/PDF/XLS files in root or /data directory
     local_leads = load_all_lead_datasets()
     if local_leads:
-        logging.info(f"📁 Loaded {len(local_leads)} lead(s) from local dataset files.")
+        logging.info(f"📁 Loaded {len(local_leads)} lead(s) from local repo datasets.")
         real_leads.extend(local_leads)
 
-    # 2. Harvest live CA County Public Notice documents
-    county_leads = fetch_live_county_records()
-    if county_leads:
-        logging.info(f"🌐 Loaded {len(county_leads)} lead(s) from County Public Notices.")
-        real_leads.extend(county_leads)
-
-    # 3. Harvest live Propwire stream
+    # 2. Harvest live Propwire Next.js stream
     propwire_leads = fetch_propwire_leads()
     if propwire_leads:
-        logging.info(f"📡 Loaded {len(propwire_leads)} lead(s) from Propwire.")
+        logging.info(f"📡 Loaded {len(propwire_leads)} lead(s) from Propwire stream.")
         real_leads.extend(propwire_leads)
 
-    # 4. Fallback guard: ONLY activate test leads if 0 live records were harvested anywhere
+    # 3. Fallback guard: ONLY activate test leads if 0 live records were harvested anywhere
     if not real_leads:
-        logging.warning("⚠️ No live datasets, public notices, or stream records retrieved. Activating Staging Fallback Batch.")
+        logging.warning("⚠️ No live datasets or stream records retrieved. Activating Staging Fallback Batch.")
         real_leads = get_staging_fallback_leads()
 
     logging.info(f"\n📥 Total Aggregated Feed: {len(real_leads)} record(s). Filtering, unmasking & dispatching...\n")
@@ -552,7 +506,6 @@ if __name__ == "__main__":
             logging.info(f"\n🎯 TEST CAP REACHED: Processed {MAX_TEST_LEADS} leads. Halting batch.")
             break
 
-        # Deduplication Key Check (By APN or Address)
         apn = parcel.get("apn")
         addr = parcel.get("address")
         dedup_key = apn if (apn and apn != "PENDING VERIFICATION") else addr

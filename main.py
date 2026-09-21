@@ -7,6 +7,7 @@ import csv
 import pandas as pd
 import pdfplumber
 import logging
+from bs4 import BeautifulSoup
 
 # Set up clean logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -17,13 +18,13 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 WORKER_URL = os.getenv("WORKER_URL", "https://emergencyaudit.com")
 MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY", "EmergencyAudit_Master_Key_2027!")
 
-# PRODUCTION LEAD CAP (Set to None for full production volume; set to integer like 5 for pipe testing)
+# PRODUCTION LEAD CAP (Set to None for unlimited production volume)
 MAX_TEST_LEADS = None 
 
 # SCRAPERAPI PROXY CONFIGURATION
 SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY", "38c60fbbae81a8c17897a5b68da2e04c")
 
-# TARGET PROPWIRE LIVE STREAM URL (LA COUNTY | HIGH EQUITY | NOTICE OF DEFAULT)
+# TARGET PROPWIRE LIVE STREAM URL
 TARGET_PROPWIRE_URL = os.getenv(
     "TARGET_PROPWIRE_URL",
     "https://propwire.com/search?filters=%7B%22lead_type%22%3A%5B%22preforeclosure%22%5D%2C%22property_type%22%3A%5B%22commercial%22%2C%22mfh_5_plus%22%2C%22mfh_2_to_4%22%2C%22condo%22%2C%22sfr%22%5D%2C%22owner_type%22%3A%5B%22individual%22%2C%22company%22%5D%2C%22estimated_equity_percent%22%3A%7B%22min%22%3A30%2C%22max%22%3A100%7D%2C%22preforeclosure%22%3Atrue%2C%22notice_type%22%3A%22NOD%22%2C%22notice_date%22%3A%7B%22min%22%3A%222026-06-01%22%7D%2C%22locations%22%3A%5B%7B%22searchType%22%3A%22N%22%2C%22county%22%3A%22Los%20Angeles%22%2C%22state%22%3A%22CA%22%2C%22title%22%3A%22Los%20Angeles%2C%20CA%22%7D%5D%7D&location=Los%20Angeles%20County%2C%20CA"
@@ -43,7 +44,7 @@ ENABLE_TWILIO_SMS = os.getenv("ENABLE_TWILIO_SMS", "true").lower() == "true"
 # SYSTEM CONTROLS & SAFETY FLAGS
 PAUSE_PIPELINE = os.getenv("PAUSE_PIPELINE", "false").lower() == "true"
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() in ["true", "1", "yes"]
-STAGING_MODE = os.getenv("STAGING_MODE", "false").lower() == "true"  # Set to FALSE for live dispatch
+STAGING_MODE = os.getenv("STAGING_MODE", "false").lower() == "true"
 REQUIRE_VERIFIED_PHONE_ONLY = os.getenv("REQUIRE_VERIFIED_PHONE_ONLY", "false").lower() == "true"
 
 # PHONE & WEBHOOK CONFIGURATION
@@ -91,8 +92,7 @@ def generate_deterministic_case_id(apn, address):
 
 def validate_lead_record(record):
     """
-    Validation Blocker: Filters out incomplete, junk, or untraceable records
-    BEFORE running skip-trace or dispatching to Cloudflare KV.
+    Validation Blocker: Filters out incomplete, junk, or untraceable records.
     """
     address = str(record.get("address") or "").strip().upper()
     apn = str(record.get("apn") or "").strip().upper()
@@ -127,7 +127,7 @@ def free_public_phone_lookup(name, address, city="Los Angeles", state="CA"):
         target_url = f"https://www.fastpeoplesearch.com/name/{clean_name}_{clean_city}-{clean_state}"
 
         if SCRAPERAPI_KEY:
-            request_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={target_url}&country_code=us&premium=true"
+            request_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={target_url}&country_code=us"
         else:
             request_url = target_url
 
@@ -135,7 +135,7 @@ def free_public_phone_lookup(name, address, city="Los Angeles", state="CA"):
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         }
 
-        res = requests.get(request_url, headers=headers, timeout=25)
+        res = requests.get(request_url, headers=headers, timeout=20)
         if res.status_code == 200:
             phones = re.findall(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}", res.text)
             valid_phones = [
@@ -285,7 +285,7 @@ def dispatch_to_worker(parcel_record):
 
 
 # =====================================================================
-# 5. DATA INGESTION ENGINE
+# 5. DATA INGESTION & PARSING ENGINE
 # =====================================================================
 def normalize_lead_dict(raw_dict):
     clean = {}
@@ -294,8 +294,8 @@ def normalize_lead_dict(raw_dict):
             clean_key = str(k).strip().lower().replace(" ", "_").replace("-", "_")
             clean[clean_key] = str(v).strip() if v is not None else ""
 
-    apn_val = clean.get("apn") or clean.get("parcel_id") or clean.get("pin") or "PENDING VERIFICATION"
-    addr_val = clean.get("address") or clean.get("property_address") or clean.get("site_address") or "Recorded Parcel Location"
+    apn_val = clean.get("apn") or clean.get("parcel_id") or clean.get("pin") or clean.get("parcel") or "PENDING VERIFICATION"
+    addr_val = clean.get("address") or clean.get("property_address") or clean.get("site_address") or clean.get("location") or "Recorded Parcel Location"
 
     citation = (
         clean.get("record_id")
@@ -326,7 +326,7 @@ def normalize_lead_dict(raw_dict):
     return {
         "record_id": citation,
         "citation_id": citation,
-        "owner_name": clean.get("owner_name") or clean.get("owner") or clean.get("taxpayer_name") or "RECORDED OWNER",
+        "owner_name": clean.get("owner_name") or clean.get("owner") or clean.get("taxpayer_name") or clean.get("name") or "RECORDED OWNER",
         "address": addr_val,
         "city": clean.get("city", "Los Angeles"),
         "state": clean.get("state", "CA"),
@@ -337,7 +337,7 @@ def normalize_lead_dict(raw_dict):
         "amount_logged": amount,
         "property_type": prop_type,
         "property_use": prop_type,
-        "violation": clean.get("violation") or clean.get("description", "A statutory Notice of Default (NOD) has been logged in LA County public records."),
+        "violation": clean.get("violation") or clean.get("description", "A statutory Notice of Default (NOD) has been logged in CA public records."),
         "phone": clean.get("phone"),
         "email": clean.get("email")
     }
@@ -366,13 +366,13 @@ def parse_any_file(file_path):
                 for page in pdf.pages:
                     table = page.extract_table()
                     if table and len(table) > 1:
-                        headers = [str(h).strip().lower().replace(" ", "_") for h in table[0]]
+                        headers = [str(h).strip().lower().replace(" ", "_") for h in table[0] if h]
                         for row in table[1:]:
                             if len(row) == len(headers):
                                 raw_records.append(dict(zip(headers, row)))
 
     except Exception as e:
-        logging.error(f"❌ Error reading {file_path}: {e}")
+        logging.error(f"❌ Error reading file {file_path}: {e}")
         return []
 
     return [normalize_lead_dict(rec) for rec in raw_records if rec]
@@ -382,26 +382,123 @@ def load_all_lead_datasets():
     all_leads = []
     valid_exts = (".csv", ".xlsx", ".xls", ".json", ".pdf")
 
-    root_files = [f for f in os.listdir(".") if f.lower().startswith("leads") and f.lower().endswith(valid_exts)]
+    root_files = [f for f in os.listdir(".") if (f.lower().startswith("leads") or "lead" in f.lower()) and f.lower().endswith(valid_exts)]
     for f in root_files:
-        logging.info(f"📁 Found root dataset file: {f}")
+        logging.info(f"📁 Found local root dataset: {f}")
         all_leads.extend(parse_any_file(f))
 
     data_dir = "./data"
     if os.path.exists(data_dir):
         data_files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.lower().endswith(valid_exts)]
         for f in data_files:
-            logging.info(f"📂 Found /data dataset file: {f}")
+            logging.info(f"📂 Found /data dataset: {f}")
             all_leads.extend(parse_any_file(f))
 
     return all_leads
 
 
 # =====================================================================
-# 6. LIVE PROPWIRE, COUNTY PUBLIC RECORD & STAGING FALLBACK ENGINE
+# 6. LIVE CRAWLERS & SCRAPER ENGINES
 # =====================================================================
+CA_COUNTY_PORTALS = [
+    {"county": "Los Angeles", "url": "https://ttc.lacounty.gov/excess-proceeds-public-notice/"},
+    {"county": "San Bernardino", "url": "https://www.sbcounty.gov/taxcollector/surplus/"},
+    {"county": "Riverside", "url": "https://countytreasurer.org/tax-auctions/excess-proceeds"}
+]
+
+def fetch_live_county_records():
+    logging.info("🌐 [COUNTY CRAWLER] Scraping California Public Notice Portals...")
+    scraped_leads = []
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    }
+
+    for portal in CA_COUNTY_PORTALS:
+        county = portal["county"]
+        url = portal["url"]
+        logging.info(f"🔍 Crawling {county} County Portal: {url}")
+
+        try:
+            res = requests.get(url, headers=headers, timeout=12)
+            if res.status_code == 200:
+                doc_links = re.findall(r'href=["\']([^"\']+\.(?:pdf|xlsx|xls|csv))["\']', res.text, re.IGNORECASE)
+                unique_links = list(set(doc_links))
+
+                for link in unique_links:
+                    full_url = link if link.startswith("http") else requests.compat.urljoin(url, link)
+                    logging.info(f"📄 Downloading public notice document: {full_url}")
+
+                    doc_res = requests.get(full_url, headers=headers, timeout=15)
+                    if doc_res.status_code == 200:
+                        ext = ".pdf" if ".pdf" in full_url.lower() else ".xlsx"
+                        temp_path = f"temp_{int(time.time())}_{county.replace(' ', '_')}{ext}"
+
+                        with open(temp_path, "wb") as f:
+                            f.write(doc_res.content)
+
+                        parsed = parse_any_file(temp_path)
+                        if parsed:
+                            logging.info(f"🎯 Extracted {len(parsed)} real lead(s) from {county} document!")
+                            scraped_leads.extend(parsed)
+
+                        if os.path.exists(temp_path):
+                            os.remove(temp_path)
+        except Exception as e:
+            logging.error(f"⚠️ Exception crawling {county} County: {e}")
+
+    logging.info(f"📡 [COUNTY CRAWLER] Extracted {len(scraped_leads)} total public notice lead(s).")
+    return scraped_leads
+
+
+def fetch_propwire_leads():
+    logging.info("📡 [PROPWIRE ENGINE] Connecting to Propwire live stream...")
+    
+    if not SCRAPERAPI_KEY:
+        logging.warning("⚠️ ScraperAPI key missing. Skipping Propwire scrape.")
+        return []
+
+    scraper_url = "http://api.scraperapi.com"
+    params = {
+        "api_key": SCRAPERAPI_KEY,
+        "url": TARGET_PROPWIRE_URL,
+        "render": "true",
+        "ultra_premium": "true",
+        "country_code": "us"
+    }
+
+    try:
+        res = requests.get(scraper_url, params=params, timeout=60)
+        if res.status_code == 200:
+            soup = BeautifulSoup(res.text, "html.parser")
+            found_records = []
+            
+            # Extract dynamically rendered JSON or DOM rows if available
+            script_tags = soup.find_all("script")
+            for tag in script_tags:
+                if tag.string and "props" in tag.string and "lead" in tag.string:
+                    matches = re.findall(r'\{"apn":"(.*?)","address":"(.*?)","owner":"(.*?)"\}', tag.string)
+                    for apn, addr, owner in matches:
+                        found_records.append(normalize_lead_dict({
+                            "apn": apn,
+                            "address": addr,
+                            "owner_name": owner,
+                            "category": "PRE-FORECLOSURE / REINSTATEMENT",
+                            "violation": "Propwire High Equity Notice of Default (NOD) Stream"
+                        }))
+            
+            if found_records:
+                logging.info(f"✅ Propwire extracted {len(found_records)} live property lead(s)!")
+                return found_records
+
+    except Exception as err:
+        logging.error(f"⚠️ Propwire Scraper Exception: {err}")
+
+    # Return empty list on failure so live county results aren't overwritten with static test leads
+    return []
+
+
 def get_staging_fallback_leads():
-    """Generates 5 deterministic staging leads so CI/CD test pipeline runs never fail."""
+    """Generates 5 deterministic staging leads ONLY if zero live leads exist across all feeds."""
     return [
         normalize_lead_dict({
             "apn": f"5100-010-00{i}",
@@ -417,129 +514,38 @@ def get_staging_fallback_leads():
     ]
 
 
-def fetch_propwire_leads():
-    logging.info("📡 [PROPWIRE ENGINE] Connecting to Propwire via ScraperAPI residential proxy...")
-    
-    if not SCRAPERAPI_KEY:
-        logging.warning("⚠️ ScraperAPI key missing. Skipping Propwire scrape.")
-        return get_staging_fallback_leads()
-
-    scraper_url = "http://api.scraperapi.com"
-    params = {
-        "api_key": SCRAPERAPI_KEY,
-        "url": TARGET_PROPWIRE_URL,
-        "render": "true",
-        "premium": "true",  # Uses residential proxy IPs to bypass Propwire domain blocks
-        "country_code": "us"
-    }
-
-    try:
-        res = requests.get(scraper_url, params=params, timeout=90)
-        if res.status_code == 200:
-            logging.info("✅ Propwire data feed rendered successfully!")
-            scraped_batch = [
-                normalize_lead_dict({
-                    "apn": "2241-018-012",
-                    "owner_name": "WEST COAST ASSET HOLDINGS LLC",
-                    "address": "5635 Calhoun Ave",
-                    "city": "Van Nuys",
-                    "state": "CA",
-                    "zip": "91401",
-                    "default_amount": "$48,250.00 Recorded NOD",
-                    "category": "PRE-FORECLOSURE / REINSTATEMENT",
-                    "violation": "LA County Notice of Default (NOD) logged. High Equity (87%)."
-                }),
-                normalize_lead_dict({
-                    "apn": "3004-022-019",
-                    "owner_name": "INDIVIDUAL RECORDED OWNER",
-                    "address": "3148 Maricotte Dr",
-                    "city": "Palmdale",
-                    "state": "CA",
-                    "zip": "93550",
-                    "default_amount": "$31,400.00 Recorded NOD",
-                    "category": "PRE-FORECLOSURE / REINSTATEMENT",
-                    "violation": "LA County Notice of Default (NOD) logged. Equity (52%)."
-                })
-            ]
-            return scraped_batch
-        else:
-            logging.error(f"❌ ScraperAPI Proxy Error ({res.status_code}): {res.text}")
-    except Exception as err:
-        logging.error(f"⚠️ Exception during Propwire scrape / timeout: {err}")
-
-    logging.info("🔄 Activating Staging Fallback Batch for Pipeline Testing...")
-    return get_staging_fallback_leads()
-
-
-CA_COUNTY_PORTALS = [
-    {"county": "Los Angeles", "url": "https://ttc.lacounty.gov/excess-proceeds-public-notice/"},
-    {"county": "San Bernardino", "url": "https://www.sbcounty.gov/taxcollector/surplus/"},
-    {"county": "Riverside", "url": "https://countytreasurer.org/tax-auctions/excess-proceeds"}
-]
-
-def fetch_live_county_records():
-    logging.info("🌐 [BEAST SCRAPER] Launching Live County Public Records Web Crawler...")
-    scraped_leads = []
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    }
-
-    for portal in CA_COUNTY_PORTALS:
-        county = portal["county"]
-        url = portal["url"]
-        logging.info(f"🔍 Crawling {county} County Public Notice Portal: {url}")
-
-        try:
-            res = requests.get(url, headers=headers, timeout=10)
-            if res.status_code == 200:
-                doc_links = re.findall(r'href=["\']([^"\']+\.(?:pdf|xlsx|xls|csv))["\']', res.text, re.IGNORECASE)
-                unique_links = list(set(doc_links))
-
-                for link in unique_links:
-                    full_url = link if link.startswith("http") else requests.compat.urljoin(url, link)
-                    logging.info(f"📄 Downloading public notice file: {full_url}")
-
-                    doc_res = requests.get(full_url, headers=headers, timeout=12)
-                    if doc_res.status_code == 200:
-                        ext = ".pdf" if ".pdf" in full_url.lower() else ".xlsx"
-                        temp_path = f"temp_{int(time.time())}{ext}"
-
-                        with open(temp_path, "wb") as f:
-                            f.write(doc_res.content)
-
-                        parsed = parse_any_file(temp_path)
-                        if parsed:
-                            logging.info(f"🎯 Extracted {len(parsed)} verified leads from document!")
-                            scraped_leads.extend(parsed)
-
-                        if os.path.exists(temp_path):
-                            os.remove(temp_path)
-        except Exception as e:
-            logging.error(f"⚠️ Exception crawling {county} County: {e}")
-
-    logging.info(f"📡 [BEAST SCRAPER] Live Crawl Complete. Extracted {len(scraped_leads)} total lead(s).")
-    return scraped_leads
-
-
 # =====================================================================
-# 7. LIVE RUN EXECUTION LOOP WITH DEDUPLICATION
+# 7. MAIN EXECUTION LOOP WITH DEDUPLICATION
 # =====================================================================
 if __name__ == "__main__":
     logging.info(f"🚀 Universal Ingress Engine Active. Pipeline in PRODUCTION MODE (Cap: {'UNLIMITED' if MAX_TEST_LEADS is None else MAX_TEST_LEADS}).")
 
-    real_leads = load_all_lead_datasets()
+    real_leads = []
 
-    if not real_leads:
-        real_leads = fetch_propwire_leads()
+    # 1. Harvest local CSV/PDF/XLS files in root or /data directory
+    local_leads = load_all_lead_datasets()
+    if local_leads:
+        logging.info(f"📁 Loaded {len(local_leads)} lead(s) from local dataset files.")
+        real_leads.extend(local_leads)
 
-    if not real_leads:
-        real_leads = fetch_live_county_records()
+    # 2. Harvest live CA County Public Notice documents
+    county_leads = fetch_live_county_records()
+    if county_leads:
+        logging.info(f"🌐 Loaded {len(county_leads)} lead(s) from County Public Notices.")
+        real_leads.extend(county_leads)
 
+    # 3. Harvest live Propwire stream
+    propwire_leads = fetch_propwire_leads()
+    if propwire_leads:
+        logging.info(f"📡 Loaded {len(propwire_leads)} lead(s) from Propwire.")
+        real_leads.extend(propwire_leads)
+
+    # 4. Fallback guard: ONLY activate test leads if 0 live records were harvested anywhere
     if not real_leads:
-        logging.warning("⚠️ No static datasets or live feeds yielded records. Using Staging Fallback Batch.")
+        logging.warning("⚠️ No live datasets, public notices, or stream records retrieved. Activating Staging Fallback Batch.")
         real_leads = get_staging_fallback_leads()
 
-    logging.info(f"📥 Loaded {len(real_leads)} total raw record(s). Filtering & dispatching...\n")
+    logging.info(f"\n📥 Total Aggregated Feed: {len(real_leads)} record(s). Filtering, unmasking & dispatching...\n")
     
     passed_count = 0
     blocked_count = 0
@@ -547,7 +553,7 @@ if __name__ == "__main__":
 
     for idx, parcel in enumerate(real_leads, 1):
         if MAX_TEST_LEADS and passed_count >= MAX_TEST_LEADS:
-            logging.info(f"\n🎯 TEST CAP REACHED: Successfully processed {MAX_TEST_LEADS} leads. Stopping execution batch.")
+            logging.info(f"\n🎯 TEST CAP REACHED: Processed {MAX_TEST_LEADS} leads. Halting batch.")
             break
 
         # Deduplication Key Check (By APN or Address)
@@ -566,7 +572,7 @@ if __name__ == "__main__":
             blocked_count += 1
             continue
 
-        logging.info(f"✅ [{passed_count + 1}/{MAX_TEST_LEADS or 'UNLIMITED'}] Ingesting Valid Lead: {parcel.get('owner_name')} - {parcel.get('address')}")
+        logging.info(f"✅ [{passed_count + 1}/{MAX_TEST_LEADS or 'UNLIMITED'}] Ingesting Lead: {parcel.get('owner_name')} - {parcel.get('address')}")
         dispatch_to_worker(parcel)
         passed_count += 1
         time.sleep(0.5)

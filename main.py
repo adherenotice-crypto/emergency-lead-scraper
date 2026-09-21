@@ -81,7 +81,7 @@ def validate_lead_record(record):
 
 
 # =====================================================================
-# 3. APIFY DIRECT-URL CHUNKED SKIP-TRACING ENGINE (Bypasses Actor 400 Errors)
+# 3. APIFY DIRECT-URL CHUNKED SKIP-TRACING ENGINE
 # =====================================================================
 def apify_bulk_skip_trace(lead_batch):
     if not APIFY_TOKEN:
@@ -441,4 +441,4 @@ if __name__ == "__main__":
             except Exception as e:
                 logging.error(f"⚠️ Dispatch Exception: {e}")
 
-    logging.info(f"\n📊 Batch Execution Summary: {passed_count} Processed & Dispatched | {blocked_count} Blocked") Processed & Dispatched | {blocked_count} Blocked")
+    logging.info(f"\n📊 Batch Execution Summary: {passed_count} Processed & Dispatched | {blocked_count} Blocked")

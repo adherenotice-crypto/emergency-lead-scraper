@@ -277,70 +277,108 @@ def dispatch_to_worker(parcel_record):
 # 5. DATA INGESTION & FILE PARSING ENGINE
 # =====================================================================
 def normalize_lead_dict(raw_dict):
-    clean = {}
+    # Sanitize all column keys down to pure lowercase alphanumeric strings
+    norm = {}
     for k, v in raw_dict.items():
-        if k:
-            clean_key = str(k).strip().lower().replace(" ", "_").replace("-", "_")
-            clean[clean_key] = str(v).strip() if v is not None else ""
+        if k is not None and v is not None:
+            clean_k = re.sub(r'[^a-z0-9]', '', str(k).lower())
+            norm[clean_k] = str(v).strip()
 
+    # 1. APN Extraction
     apn_val = (
-        clean.get("apn") or clean.get("parcel_id") or clean.get("pin") 
-        or clean.get("parcel") or clean.get("parcel_number") or "PENDING VERIFICATION"
+        norm.get("apn") or norm.get("parcelid") or norm.get("pin") 
+        or norm.get("parcel") or norm.get("parcelnumber") or "PENDING VERIFICATION"
     )
-    
+
+    # 2. Address Extraction
     addr_val = (
-        clean.get("address") or clean.get("property_address") or clean.get("site_address") 
-        or clean.get("location") or clean.get("street_address") or "Recorded Parcel Location"
+        norm.get("address") or norm.get("propertyaddress") or norm.get("siteaddress") 
+        or norm.get("location") or norm.get("streetaddress") or norm.get("propaddress") 
+        or "Recorded Parcel Location"
     )
 
+    # 3. Location Details
+    city_val = norm.get("city") or norm.get("propertycity") or "Los Angeles"
+    state_val = norm.get("state") or norm.get("propertystate") or "CA"
+    zip_val = norm.get("zip") or norm.get("zipcode") or norm.get("propertyzip") or "90012"
+
+    # 4. Owner Name Extraction (Handles Propwire split & full-name layouts)
     owner_val = (
-        clean.get("owner_name") or clean.get("owner") or clean.get("taxpayer_name") 
-        or clean.get("name") or clean.get("owner_1_full_name") or "RECORDED OWNER"
+        norm.get("owner1fullname")
+        or norm.get("ownerfullname")
+        or norm.get("ownername")
+        or norm.get("owner1")
+        or norm.get("owner")
+        or norm.get("owner1companyname")
+        or norm.get("companyname")
+        or norm.get("taxpayername")
     )
 
+    if not owner_val:
+        fname = norm.get("owner1firstname") or norm.get("ownerfirstname") or norm.get("firstname") or ""
+        lname = norm.get("owner1lastname") or norm.get("ownerlastname") or norm.get("lastname") or ""
+        combined = f"{fname} {lname}".strip()
+        if combined:
+            owner_val = combined
+
+    if not owner_val:
+        for k, v in norm.items():
+            if "owner" in k and v and v.upper() not in ["N/A", "NONE", "UNKNOWN", "NULL", ""]:
+                owner_val = v
+                break
+
+    if not owner_val:
+        owner_val = "RECORDED OWNER"
+
+    # 5. Case Citation ID
     citation = (
-        clean.get("record_id")
-        or clean.get("citation_id")
-        or clean.get("case_id")
-        or clean.get("notice_no")
+        norm.get("recordid")
+        or norm.get("citationid")
+        or norm.get("caseid")
+        or norm.get("noticeno")
         or generate_deterministic_case_id(apn_val, addr_val)
     )
 
+    # 6. Default Amount & Property Type
     amount = (
-        clean.get("default_amount")
-        or clean.get("amount_logged")
-        or clean.get("amount")
-        or clean.get("surplus")
-        or clean.get("default")
-        or clean.get("cure_amount")
+        norm.get("defaultamount")
+        or norm.get("amountlogged")
+        or norm.get("amount")
+        or norm.get("surplus")
+        or norm.get("default")
+        or norm.get("cureamount")
+        or norm.get("estequity")
         or "$35,420.00 Recorded"
     )
 
     prop_type = (
-        clean.get("property_type")
-        or clean.get("property_use")
-        or clean.get("use")
-        or clean.get("type")
+        norm.get("propertytype")
+        or norm.get("propertyuse")
+        or norm.get("use")
+        or norm.get("type")
         or "Single Family / Commercial"
     )
+
+    phone_val = norm.get("phone") or norm.get("phone1") or norm.get("mobile") or norm.get("ownerphone")
+    email_val = norm.get("email") or norm.get("owneremail")
 
     return {
         "record_id": citation,
         "citation_id": citation,
         "owner_name": owner_val,
         "address": addr_val,
-        "city": clean.get("city", "Los Angeles"),
-        "state": clean.get("state", "CA"),
-        "zip": clean.get("zip") or clean.get("zip_code", "90012"),
+        "city": city_val,
+        "state": state_val,
+        "zip": zip_val,
         "apn": apn_val,
-        "category": clean.get("category", "PRE-FORECLOSURE / REINSTATEMENT"),
+        "category": norm.get("category") or "PRE-FORECLOSURE / REINSTATEMENT",
         "default_amount": amount,
         "amount_logged": amount,
         "property_type": prop_type,
         "property_use": prop_type,
-        "violation": clean.get("violation") or clean.get("description", "A statutory Notice of Default (NOD) has been logged in CA public records."),
-        "phone": clean.get("phone") or clean.get("phone_1") or clean.get("mobile"),
-        "email": clean.get("email")
+        "violation": norm.get("violation") or norm.get("description") or "A statutory Notice of Default (NOD) has been logged in CA public records.",
+        "phone": phone_val,
+        "email": email_val
     }
 
 
@@ -413,7 +451,6 @@ def fetch_propwire_leads():
             )
             page = context.new_page()
 
-            # Navigate to target URL and wait for network idle + JS hydration
             page.goto(TARGET_PROPWIRE_URL, timeout=60000, wait_until="networkidle")
             page.wait_for_timeout(4000)
 

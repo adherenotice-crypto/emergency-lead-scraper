@@ -27,26 +27,11 @@ TARGET_PROPWIRE_URL = os.getenv(
     "TARGET_PROPWIRE_URL"
 ) or "https://propwire.com/search?filters=%7B%22lead_type%22%3A%5B%22preforeclosure%22%5D%2C%22property_type%22%3A%5B%22commercial%22%2C%22mfh_5_plus%22%2C%22mfh_2_to_4%22%2C%22condo%22%2C%22sfr%22%5D%2C%22owner_type%22%3A%5B%22individual%22%2C%22company%22%5D%2C%22estimated_equity_percent%22%3A%7B%22min%22%3A30%2C%22max%22%3A100%7D%2C%22preforeclosure%22%3Atrue%2C%22notice_type%22%3A%22NOD%22%2C%22notice_date%22%3A%7B%22min%22%3A%222026-06-01%22%7D%2C%22locations%22%3A%5B%7B%22searchType%22%3A%22N%22%2C%22county%22%3A%22Los%20Angeles%22%2C%22state%22%3A%22CA%22%2C%22title%22%3A%22Los%20Angeles%2C%20CA%22%7D%5D%7D&location=Los%20Angeles%20County%2C%20CA"
 
-# TRACERFY DISABLED
-TRACERFY_API_KEY = ""
-TRACERFY_URL = "https://tracerfy.com/v1/api/trace/lookup/"
-ENABLE_TRACERFY = False
-
-# TWILIO CONFIGURATION
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID") or ""
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN") or ""
-TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER") or os.getenv("TWILIO_FROM_NUMBER") or ""
-ENABLE_TWILIO_SMS = (os.getenv("ENABLE_TWILIO_SMS") or "true").lower() == "true"
-
 # SYSTEM CONTROLS & SAFETY FLAGS
 PAUSE_PIPELINE = (os.getenv("PAUSE_PIPELINE") or "false").lower() == "true"
 DRY_RUN = (os.getenv("DRY_RUN") or "false").lower() in ["true", "1", "yes"]
 STAGING_MODE = (os.getenv("STAGING_MODE") or "false").lower() == "true"
 REQUIRE_VERIFIED_PHONE_ONLY = (os.getenv("REQUIRE_VERIFIED_PHONE_ONLY") or "false").lower() == "true"
-
-# PHONE & WEBHOOK CONFIGURATION
-NETWORK_1800_NUMBER = os.getenv("NETWORK_1800_NUMBER") or "1-800-555-0199"
-WEBHOOK_URL = os.getenv("WEBHOOK_URL") or ""
 
 
 # =====================================================================
@@ -102,49 +87,49 @@ def validate_lead_record(record):
 
 
 # =====================================================================
-# 3. $0 NATIVE PLAYWRIGHT UNMASKING ENGINE (Runs in GitHub Actions)
+# 3. $0 DUCKDUCKGO SEARCH SNIPPET MINING ENGINE
 # =====================================================================
-def free_playwright_phone_lookup(browser_context, name, address, city="Los Angeles", state="CA"):
-    clean_name = re.sub(r"[^\w\s]", "", name).strip().replace(" ", "-").lower()
-    clean_city = city.strip().replace(" ", "-").lower()
-    clean_state = state.strip().lower()
+def free_duckduckgo_phone_lookup(browser_context, name, address, city="Los Angeles", state="CA"):
+    try:
+        clean_name = re.sub(r"[^\w\s]", "", name).strip()
+        clean_city = city.strip()
+        clean_state = state.strip()
 
-    fps_url = f"https://www.fastpeoplesearch.com/name/{clean_name}_{clean_city}-{clean_state}"
-    tps_url = f"https://www.truepeoplesearch.com/results?name={clean_name.replace('-', '%20')}&citystatezip={clean_city}%2C%20{clean_state}"
+        # Query DuckDuckGo for public phone directory snippets
+        query = f'"{clean_name}" "{clean_city}" "{clean_state}" phone number'
+        encoded_query = requests.utils.quote(query)
+        target_url = f"https://html.duckduckgo.com/html/?q={encoded_query}"
 
-    for target_url in [fps_url, tps_url]:
+        page = browser_context.new_page()
+        page.goto(target_url, timeout=15000, wait_until="domcontentloaded")
+        page.wait_for_timeout(1000)
+
+        html = page.content()
+        page.close()
+
+        soup = BeautifulSoup(html, "html.parser")
+        snippets = [s.get_text() for s in soup.find_all("a", class_="result__snippet")]
+        snippets.extend([s.get_text() for s in soup.find_all("td", class_="result-snippet")])
+        full_text = " ".join(snippets)
+
+        # Extract 10-digit mobile patterns directly from indexed search snippet text
+        phones = re.findall(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}", full_text)
+
+        valid_phones = []
+        for p in phones:
+            clean_p = re.sub(r"\D", "", p)
+            if len(clean_p) == 10 and not clean_p.startswith(("800", "888", "877", "866", "202", "900", "000")):
+                valid_phones.append(clean_p)
+
+        if valid_phones:
+            return f"+1{valid_phones[0]}"
+
+    except Exception as e:
+        logging.error(f"[DuckDuckGo Snippet Search Exception] {e}")
         try:
-            page = browser_context.new_page()
-            
-            # Mask Playwright automation signatures
-            page.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            """)
-
-            page.goto(target_url, timeout=18000, wait_until="domcontentloaded")
-            page.wait_for_timeout(1500)
-
-            html = page.content()
             page.close()
-
-            tel_matches = re.findall(r'href=["\']tel:([^"\']+)["\']', html, re.IGNORECASE)
-            raw_phones = tel_matches if tel_matches else re.findall(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}", html)
-
-            valid_phones = []
-            for p in raw_phones:
-                clean_p = re.sub(r"\D", "", p)
-                if len(clean_p) == 10 and not clean_p.startswith(("800", "888", "877", "866", "202", "900", "000")):
-                    valid_phones.append(clean_p)
-
-            if valid_phones:
-                return f"+1{valid_phones[0]}"
-
-        except Exception as e:
-            logging.error(f"[Playwright Unmask Exception] {e}")
-            try:
-                page.close()
-            except Exception:
-                pass
+        except Exception:
+            pass
 
     return None
 
@@ -158,8 +143,8 @@ def skip_trace_with_playwright(browser_context, human_name, address, city="Los A
         if not target_name:
             target_name = human_name
 
-    logging.info(f"[$0 Native Playwright Search] Unmasking contact for [{owner_type}] {target_name} at {address}...")
-    found_phone = free_playwright_phone_lookup(browser_context, target_name, address, city, state)
+    logging.info(f"[$0 Search Snippet Mining] Unmasking contact for [{owner_type}] {target_name} at {address}...")
+    found_phone = free_duckduckgo_phone_lookup(browser_context, target_name, address, city, state)
     
     if found_phone:
         return {
@@ -364,7 +349,7 @@ if __name__ == "__main__":
         logging.warning("⚠️ No live datasets retrieved. Activating Staging Fallback.")
         real_leads = get_staging_fallback_leads()
 
-    logging.info(f"\n📥 Total Aggregated Feed: {len(real_leads)} record(s). Unmasking & Queueing Bulk Dispatch...\n")
+    logging.info(f"\n📥 Total Aggregated Feed: {len(real_leads)} record(s). Mining Snippets & Queueing Bulk Dispatch...\n")
     
     passed_count = 0
     blocked_count = 0
@@ -375,13 +360,7 @@ if __name__ == "__main__":
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            viewport={"width": 1920, "height": 1080},
-            extra_http_headers={
-                "Accept-Language": "en-US,en;q=0.9",
-                "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-                "Sec-Ch-Ua-Mobile": "?0",
-                "Sec-Ch-Ua-Platform": '"Windows"'
-            }
+            viewport={"width": 1920, "height": 1080}
         )
 
         for idx, parcel in enumerate(real_leads, 1):
@@ -441,7 +420,7 @@ if __name__ == "__main__":
 
         browser.close()
 
-    # BULK DISPATCH: 1 Single HTTP POST Request to Cloudflare (1 KV Write Total)
+    # Single HTTP POST Request to Cloudflare Worker (Conserves Daily KV Write Limits)
     if dispatch_queue:
         logging.info(f"\n🚀 Sending 1 single bulk payload with {len(dispatch_queue)} record(s) to Worker...")
         endpoint = f"{WORKER_URL.rstrip('/')}/api/inbound-lead-hook"

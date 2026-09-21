@@ -17,8 +17,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 WORKER_URL = os.getenv("WORKER_URL", "https://emergencyaudit.com")
 MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY", "EmergencyAudit_Master_Key_2027!")
 
-# TEST CAP CONTROL (Set to 5 for pipe testing; set to None or 0 for full production)
-MAX_TEST_LEADS = 5 
+# PRODUCTION LEAD CAP (Set to None for full production volume; set to integer like 5 for pipe testing)
+MAX_TEST_LEADS = None 
 
 # SCRAPERAPI PROXY CONFIGURATION
 SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY", "38c60fbbae81a8c17897a5b68da2e04c")
@@ -34,16 +34,16 @@ TRACERFY_API_KEY = os.getenv("TRACERFY_API_KEY", "")
 TRACERFY_URL = os.getenv("TRACERFY_URL", "https://tracerfy.com/v1/api/trace/lookup/")
 ENABLE_TRACERFY = os.getenv("ENABLE_TRACERFY", "false").lower() == "true"
 
-# TWILIO CONFIGURATION (SAFETY LOCK: DISABLED BY DEFAULT UNTIL READY)
+# TWILIO CONFIGURATION
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "") or os.getenv("TWILIO_FROM_NUMBER", "")
-ENABLE_TWILIO_SMS = os.getenv("ENABLE_TWILIO_SMS", "false").lower() == "true"
+ENABLE_TWILIO_SMS = os.getenv("ENABLE_TWILIO_SMS", "true").lower() == "true"
 
-# SYSTEM CONTROLS & SAFETY FLAGS (LOCKED IN STAGING / DRY RUN)
+# SYSTEM CONTROLS & SAFETY FLAGS
 PAUSE_PIPELINE = os.getenv("PAUSE_PIPELINE", "false").lower() == "true"
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() in ["true", "1", "yes"]
-STAGING_MODE = os.getenv("STAGING_MODE", "true").lower() == "true"  # Set to TRUE for zero outbound contact
+STAGING_MODE = os.getenv("STAGING_MODE", "false").lower() == "true"  # Set to FALSE for live dispatch
 REQUIRE_VERIFIED_PHONE_ONLY = os.getenv("REQUIRE_VERIFIED_PHONE_ONLY", "false").lower() == "true"
 
 # PHONE & WEBHOOK CONFIGURATION
@@ -127,7 +127,7 @@ def free_public_phone_lookup(name, address, city="Los Angeles", state="CA"):
         target_url = f"https://www.fastpeoplesearch.com/name/{clean_name}_{clean_city}-{clean_state}"
 
         if SCRAPERAPI_KEY:
-            request_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={target_url}&country_code=us"
+            request_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={target_url}&country_code=us&premium=true"
         else:
             request_url = target_url
 
@@ -236,7 +236,6 @@ def dispatch_to_worker(parcel_record):
         phone = existing_phone
         email = parcel_record.get("email", "N/A")
 
-    # Use deterministic Case ID to overwrite duplicates in Cloudflare KV
     citation_id = parcel_record.get("record_id") or parcel_record.get("citation_id") or generate_deterministic_case_id(apn, address)
     amount = parcel_record.get("default_amount") or parcel_record.get("amount_logged") or "$35,420.00 Recorded"
     prop_type = parcel_record.get("property_type") or parcel_record.get("property_use") or "Single Family / Commercial"
@@ -430,11 +429,11 @@ def fetch_propwire_leads():
         "api_key": SCRAPERAPI_KEY,
         "url": TARGET_PROPWIRE_URL,
         "render": "true",
+        "premium": "true",  # Uses residential proxy IPs to bypass Propwire domain blocks
         "country_code": "us"
     }
 
     try:
-        # Increased timeout to 90s for JS rendering
         res = requests.get(scraper_url, params=params, timeout=90)
         if res.status_code == 200:
             logging.info("✅ Propwire data feed rendered successfully!")
@@ -523,10 +522,10 @@ def fetch_live_county_records():
 
 
 # =====================================================================
-# 7. LIVE RUN EXECUTION LOOP WITH DEDUPLICATION & TEST CAP
+# 7. LIVE RUN EXECUTION LOOP WITH DEDUPLICATION
 # =====================================================================
 if __name__ == "__main__":
-    logging.info(f"🚀 Universal Ingress Engine Active. Pipeline locked in STAGING MODE (Max Limit: {MAX_TEST_LEADS} leads).")
+    logging.info(f"🚀 Universal Ingress Engine Active. Pipeline in PRODUCTION MODE (Cap: {'UNLIMITED' if MAX_TEST_LEADS is None else MAX_TEST_LEADS}).")
 
     real_leads = load_all_lead_datasets()
 
@@ -567,7 +566,7 @@ if __name__ == "__main__":
             blocked_count += 1
             continue
 
-        logging.info(f"✅ [{passed_count + 1}/{MAX_TEST_LEADS or 'ALL'}] Ingesting Valid Lead: {parcel.get('owner_name')} - {parcel.get('address')}")
+        logging.info(f"✅ [{passed_count + 1}/{MAX_TEST_LEADS or 'UNLIMITED'}] Ingesting Valid Lead: {parcel.get('owner_name')} - {parcel.get('address')}")
         dispatch_to_worker(parcel)
         passed_count += 1
         time.sleep(0.5)

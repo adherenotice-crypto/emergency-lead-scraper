@@ -81,8 +81,48 @@ def validate_lead_record(record):
 
 
 # =====================================================================
-# 3. APIFY ASYNC SKIP-TRACING ENGINE (Zero 502 Bad Gateway Errors)
+# 3. APIFY ASYNC SKIP-TRACING ENGINE (WITH NORMALIZED URL & DATA MATCHING)
 # =====================================================================
+def clean_url_key(url_str):
+    if not url_str:
+        return ""
+    return re.sub(r"^https?://(www\.)?", "", str(url_str)).rstrip("/").lower()
+
+
+def extract_phone_from_record(record):
+    # Direct field checks
+    candidate_keys = ["Phone-1", "primaryPhone", "phone", "mobilePhone", "Phone", "telephone"]
+    for k in candidate_keys:
+        val = record.get(k)
+        if val:
+            clean_p = re.sub(r"\D", "", str(val))
+            if len(clean_p) == 10:
+                return f"+1{clean_p}"
+            elif len(clean_p) == 11 and clean_p.startswith("1"):
+                return f"+{clean_p}"
+
+    # Nested array/dict checks
+    phones_obj = record.get("phones") or record.get("phoneNumbers") or record.get("allPhones")
+    if phones_obj and isinstance(phones_obj, list):
+        for item in phones_obj:
+            p_val = item.get("number") if isinstance(item, dict) else str(item)
+            clean_p = re.sub(r"\D", "", str(p_val))
+            if len(clean_p) == 10:
+                return f"+1{clean_p}"
+            elif len(clean_p) == 11 and clean_p.startswith("1"):
+                return f"+{clean_p}"
+
+    # Fallback Regex Search over raw JSON string of record
+    raw_str = json.dumps(record)
+    matches = re.findall(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}", raw_str)
+    for m in matches:
+        clean_p = re.sub(r"\D", "", m)
+        if len(clean_p) == 10 and not clean_p.startswith(("800", "888", "877", "866", "900", "000")):
+            return f"+1{clean_p}"
+
+    return None
+
+
 def apify_bulk_skip_trace(lead_batch):
     if not APIFY_TOKEN:
         logging.warning("⚠️ APIFY_TOKEN secret not found in environment. Skipping Apify unmasking.")
@@ -91,12 +131,13 @@ def apify_bulk_skip_trace(lead_batch):
     logging.info(f"⚡ [APIFY ASYNC ENGINE] Submitting {len(lead_batch)} lead(s) for cloud unmasking...")
 
     results_map = {}
-    CHUNK_SIZE = 25  # Async execution easily handles 25 leads per batch
+    CHUNK_SIZE = 25
 
     for i in range(0, len(lead_batch), CHUNK_SIZE):
         chunk = lead_batch[i:i + CHUNK_SIZE]
         start_urls = []
         lookup_map = {}
+        fallback_name_map = {}
 
         for item in chunk:
             raw_name = item.get("owner_name", "")
@@ -125,13 +166,15 @@ def apify_bulk_skip_trace(lead_batch):
 
             if clean_fn and clean_ln:
                 target_url = f"https://www.fastpeoplesearch.com/name/{clean_fn}-{clean_ln}_{clean_city}-{clean_state}"
+                norm_key = clean_url_key(target_url)
+                
                 start_urls.append({"url": target_url})
-                lookup_map[target_url] = item.get("record_id")
+                lookup_map[norm_key] = item.get("record_id")
+                fallback_name_map[f"{clean_fn}_{clean_ln}"] = item.get("record_id")
 
         if not start_urls:
             continue
 
-        # 1. Start Async Actor Run
         start_endpoint = f"https://api.apify.com/v2/acts/memo23~fastpeoplesearch-scraper/runs?token={APIFY_TOKEN}"
         payload = {"startUrls": start_urls, "maxItems": len(start_urls)}
 
@@ -147,9 +190,8 @@ def apify_bulk_skip_trace(lead_batch):
 
             logging.info(f"⏳ Apify Run [{run_id}] started. Polling status...")
 
-            # 2. Poll until Succeeded
             status_endpoint = f"https://api.apify.com/v2/actor-runs/{run_id}?token={APIFY_TOKEN}"
-            for _ in range(30):
+            for _ in range(36):
                 time.sleep(5)
                 poll_res = requests.get(status_endpoint, timeout=15)
                 if poll_res.status_code == 200:
@@ -160,30 +202,38 @@ def apify_bulk_skip_trace(lead_batch):
                         logging.error(f"❌ Apify Run [{run_id}] failed with status: {status}")
                         break
 
-            # 3. Fetch Dataset Items
             dataset_endpoint = f"https://api.apify.com/v2/datasets/{dataset_id}/items?token={APIFY_TOKEN}"
             items_res = requests.get(dataset_endpoint, timeout=30)
             if items_res.status_code == 200:
                 extracted_data = items_res.json()
                 for record in extracted_data:
-                    page_url = record.get("url") or record.get("loadedUrl")
-                    phone = record.get("Phone-1") or record.get("primaryPhone") or record.get("phone")
-                    
-                    if not phone and record.get("phones"):
-                        phone_objs = record.get("phones", [])
-                        if phone_objs and isinstance(phone_objs, list):
-                            phone = phone_objs[0].get("number") if isinstance(phone_objs[0], dict) else str(phone_objs[0])
+                    phone = extract_phone_from_record(record)
+                    if not phone:
+                        continue
 
-                    if phone:
-                        clean_p = re.sub(r"\D", "", str(phone))
-                        if len(clean_p) == 10:
-                            clean_p = f"+1{clean_p}"
-                        elif len(clean_p) == 11 and clean_p.startswith("1"):
-                            clean_p = f"+{clean_p}"
-                        
-                        citation_id = lookup_map.get(page_url)
-                        if citation_id:
-                            results_map[citation_id] = clean_p
+                    citation_id = None
+                    possible_urls = [
+                        record.get("url"),
+                        record.get("loadedUrl"),
+                        record.get("inputUrl"),
+                        record.get("searchUrl")
+                    ]
+
+                    for u in possible_urls:
+                        if u:
+                            norm_u = clean_url_key(u)
+                            if norm_u in lookup_map:
+                                citation_id = lookup_map[norm_u]
+                                break
+
+                    # Fallback to name matching if URL matching missed due to redirect
+                    if not citation_id:
+                        rec_fn = re.sub(r"[^\w]", "", str(record.get("firstName") or "")).lower()
+                        rec_ln = re.sub(r"[^\w]", "", str(record.get("lastName") or "")).lower()
+                        citation_id = fallback_name_map.get(f"{rec_fn}_{rec_ln}")
+
+                    if citation_id:
+                        results_map[citation_id] = phone
             else:
                 logging.error(f"❌ Apify Dataset Fetch Error [{items_res.status_code}]")
         except Exception as e:

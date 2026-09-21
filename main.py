@@ -7,7 +7,6 @@ import csv
 import pandas as pd
 import pdfplumber
 import logging
-from bs4 import BeautifulSoup
 
 # Set up clean logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -469,14 +468,12 @@ def fetch_propwire_leads():
     try:
         res = requests.get(scraper_url, params=params, timeout=60)
         if res.status_code == 200:
-            soup = BeautifulSoup(res.text, "html.parser")
             found_records = []
+            script_contents = re.findall(r'<script[^>]*>(.*?)</script>', res.text, re.DOTALL | re.IGNORECASE)
             
-            # Extract dynamically rendered JSON or DOM rows if available
-            script_tags = soup.find_all("script")
-            for tag in script_tags:
-                if tag.string and "props" in tag.string and "lead" in tag.string:
-                    matches = re.findall(r'\{"apn":"(.*?)","address":"(.*?)","owner":"(.*?)"\}', tag.string)
+            for script_text in script_contents:
+                if "props" in script_text and "lead" in script_text:
+                    matches = re.findall(r'\{"apn":"(.*?)","address":"(.*?)","owner":"(.*?)"\}', script_text)
                     for apn, addr, owner in matches:
                         found_records.append(normalize_lead_dict({
                             "apn": apn,
@@ -493,7 +490,6 @@ def fetch_propwire_leads():
     except Exception as err:
         logging.error(f"⚠️ Propwire Scraper Exception: {err}")
 
-    # Return empty list on failure so live county results aren't overwritten with static test leads
     return []
 
 

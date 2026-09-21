@@ -19,7 +19,7 @@ MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY") or "EmergencyAudit_Master_Key_2
 APIFY_TOKEN = os.getenv("APIFY_TOKEN")
 
 # PRODUCTION LEAD CAP (Set to None for unlimited production volume)
-MAX_TEST_LEADS = None 
+MAX_TEST_LEADS = None
 
 # SYSTEM CONTROLS & SAFETY FLAGS
 PAUSE_PIPELINE = (os.getenv("PAUSE_PIPELINE") or "false").lower() == "true"
@@ -32,7 +32,7 @@ REQUIRE_VERIFIED_PHONE_ONLY = (os.getenv("REQUIRE_VERIFIED_PHONE_ONLY") or "fals
 # 2. ENTITY DETECTOR & DEDUP IDENTIFIER GENERATOR
 # =====================================================================
 ENTITY_KEYWORDS = [
-    "LLC", "INC", "CORP", "CORPORATION", "HOLDINGS", "PROPERTIES", 
+    "LLC", "INC", "CORP", "CORPORATION", "HOLDINGS", "PROPERTIES",
     "INVESTMENTS", "LTD", "LP", "GROUP", "PARTNERS", "REALTY", "COMPANY", "CO"
 ]
 
@@ -81,91 +81,94 @@ def validate_lead_record(record):
 
 
 # =====================================================================
-# 3. APIFY BULK SKIP-TRACING ENGINE (Bypasses Cloudflare Anti-Bot)
+# 3. APIFY CHUNKED SKIP-TRACING ENGINE (Prevents 400 Timeout Errors)
 # =====================================================================
 def apify_bulk_skip_trace(lead_batch):
     if not APIFY_TOKEN:
         logging.warning("⚠️ APIFY_TOKEN secret not found in environment. Skipping Apify unmasking.")
         return {}
 
-    logging.info(f"⚡ [APIFY ENGINE] Submitting batch of {len(lead_batch)} lead(s) for automated unmasking...")
-
-    apify_searches = []
-    lookup_map = {}
-
-    for item in lead_batch:
-        raw_name = item.get("owner_name", "")
-        owner_type = classify_owner_type(raw_name)
-
-        if owner_type == "TRUST":
-            target_name = re.sub(r"\b(TRUST|TRUSTEE|TTEE|FAMILY|REVOCABLE|LIVING|DATED|\d+)\b", "", raw_name, flags=re.I).strip()
-        else:
-            target_name = raw_name
-
-        name_parts = target_name.strip().split()
-        if len(name_parts) >= 2:
-            first_name = name_parts[0]
-            last_name = " ".join(name_parts[1:])
-        else:
-            first_name = target_name
-            last_name = ""
-
-        city = item.get("city", "Los Angeles")
-        state = item.get("state", "CA")
-
-        match_key = f"{first_name.upper()}_{last_name.upper()}_{city.upper()}"
-        lookup_map[match_key] = item.get("record_id")
-
-        apify_searches.append({
-            "firstName": first_name,
-            "lastName": last_name,
-            "city": city,
-            "state": state
-        })
-
-    actor_endpoint = f"https://api.apify.com/v2/acts/memo23~fastpeoplesearch-scraper/run-sync-get-dataset-items?token={APIFY_TOKEN}"
-    
-    payload = {
-        "searches": apify_searches,
-        "maxItemsPerSearch": 1,
-        "flattenedOutput": True
-    }
+    logging.info(f"⚡ [APIFY ENGINE] Submitting batch of {len(lead_batch)} lead(s) for chunked unmasking...")
 
     results_map = {}
-    try:
-        res = requests.post(actor_endpoint, json=payload, timeout=300)
-        if res.status_code in [200, 201]:
-            extracted_data = res.json()
-            for record in extracted_data:
-                fn = (record.get("firstName") or record.get("search_firstName") or "").upper()
-                ln = (record.get("lastName") or record.get("search_lastName") or "").upper()
-                ct = (record.get("city") or record.get("search_city") or "").upper()
-                match_key = f"{fn}_{ln}_{ct}"
+    CHUNK_SIZE = 15  # Process 15 leads per synchronous payload to prevent Apify memory/timeout errors
 
-                # Extract phone number from Apify output
-                phone = record.get("Phone-1") or record.get("primaryPhone") or record.get("phone")
-                if not phone and record.get("phones"):
-                    phone_objs = record.get("phones", [])
-                    if phone_objs and isinstance(phone_objs, list):
-                        phone = phone_objs[0].get("number") if isinstance(phone_objs[0], dict) else str(phone_objs[0])
+    for i in range(0, len(lead_batch), CHUNK_SIZE):
+        chunk = lead_batch[i:i + CHUNK_SIZE]
+        apify_searches = []
+        lookup_map = {}
 
-                if phone:
-                    clean_p = re.sub(r"\D", "", str(phone))
-                    if len(clean_p) == 10:
-                        clean_p = f"+1{clean_p}"
-                    elif len(clean_p) == 11 and clean_p.startswith("1"):
-                        clean_p = f"+{clean_p}"
-                    
-                    citation_id = lookup_map.get(match_key)
-                    if citation_id:
-                        results_map[citation_id] = clean_p
+        for item in chunk:
+            raw_name = item.get("owner_name", "")
+            owner_type = classify_owner_type(raw_name)
+
+            if owner_type == "TRUST":
+                target_name = re.sub(r"\b(TRUST|TRUSTEE|TTEE|FAMILY|REVOCABLE|LIVING|DATED|\d+)\b", "", raw_name, flags=re.I).strip()
+            else:
+                target_name = raw_name
+
+            name_parts = target_name.strip().split()
+            if len(name_parts) >= 2:
+                first_name = name_parts[0]
+                last_name = " ".join(name_parts[1:])
+            else:
+                first_name = target_name
+                last_name = ""
+
+            city = item.get("city", "Los Angeles")
+            state = item.get("state", "CA")
+
+            match_key = f"{first_name.upper()}_{last_name.upper()}_{city.upper()}"
+            lookup_map[match_key] = item.get("record_id")
+
+            apify_searches.append({
+                "firstName": first_name,
+                "lastName": last_name,
+                "city": city,
+                "state": state
+            })
+
+        actor_endpoint = f"https://api.apify.com/v2/acts/memo23~fastpeoplesearch-scraper/run-sync-get-dataset-items?token={APIFY_TOKEN}"
+        payload = {
+            "searches": apify_searches,
+            "maxItemsPerSearch": 1,
+            "flattenedOutput": True
+        }
+
+        try:
+            res = requests.post(actor_endpoint, json=payload, timeout=120)
+            if res.status_code in [200, 201]:
+                extracted_data = res.json()
+                for record in extracted_data:
+                    fn = (record.get("firstName") or record.get("search_firstName") or "").upper()
+                    ln = (record.get("lastName") or record.get("search_lastName") or "").upper()
+                    ct = (record.get("city") or record.get("search_city") or "").upper()
+                    match_key = f"{fn}_{ln}_{ct}"
+
+                    phone = record.get("Phone-1") or record.get("primaryPhone") or record.get("phone")
+                    if not phone and record.get("phones"):
+                        phone_objs = record.get("phones", [])
+                        if phone_objs and isinstance(phone_objs, list):
+                            phone = phone_objs[0].get("number") if isinstance(phone_objs[0], dict) else str(phone_objs[0])
+
+                    if phone:
+                        clean_p = re.sub(r"\D", "", str(phone))
+                        if len(clean_p) == 10:
+                            clean_p = f"+1{clean_p}"
+                        elif len(clean_p) == 11 and clean_p.startswith("1"):
+                            clean_p = f"+{clean_p}"
                         
-            logging.info(f"✅ [APIFY ENGINE] Successfully unmasked {len(results_map)} live phone number(s)!")
-        else:
-            logging.error(f"❌ Apify Actor Error [{res.status_code}]: {res.text}")
-    except Exception as e:
-        logging.error(f"⚠️ Apify Execution Exception: {e}")
+                        citation_id = lookup_map.get(match_key)
+                        if citation_id:
+                            results_map[citation_id] = clean_p
+            else:
+                logging.error(f"❌ Apify Chunk Error [{res.status_code}]: {res.text}")
+        except Exception as e:
+            logging.error(f"⚠️ Apify Chunk Exception: {e}")
 
+        time.sleep(1)
+
+    logging.info(f"✅ [APIFY ENGINE] Successfully unmasked {len(results_map)} live phone number(s) across chunks!")
     return results_map
 
 
@@ -180,13 +183,13 @@ def normalize_lead_dict(raw_dict):
             norm[clean_k] = str(v).strip()
 
     apn_val = (
-        norm.get("apn") or norm.get("parcelid") or norm.get("pin") 
+        norm.get("apn") or norm.get("parcelid") or norm.get("pin")
         or norm.get("parcel") or norm.get("parcelnumber") or "PENDING VERIFICATION"
     )
 
     addr_val = (
-        norm.get("address") or norm.get("propertyaddress") or norm.get("siteaddress") 
-        or norm.get("location") or norm.get("streetaddress") or norm.get("propaddress") 
+        norm.get("address") or norm.get("propertyaddress") or norm.get("siteaddress")
+        or norm.get("location") or norm.get("streetaddress") or norm.get("propaddress")
         or "Recorded Parcel Location"
     )
 
@@ -387,7 +390,7 @@ if __name__ == "__main__":
         prepared_records.append(parcel)
         passed_count += 1
 
-    # Execute Apify Bulk Unmasking for leads missing phone numbers
+    # Execute Apify Bulk Unmasking in chunks
     unmasked_phones = {}
     if needs_unmask_batch:
         unmasked_phones = apify_bulk_skip_trace(needs_unmask_batch)
@@ -417,7 +420,7 @@ if __name__ == "__main__":
             "status": "PENDING_REVIEW" if STAGING_MODE else "READY_FOR_DISPATCH"
         })
 
-    # Dispatch Single Bulk Request to Cloudflare Worker (Conserves Daily KV Write Limits)
+    # Dispatch Single Bulk Request to Cloudflare Worker
     if dispatch_queue:
         logging.info(f"\n🚀 Dispatching {len(dispatch_queue)} unmasked record(s) to Cloudflare KV...")
         endpoint = f"{WORKER_URL.rstrip('/')}/api/inbound-lead-hook"

@@ -102,37 +102,51 @@ def validate_lead_record(record):
 
 
 # =====================================================================
-# 3. $0 NATIVE PLAYWRIGHT UNMASKING ENGINE (Runs inside GitHub Runner)
+# 3. $0 NATIVE PLAYWRIGHT UNMASKING ENGINE (With Anti-Detection Evasions)
 # =====================================================================
 def free_playwright_phone_lookup(browser_context, name, address, city="Los Angeles", state="CA"):
-    try:
-        clean_name = re.sub(r"[^\w\s]", "", name).strip().replace(" ", "-").lower()
-        clean_city = city.strip().replace(" ", "-").lower()
-        clean_state = state.strip().lower()
-        
-        target_url = f"https://www.fastpeoplesearch.com/name/{clean_name}_{clean_city}-{clean_state}"
+    clean_name = re.sub(r"[^\w\s]", "", name).strip().replace(" ", "-").lower()
+    clean_city = city.strip().replace(" ", "-").lower()
+    clean_state = state.strip().lower()
 
-        page = browser_context.new_page()
-        page.goto(target_url, timeout=15000, wait_until="domcontentloaded")
-        page.wait_for_timeout(1000)
+    # Target 1: FastPeopleSearch | Target 2: TruePeopleSearch
+    fps_url = f"https://www.fastpeoplesearch.com/name/{clean_name}_{clean_city}-{clean_state}"
+    tps_url = f"https://www.truepeoplesearch.com/results?name={clean_name.replace('-', '%20')}&citystatezip={clean_city}%2C%20{clean_state}"
 
-        html = page.content()
-        page.close()
+    for target_url in [fps_url, tps_url]:
+        try:
+            page = browser_context.new_page()
+            
+            # Mask Playwright automation flags
+            page.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            """)
 
-        tel_matches = re.findall(r'href=["\']tel:([^"\']+)["\']', html, re.IGNORECASE)
-        raw_phones = tel_matches if tel_matches else re.findall(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}", html)
+            page.goto(target_url, timeout=18000, wait_until="domcontentloaded")
+            page.wait_for_timeout(1500)
 
-        valid_phones = []
-        for p in raw_phones:
-            clean_p = re.sub(r"\D", "", p)
-            if len(clean_p) == 10 and not clean_p.startswith(("800", "888", "877", "866", "202", "900", "000")):
-                valid_phones.append(clean_p)
+            html = page.content()
+            page.close()
 
-        if valid_phones:
-            return f"+1{valid_phones[0]}"
+            # Extraction Priority: tel: anchor links -> phone regex pattern
+            tel_matches = re.findall(r'href=["\']tel:([^"\']+)["\']', html, re.IGNORECASE)
+            raw_phones = tel_matches if tel_matches else re.findall(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}", html)
 
-    except Exception as e:
-        logging.error(f"[Playwright Unmask Exception] {e}")
+            valid_phones = []
+            for p in raw_phones:
+                clean_p = re.sub(r"\D", "", p)
+                if len(clean_p) == 10 and not clean_p.startswith(("800", "888", "877", "866", "202", "900", "000")):
+                    valid_phones.append(clean_p)
+
+            if valid_phones:
+                return f"+1{valid_phones[0]}"
+
+        except Exception as e:
+            logging.error(f"[Playwright Unmask Exception] {e}")
+            try:
+                page.close()
+            except Exception:
+                pass
 
     return None
 
@@ -185,7 +199,7 @@ def dispatch_to_worker(parcel_record, browser_context=None):
     apn = parcel_record.get("apn", "PENDING VERIFICATION")
 
     existing_phone = parcel_record.get("phone")
-    if not existing_phone or existing_phone in ["PENDING UNMASK", "Unmasked Upon Purchase", "+14537422249"]:
+    if not existing_phone or existing_phone in ["PENDING UNMASK", "Unmasked Upon Purchase", "+14537422249", "+13333333333"]:
         if browser_context:
             trace_res = skip_trace_with_playwright(browser_context, owner, address, city, state, zip_code)
             phone = trace_res["phone"]
@@ -197,7 +211,8 @@ def dispatch_to_worker(parcel_record, browser_context=None):
         phone = existing_phone
         email = parcel_record.get("email", "N/A")
 
-    citation_id = parcel_record.get("record_id") or parcel_record.get("citation_id") or generateDeterministic_case_id(apn, address)
+    # Fixed syntax bug (generate_deterministic_case_id)
+    citation_id = parcel_record.get("record_id") or parcel_record.get("citation_id") or generate_deterministic_case_id(apn, address)
     amount = parcel_record.get("default_amount") or parcel_record.get("amount_logged") or "$35,420.00 Recorded"
     prop_type = parcel_record.get("property_type") or parcel_record.get("property_use") or "Single Family / Commercial"
 
@@ -434,11 +449,18 @@ if __name__ == "__main__":
     blocked_count = 0
     seen_identifiers = set()
 
-    # Spin up native Playwright browser instance once for the entire batch
+    # Spin up browser context with anti-bot headers
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            viewport={"width": 1920, "height": 1080},
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
+                "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+                "Sec-Ch-Ua-Mobile": "?0",
+                "Sec-Ch-Ua-Platform": '"Windows"'
+            }
         )
 
         for idx, parcel in enumerate(real_leads, 1):

@@ -81,21 +81,21 @@ def validate_lead_record(record):
 
 
 # =====================================================================
-# 3. APIFY CHUNKED SKIP-TRACING ENGINE (Prevents 400 Timeout Errors)
+# 3. APIFY DIRECT-URL CHUNKED SKIP-TRACING ENGINE (Bypasses Actor 400 Errors)
 # =====================================================================
 def apify_bulk_skip_trace(lead_batch):
     if not APIFY_TOKEN:
         logging.warning("⚠️ APIFY_TOKEN secret not found in environment. Skipping Apify unmasking.")
         return {}
 
-    logging.info(f"⚡ [APIFY ENGINE] Submitting batch of {len(lead_batch)} lead(s) for chunked unmasking...")
+    logging.info(f"⚡ [APIFY ENGINE] Submitting batch of {len(lead_batch)} lead(s) via Direct Search URLs...")
 
     results_map = {}
-    CHUNK_SIZE = 15  # Process 15 leads per synchronous payload to prevent Apify memory/timeout errors
+    CHUNK_SIZE = 10  # 10 URL chunks prevent memory overflow and actor timeouts
 
     for i in range(0, len(lead_batch), CHUNK_SIZE):
         chunk = lead_batch[i:i + CHUNK_SIZE]
-        apify_searches = []
+        start_urls = []
         lookup_map = {}
 
         for item in chunk:
@@ -118,34 +118,34 @@ def apify_bulk_skip_trace(lead_batch):
             city = item.get("city", "Los Angeles")
             state = item.get("state", "CA")
 
-            match_key = f"{first_name.upper()}_{last_name.upper()}_{city.upper()}"
-            lookup_map[match_key] = item.get("record_id")
+            # Clean URL path parameters for FastPeopleSearch
+            clean_fn = re.sub(r"[^\w]", "", first_name).lower()
+            clean_ln = re.sub(r"[^\w]", "", last_name).lower()
+            clean_city = re.sub(r"[^\w]", "-", city).lower()
+            clean_state = re.sub(r"[^\w]", "", state).lower()
 
-            apify_searches.append({
-                "firstName": first_name,
-                "lastName": last_name,
-                "city": city,
-                "state": state
-            })
+            if clean_fn and clean_ln:
+                target_url = f"https://www.fastpeoplesearch.com/name/{clean_fn}-{clean_ln}_{clean_city}-{clean_state}"
+                start_urls.append({"url": target_url})
+                lookup_map[target_url] = item.get("record_id")
+
+        if not start_urls:
+            continue
 
         actor_endpoint = f"https://api.apify.com/v2/acts/memo23~fastpeoplesearch-scraper/run-sync-get-dataset-items?token={APIFY_TOKEN}"
         payload = {
-            "searches": apify_searches,
-            "maxItemsPerSearch": 1,
-            "flattenedOutput": True
+            "startUrls": start_urls,
+            "maxItems": len(start_urls)
         }
 
         try:
-            res = requests.post(actor_endpoint, json=payload, timeout=120)
+            res = requests.post(actor_endpoint, json=payload, timeout=180)
             if res.status_code in [200, 201]:
                 extracted_data = res.json()
                 for record in extracted_data:
-                    fn = (record.get("firstName") or record.get("search_firstName") or "").upper()
-                    ln = (record.get("lastName") or record.get("search_lastName") or "").upper()
-                    ct = (record.get("city") or record.get("search_city") or "").upper()
-                    match_key = f"{fn}_{ln}_{ct}"
-
+                    page_url = record.get("url") or record.get("loadedUrl")
                     phone = record.get("Phone-1") or record.get("primaryPhone") or record.get("phone")
+                    
                     if not phone and record.get("phones"):
                         phone_objs = record.get("phones", [])
                         if phone_objs and isinstance(phone_objs, list):
@@ -158,7 +158,7 @@ def apify_bulk_skip_trace(lead_batch):
                         elif len(clean_p) == 11 and clean_p.startswith("1"):
                             clean_p = f"+{clean_p}"
                         
-                        citation_id = lookup_map.get(match_key)
+                        citation_id = lookup_map.get(page_url)
                         if citation_id:
                             results_map[citation_id] = clean_p
             else:
@@ -168,7 +168,7 @@ def apify_bulk_skip_trace(lead_batch):
 
         time.sleep(1)
 
-    logging.info(f"✅ [APIFY ENGINE] Successfully unmasked {len(results_map)} live phone number(s) across chunks!")
+    logging.info(f"✅ [APIFY ENGINE] Successfully unmasked {len(results_map)} live phone number(s)!")
     return results_map
 
 
@@ -390,7 +390,7 @@ if __name__ == "__main__":
         prepared_records.append(parcel)
         passed_count += 1
 
-    # Execute Apify Bulk Unmasking in chunks
+    # Execute Apify Direct-URL Skip Tracing
     unmasked_phones = {}
     if needs_unmask_batch:
         unmasked_phones = apify_bulk_skip_trace(needs_unmask_batch)
@@ -441,4 +441,4 @@ if __name__ == "__main__":
             except Exception as e:
                 logging.error(f"⚠️ Dispatch Exception: {e}")
 
-    logging.info(f"\n📊 Batch Execution Summary: {passed_count} Processed & Dispatched | {blocked_count} Blocked")
+    logging.info(f"\n📊 Batch Execution Summary: {passed_count} Processed & Dispatched | {blocked_count} Blocked") Processed & Dispatched | {blocked_count} Blocked")

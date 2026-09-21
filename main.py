@@ -102,14 +102,13 @@ def validate_lead_record(record):
 
 
 # =====================================================================
-# 3. $0 NATIVE PLAYWRIGHT UNMASKING ENGINE (With Anti-Detection Evasions)
+# 3. $0 NATIVE PLAYWRIGHT UNMASKING ENGINE (Runs in GitHub Actions)
 # =====================================================================
 def free_playwright_phone_lookup(browser_context, name, address, city="Los Angeles", state="CA"):
     clean_name = re.sub(r"[^\w\s]", "", name).strip().replace(" ", "-").lower()
     clean_city = city.strip().replace(" ", "-").lower()
     clean_state = state.strip().lower()
 
-    # Target 1: FastPeopleSearch | Target 2: TruePeopleSearch
     fps_url = f"https://www.fastpeoplesearch.com/name/{clean_name}_{clean_city}-{clean_state}"
     tps_url = f"https://www.truepeoplesearch.com/results?name={clean_name.replace('-', '%20')}&citystatezip={clean_city}%2C%20{clean_state}"
 
@@ -117,7 +116,7 @@ def free_playwright_phone_lookup(browser_context, name, address, city="Los Angel
         try:
             page = browser_context.new_page()
             
-            # Mask Playwright automation flags
+            # Mask Playwright automation signatures
             page.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
             """)
@@ -128,7 +127,6 @@ def free_playwright_phone_lookup(browser_context, name, address, city="Los Angel
             html = page.content()
             page.close()
 
-            # Extraction Priority: tel: anchor links -> phone regex pattern
             tel_matches = re.findall(r'href=["\']tel:([^"\']+)["\']', html, re.IGNORECASE)
             raw_phones = tel_matches if tel_matches else re.findall(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}", html)
 
@@ -184,84 +182,7 @@ def skip_trace_with_playwright(browser_context, human_name, address, city="Los A
 
 
 # =====================================================================
-# 4. WORKER DISPATCH ENGINE
-# =====================================================================
-def dispatch_to_worker(parcel_record, browser_context=None):
-    if PAUSE_PIPELINE:
-        logging.info("⏸️ Pipeline paused. Skipping dispatch.")
-        return False
-
-    owner = parcel_record.get("owner_name", "RECORDED PROPERTY OWNER / INTERESTED PARTY")
-    address = parcel_record.get("address", "Recorded Parcel Location")
-    city = parcel_record.get("city", "Los Angeles")
-    state = parcel_record.get("state", "CA")
-    zip_code = parcel_record.get("zip", "90012")
-    apn = parcel_record.get("apn", "PENDING VERIFICATION")
-
-    existing_phone = parcel_record.get("phone")
-    if not existing_phone or existing_phone in ["PENDING UNMASK", "Unmasked Upon Purchase", "+14537422249", "+13333333333"]:
-        if browser_context:
-            trace_res = skip_trace_with_playwright(browser_context, owner, address, city, state, zip_code)
-            phone = trace_res["phone"]
-            email = trace_res["email"]
-        else:
-            phone = "PENDING UNMASK"
-            email = "N/A"
-    else:
-        phone = existing_phone
-        email = parcel_record.get("email", "N/A")
-
-    # Fixed syntax bug (generate_deterministic_case_id)
-    citation_id = parcel_record.get("record_id") or parcel_record.get("citation_id") or generate_deterministic_case_id(apn, address)
-    amount = parcel_record.get("default_amount") or parcel_record.get("amount_logged") or "$35,420.00 Recorded"
-    prop_type = parcel_record.get("property_type") or parcel_record.get("property_use") or "Single Family / Commercial"
-
-    payload = {
-        "record_id": citation_id,
-        "citation_id": citation_id,
-        "caseId": citation_id,
-        "address": address,
-        "owner_name": owner,
-        "phone": phone,
-        "email": email,
-        "apn": apn,
-        "category": parcel_record.get("category", "PRE-FORECLOSURE / REINSTATEMENT"),
-        "default_amount": amount,
-        "amount_logged": amount,
-        "property_type": prop_type,
-        "property_use": prop_type,
-        "violation": parcel_record.get("violation", "A statutory Notice of Default (NOD) has been logged in LA County public records."),
-        "year_built": parcel_record.get("year_built", "N/A"),
-        "sqft": parcel_record.get("sqft", "N/A"),
-        "zoning": parcel_record.get("zoning", "N/A"),
-        "status": "PENDING_REVIEW" if STAGING_MODE else "READY_FOR_DISPATCH"
-    }
-
-    if DRY_RUN:
-        logging.info(f"🧪 [DRY RUN] Would post record to Worker:\n{json.dumps(payload, indent=2)}")
-        return True
-
-    endpoint = f"{WORKER_URL.rstrip('/')}/api/inbound-lead-hook"
-    headers = {
-        "Content-Type": "application/json",
-        "X-Emergency-Key": MASTER_ADMIN_KEY
-    }
-
-    try:
-        res = requests.post(endpoint, data=json.dumps([payload]), headers=headers, timeout=15)
-        if res.status_code == 200:
-            logging.info(f"✅ Dispatched [{citation_id}] -> Phone: {phone} (Status: {payload['status']})")
-            return True
-        else:
-            logging.error(f"❌ Worker Error [{res.status_code}]: {res.text}")
-            return False
-    except Exception as e:
-        logging.error(f"⚠️ Dispatch Exception: {e}")
-        return False
-
-
-# =====================================================================
-# 5. DATA INGESTION & FILE PARSING ENGINE
+# 4. DATA INGESTION & FILE PARSING ENGINE
 # =====================================================================
 def normalize_lead_dict(raw_dict):
     norm = {}
@@ -433,7 +354,7 @@ def get_staging_fallback_leads():
 
 
 # =====================================================================
-# 7. MAIN EXECUTION LOOP WITH DEDUPLICATION
+# 5. MAIN EXECUTION LOOP (BULK DISPATCH)
 # =====================================================================
 if __name__ == "__main__":
     logging.info(f"🚀 Universal Ingress Engine Active. Pipeline in PRODUCTION MODE.")
@@ -443,13 +364,13 @@ if __name__ == "__main__":
         logging.warning("⚠️ No live datasets retrieved. Activating Staging Fallback.")
         real_leads = get_staging_fallback_leads()
 
-    logging.info(f"\n📥 Total Aggregated Feed: {len(real_leads)} record(s). Launching Playwright Unmasking Engine...\n")
+    logging.info(f"\n📥 Total Aggregated Feed: {len(real_leads)} record(s). Unmasking & Queueing Bulk Dispatch...\n")
     
     passed_count = 0
     blocked_count = 0
     seen_identifiers = set()
+    dispatch_queue = []
 
-    # Spin up browser context with anti-bot headers
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
@@ -483,10 +404,62 @@ if __name__ == "__main__":
                 blocked_count += 1
                 continue
 
-            logging.info(f"✅ [{passed_count + 1}/{MAX_TEST_LEADS or 'UNLIMITED'}] Processing Lead: {parcel.get('owner_name')} - {parcel.get('address')}")
-            dispatch_to_worker(parcel, browser_context=context)
+            owner = parcel.get("owner_name", "RECORDED OWNER")
+            city = parcel.get("city", "Los Angeles")
+            state = parcel.get("state", "CA")
+            zip_code = parcel.get("zip", "90012")
+
+            existing_phone = parcel.get("phone")
+            if not existing_phone or existing_phone in ["PENDING UNMASK", "Unmasked Upon Purchase", "+14537422249", "+13333333333"]:
+                trace_res = skip_trace_with_playwright(context, owner, addr, city, state, zip_code)
+                phone = trace_res["phone"]
+                email = trace_res["email"]
+            else:
+                phone = existing_phone
+                email = parcel.get("email", "N/A")
+
+            citation_id = parcel.get("record_id") or parcel.get("citation_id") or generate_deterministic_case_id(apn, addr)
+
+            dispatch_queue.append({
+                "record_id": citation_id,
+                "citation_id": citation_id,
+                "caseId": citation_id,
+                "address": addr,
+                "owner_name": owner,
+                "phone": phone,
+                "email": email,
+                "apn": apn,
+                "category": parcel.get("category", "PRE-FORECLOSURE / REINSTATEMENT"),
+                "default_amount": parcel.get("default_amount") or "$35,420.00 Recorded",
+                "property_type": parcel.get("property_type") or "Single Family / Commercial",
+                "violation": parcel.get("violation") or "A statutory Notice of Default (NOD) has been logged in LA County public records.",
+                "status": "PENDING_REVIEW" if STAGING_MODE else "READY_FOR_DISPATCH"
+            })
+
             passed_count += 1
+            logging.info(f"📦 [{passed_count}/{len(real_leads)}] Queued Lead: {owner} -> Phone: {phone}")
 
         browser.close()
 
-    logging.info(f"\n📊 Batch Execution Summary: {passed_count} Dispatched to KV | {blocked_count} Blocked")
+    # BULK DISPATCH: 1 Single HTTP POST Request to Cloudflare (1 KV Write Total)
+    if dispatch_queue:
+        logging.info(f"\n🚀 Sending 1 single bulk payload with {len(dispatch_queue)} record(s) to Worker...")
+        endpoint = f"{WORKER_URL.rstrip('/')}/api/inbound-lead-hook"
+        headers = {
+            "Content-Type": "application/json",
+            "X-Emergency-Key": MASTER_ADMIN_KEY
+        }
+
+        if DRY_RUN:
+            logging.info(f"🧪 [DRY RUN] Would post bulk payload to Worker:\n{json.dumps(dispatch_queue[:2], indent=2)}")
+        else:
+            try:
+                res = requests.post(endpoint, data=json.dumps(dispatch_queue), headers=headers, timeout=30)
+                if res.status_code == 200:
+                    logging.info(f"✅ Bulk Dispatch Successful! All {len(dispatch_queue)} records stored in KV.")
+                else:
+                    logging.error(f"❌ Worker Error [{res.status_code}]: {res.text}")
+            except Exception as e:
+                logging.error(f"⚠️ Dispatch Exception: {e}")
+
+    logging.info(f"\n📊 Batch Execution Summary: {passed_count} Processed & Dispatched | {blocked_count} Blocked")

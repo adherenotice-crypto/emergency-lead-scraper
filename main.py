@@ -81,17 +81,17 @@ def validate_lead_record(record):
 
 
 # =====================================================================
-# 3. APIFY DIRECT-URL CHUNKED SKIP-TRACING ENGINE
+# 3. APIFY ASYNC SKIP-TRACING ENGINE (Zero 502 Bad Gateway Errors)
 # =====================================================================
 def apify_bulk_skip_trace(lead_batch):
     if not APIFY_TOKEN:
         logging.warning("⚠️ APIFY_TOKEN secret not found in environment. Skipping Apify unmasking.")
         return {}
 
-    logging.info(f"⚡ [APIFY ENGINE] Submitting batch of {len(lead_batch)} lead(s) via Direct Search URLs...")
+    logging.info(f"⚡ [APIFY ASYNC ENGINE] Submitting {len(lead_batch)} lead(s) for cloud unmasking...")
 
     results_map = {}
-    CHUNK_SIZE = 10  # 10 URL chunks prevent memory overflow and actor timeouts
+    CHUNK_SIZE = 25  # Async execution easily handles 25 leads per batch
 
     for i in range(0, len(lead_batch), CHUNK_SIZE):
         chunk = lead_batch[i:i + CHUNK_SIZE]
@@ -118,7 +118,6 @@ def apify_bulk_skip_trace(lead_batch):
             city = item.get("city", "Los Angeles")
             state = item.get("state", "CA")
 
-            # Clean URL path parameters for FastPeopleSearch
             clean_fn = re.sub(r"[^\w]", "", first_name).lower()
             clean_ln = re.sub(r"[^\w]", "", last_name).lower()
             clean_city = re.sub(r"[^\w]", "-", city).lower()
@@ -132,16 +131,40 @@ def apify_bulk_skip_trace(lead_batch):
         if not start_urls:
             continue
 
-        actor_endpoint = f"https://api.apify.com/v2/acts/memo23~fastpeoplesearch-scraper/run-sync-get-dataset-items?token={APIFY_TOKEN}"
-        payload = {
-            "startUrls": start_urls,
-            "maxItems": len(start_urls)
-        }
+        # 1. Start Async Actor Run
+        start_endpoint = f"https://api.apify.com/v2/acts/memo23~fastpeoplesearch-scraper/runs?token={APIFY_TOKEN}"
+        payload = {"startUrls": start_urls, "maxItems": len(start_urls)}
 
         try:
-            res = requests.post(actor_endpoint, json=payload, timeout=180)
-            if res.status_code in [200, 201]:
-                extracted_data = res.json()
+            run_res = requests.post(start_endpoint, json=payload, timeout=30)
+            if run_res.status_code not in [200, 201]:
+                logging.error(f"❌ Apify Start Run Error [{run_res.status_code}]: {run_res.text}")
+                continue
+
+            run_data = run_res.json().get("data", {})
+            run_id = run_data.get("id")
+            dataset_id = run_data.get("defaultDatasetId")
+
+            logging.info(f"⏳ Apify Run [{run_id}] started. Polling status...")
+
+            # 2. Poll until Succeeded
+            status_endpoint = f"https://api.apify.com/v2/actor-runs/{run_id}?token={APIFY_TOKEN}"
+            for _ in range(30):
+                time.sleep(5)
+                poll_res = requests.get(status_endpoint, timeout=15)
+                if poll_res.status_code == 200:
+                    status = poll_res.json().get("data", {}).get("status")
+                    if status == "SUCCEEDED":
+                        break
+                    elif status in ["FAILED", "ABORTED", "TIMED-OUT"]:
+                        logging.error(f"❌ Apify Run [{run_id}] failed with status: {status}")
+                        break
+
+            # 3. Fetch Dataset Items
+            dataset_endpoint = f"https://api.apify.com/v2/datasets/{dataset_id}/items?token={APIFY_TOKEN}"
+            items_res = requests.get(dataset_endpoint, timeout=30)
+            if items_res.status_code == 200:
+                extracted_data = items_res.json()
                 for record in extracted_data:
                     page_url = record.get("url") or record.get("loadedUrl")
                     phone = record.get("Phone-1") or record.get("primaryPhone") or record.get("phone")
@@ -162,11 +185,9 @@ def apify_bulk_skip_trace(lead_batch):
                         if citation_id:
                             results_map[citation_id] = clean_p
             else:
-                logging.error(f"❌ Apify Chunk Error [{res.status_code}]: {res.text}")
+                logging.error(f"❌ Apify Dataset Fetch Error [{items_res.status_code}]")
         except Exception as e:
-            logging.error(f"⚠️ Apify Chunk Exception: {e}")
-
-        time.sleep(1)
+            logging.error(f"⚠️ Apify Async Execution Exception: {e}")
 
     logging.info(f"✅ [APIFY ENGINE] Successfully unmasked {len(results_map)} live phone number(s)!")
     return results_map
@@ -390,7 +411,7 @@ if __name__ == "__main__":
         prepared_records.append(parcel)
         passed_count += 1
 
-    # Execute Apify Direct-URL Skip Tracing
+    # Execute Apify Async Skip Tracing
     unmasked_phones = {}
     if needs_unmask_batch:
         unmasked_phones = apify_bulk_skip_trace(needs_unmask_batch)

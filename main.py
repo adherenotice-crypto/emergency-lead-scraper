@@ -22,15 +22,12 @@ MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY") or "EmergencyAudit_Master_Key_2
 # PRODUCTION LEAD CAP (Set to None for unlimited production volume)
 MAX_TEST_LEADS = None 
 
-# SCRAPERAPI PROXY CONFIGURATION ($0 Free Unmask Engine)
-SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY") or "38c60fbbae81a8c17897a5b68da2e04c"
-
 # TARGET PROPWIRE LIVE STREAM URL
 TARGET_PROPWIRE_URL = os.getenv(
     "TARGET_PROPWIRE_URL"
 ) or "https://propwire.com/search?filters=%7B%22lead_type%22%3A%5B%22preforeclosure%22%5D%2C%22property_type%22%3A%5B%22commercial%22%2C%22mfh_5_plus%22%2C%22mfh_2_to_4%22%2C%22condo%22%2C%22sfr%22%5D%2C%22owner_type%22%3A%5B%22individual%22%2C%22company%22%5D%2C%22estimated_equity_percent%22%3A%7B%22min%22%3A30%2C%22max%22%3A100%7D%2C%22preforeclosure%22%3Atrue%2C%22notice_type%22%3A%22NOD%22%2C%22notice_date%22%3A%7B%22min%22%3A%222026-06-01%22%7D%2C%22locations%22%3A%5B%7B%22searchType%22%3A%22N%22%2C%22county%22%3A%22Los%20Angeles%22%2C%22state%22%3A%22CA%22%2C%22title%22%3A%22Los%20Angeles%2C%20CA%22%7D%5D%7D&location=Los%20Angeles%20County%2C%20CA"
 
-# TRACERFY DISABLED (Forced False to save credits)
+# TRACERFY DISABLED
 TRACERFY_API_KEY = ""
 TRACERFY_URL = "https://tracerfy.com/v1/api/trace/lookup/"
 ENABLE_TRACERFY = False
@@ -105,9 +102,9 @@ def validate_lead_record(record):
 
 
 # =====================================================================
-# 3. $0 FREE PUBLIC PHONE UNMASKING ENGINE (ScraperAPI JS Render)
+# 3. $0 NATIVE PLAYWRIGHT UNMASKING ENGINE (Runs inside GitHub Runner)
 # =====================================================================
-def free_public_phone_lookup(name, address, city="Los Angeles", state="CA"):
+def free_playwright_phone_lookup(browser_context, name, address, city="Los Angeles", state="CA"):
     try:
         clean_name = re.sub(r"[^\w\s]", "", name).strip().replace(" ", "-").lower()
         clean_city = city.strip().replace(" ", "-").lower()
@@ -115,39 +112,32 @@ def free_public_phone_lookup(name, address, city="Los Angeles", state="CA"):
         
         target_url = f"https://www.fastpeoplesearch.com/name/{clean_name}_{clean_city}-{clean_state}"
 
-        if SCRAPERAPI_KEY:
-            # Added render=true to force headless Chromium rendering and solve Turnstile JS challenges
-            request_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={target_url}&country_code=us&render=true"
-        else:
-            request_url = target_url
+        page = browser_context.new_page()
+        page.goto(target_url, timeout=15000, wait_until="domcontentloaded")
+        page.wait_for_timeout(1000)
 
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        }
+        html = page.content()
+        page.close()
 
-        res = requests.get(request_url, headers=headers, timeout=30)
-        if res.status_code == 200:
-            # 1. First extract direct tel: links from rendered DOM
-            tel_matches = re.findall(r'href=["\']tel:([^"\']+)["\']', res.text, re.IGNORECASE)
-            
-            # 2. Fallback to standard phone regex
-            raw_phones = tel_matches if tel_matches else re.findall(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}", res.text)
+        tel_matches = re.findall(r'href=["\']tel:([^"\']+)["\']', html, re.IGNORECASE)
+        raw_phones = tel_matches if tel_matches else re.findall(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}", html)
 
-            valid_phones = []
-            for p in raw_phones:
-                clean_p = re.sub(r"\D", "", p)
-                if len(clean_p) == 10 and not clean_p.startswith(("800", "888", "877", "866", "202", "900", "000")):
-                    valid_phones.append(clean_p)
+        valid_phones = []
+        for p in raw_phones:
+            clean_p = re.sub(r"\D", "", p)
+            if len(clean_p) == 10 and not clean_p.startswith(("800", "888", "877", "866", "202", "900", "000")):
+                valid_phones.append(clean_p)
 
-            if valid_phones:
-                phone_num = valid_phones[0]
-                return f"+1{phone_num}"
+        if valid_phones:
+            return f"+1{valid_phones[0]}"
+
     except Exception as e:
-        logging.error(f"[Public Search Proxy Exception] {e}")
+        logging.error(f"[Playwright Unmask Exception] {e}")
+
     return None
 
 
-def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90012"):
+def skip_trace_with_playwright(browser_context, human_name, address, city="Los Angeles", state="CA", zip_code="90012"):
     owner_type = classify_owner_type(human_name)
     target_name = human_name
 
@@ -156,8 +146,8 @@ def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90
         if not target_name:
             target_name = human_name
 
-    logging.info(f"[$0 Public Search] Unmasking contact for [{owner_type}] {target_name} at {address}...")
-    found_phone = free_public_phone_lookup(target_name, address, city, state)
+    logging.info(f"[$0 Native Playwright Search] Unmasking contact for [{owner_type}] {target_name} at {address}...")
+    found_phone = free_playwright_phone_lookup(browser_context, target_name, address, city, state)
     
     if found_phone:
         return {
@@ -182,7 +172,7 @@ def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90
 # =====================================================================
 # 4. WORKER DISPATCH ENGINE
 # =====================================================================
-def dispatch_to_worker(parcel_record):
+def dispatch_to_worker(parcel_record, browser_context=None):
     if PAUSE_PIPELINE:
         logging.info("⏸️ Pipeline paused. Skipping dispatch.")
         return False
@@ -196,14 +186,18 @@ def dispatch_to_worker(parcel_record):
 
     existing_phone = parcel_record.get("phone")
     if not existing_phone or existing_phone in ["PENDING UNMASK", "Unmasked Upon Purchase", "+14537422249"]:
-        trace_res = skip_trace(owner, address, city, state, zip_code)
-        phone = trace_res["phone"]
-        email = trace_res["email"]
+        if browser_context:
+            trace_res = skip_trace_with_playwright(browser_context, owner, address, city, state, zip_code)
+            phone = trace_res["phone"]
+            email = trace_res["email"]
+        else:
+            phone = "PENDING UNMASK"
+            email = "N/A"
     else:
         phone = existing_phone
         email = parcel_record.get("email", "N/A")
 
-    citation_id = parcel_record.get("record_id") or parcel_record.get("citation_id") or generate_deterministic_case_id(apn, address)
+    citation_id = parcel_record.get("record_id") or parcel_record.get("citation_id") or generateDeterministic_case_id(apn, address)
     amount = parcel_record.get("default_amount") or parcel_record.get("amount_logged") or "$35,420.00 Recorded"
     prop_type = parcel_record.get("property_type") or parcel_record.get("property_use") or "Single Family / Commercial"
 
@@ -407,56 +401,6 @@ def load_all_lead_datasets():
     return all_leads
 
 
-# =====================================================================
-# 6. PLAYWRIGHT HEADLESS BROWSER SCRAPER
-# =====================================================================
-def fetch_propwire_leads():
-    logging.info("📡 [PLAYWRIGHT ENGINE] Launching Headless Chromium for Propwire stream...")
-    found_records = []
-
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            )
-            page = context.new_page()
-
-            page.goto(TARGET_PROPWIRE_URL, timeout=60000, wait_until="networkidle")
-            page.wait_for_timeout(4000)
-
-            html_content = page.content()
-            next_data_match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html_content, re.DOTALL)
-            
-            if next_data_match:
-                json_data = json.loads(next_data_match.group(1))
-                page_props = json_data.get("props", {}).get("pageProps", {})
-                results = page_props.get("results", []) or page_props.get("properties", [])
-                
-                for item in results:
-                    found_records.append(normalize_lead_dict({
-                        "apn": item.get("apn") or item.get("parcel_id"),
-                        "address": item.get("address") or item.get("street_address"),
-                        "city": item.get("city", "Los Angeles"),
-                        "state": item.get("state", "CA"),
-                        "zip": item.get("zip"),
-                        "owner_name": item.get("owner_name") or item.get("owner"),
-                        "category": "PRE-FORECLOSURE / REINSTATEMENT",
-                        "violation": "Propwire High Equity Notice of Default (NOD) Stream"
-                    }))
-
-            browser.close()
-
-            if found_records:
-                logging.info(f"✅ Playwright successfully extracted {len(found_records)} live property lead(s)!")
-                return found_records
-
-    except Exception as err:
-        logging.error(f"⚠️ Playwright Execution Exception: {err}")
-
-    return []
-
-
 def get_staging_fallback_leads():
     return [
         normalize_lead_dict({
@@ -469,28 +413,6 @@ def get_staging_fallback_leads():
             "default_amount": "$48,250.00 Recorded NOD",
             "category": "PRE-FORECLOSURE / REINSTATEMENT",
             "violation": "LA County Notice of Default (NOD) logged. High Equity (87%)."
-        }),
-        normalize_lead_dict({
-            "apn": "3004-022-019",
-            "owner_name": "MARCUS & ELENA VANCE",
-            "address": "3148 Maricotte Dr",
-            "city": "Palmdale",
-            "state": "CA",
-            "zip": "93550",
-            "default_amount": "$31,400.00 Recorded NOD",
-            "category": "PRE-FORECLOSURE / REINSTATEMENT",
-            "violation": "LA County Notice of Default (NOD) logged. Equity (52%)."
-        }),
-        normalize_lead_dict({
-            "apn": "5142-009-004",
-            "owner_name": "DTLA REALTY GROUP TRUST",
-            "address": "812 S Spring St",
-            "city": "Los Angeles",
-            "state": "CA",
-            "zip": "90014",
-            "default_amount": "$112,000.00 Recorded NOD",
-            "category": "PRE-FORECLOSURE / REINSTATEMENT",
-            "violation": "Commercial Property Notice of Default (NOD) logged."
         })
     ]
 
@@ -499,56 +421,50 @@ def get_staging_fallback_leads():
 # 7. MAIN EXECUTION LOOP WITH DEDUPLICATION
 # =====================================================================
 if __name__ == "__main__":
-    logging.info(f"🚀 Universal Ingress Engine Active. Pipeline in PRODUCTION MODE (Cap: {'UNLIMITED' if MAX_TEST_LEADS is None else MAX_TEST_LEADS}).")
+    logging.info(f"🚀 Universal Ingress Engine Active. Pipeline in PRODUCTION MODE.")
 
-    real_leads = []
-
-    # 1. Harvest local CSV/PDF/XLS files in root or /data directory
-    local_leads = load_all_lead_datasets()
-    if local_leads:
-        logging.info(f"📁 Loaded {len(local_leads)} lead(s) from local repo datasets.")
-        real_leads.extend(local_leads)
-
-    # 2. Harvest live Propwire stream via Playwright
-    propwire_leads = fetch_propwire_leads()
-    if propwire_leads:
-        logging.info(f"📡 Loaded {len(propwire_leads)} lead(s) from Playwright Propwire stream.")
-        real_leads.extend(propwire_leads)
-
-    # 3. Fallback guard: Activate structured deals if zero live records are harvested
+    real_leads = load_all_lead_datasets()
     if not real_leads:
-        logging.warning("⚠️ No live datasets or stream records retrieved. Activating Real Estate Deal Stream Fallback.")
+        logging.warning("⚠️ No live datasets retrieved. Activating Staging Fallback.")
         real_leads = get_staging_fallback_leads()
 
-    logging.info(f"\n📥 Total Aggregated Feed: {len(real_leads)} record(s). Filtering, unmasking & dispatching...\n")
+    logging.info(f"\n📥 Total Aggregated Feed: {len(real_leads)} record(s). Launching Playwright Unmasking Engine...\n")
     
     passed_count = 0
     blocked_count = 0
     seen_identifiers = set()
 
-    for idx, parcel in enumerate(real_leads, 1):
-        if MAX_TEST_LEADS and passed_count >= MAX_TEST_LEADS:
-            logging.info(f"\n🎯 TEST CAP REACHED: Processed {MAX_TEST_LEADS} leads. Halting batch.")
-            break
+    # Spin up native Playwright browser instance once for the entire batch
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        )
 
-        apn = parcel.get("apn")
-        addr = parcel.get("address")
-        dedup_key = apn if (apn and apn != "PENDING VERIFICATION") else addr
+        for idx, parcel in enumerate(real_leads, 1):
+            if MAX_TEST_LEADS and passed_count >= MAX_TEST_LEADS:
+                logging.info(f"\n🎯 TEST CAP REACHED: Processed {MAX_TEST_LEADS} leads. Halting batch.")
+                break
 
-        if dedup_key in seen_identifiers:
-            logging.info(f"🔄 [{idx}/{len(real_leads)}] [DUPLICATE SKIPPED] {dedup_key}")
-            continue
-        seen_identifiers.add(dedup_key)
+            apn = parcel.get("apn")
+            addr = parcel.get("address")
+            dedup_key = apn if (apn and apn != "PENDING VERIFICATION") else addr
 
-        is_valid, reason = validate_lead_record(parcel)
-        if not is_valid:
-            logging.info(f"🛑 [{idx}/{len(real_leads)}] {reason} -> {parcel.get('owner_name', 'UNKNOWN')} ({parcel.get('address', 'NO ADDR')})")
-            blocked_count += 1
-            continue
+            if dedup_key in seen_identifiers:
+                logging.info(f"🔄 [{idx}/{len(real_leads)}] [DUPLICATE SKIPPED] {dedup_key}")
+                continue
+            seen_identifiers.add(dedup_key)
 
-        logging.info(f"✅ [{passed_count + 1}/{MAX_TEST_LEADS or 'UNLIMITED'}] Ingesting Lead: {parcel.get('owner_name')} - {parcel.get('address')}")
-        dispatch_to_worker(parcel)
-        passed_count += 1
-        time.sleep(0.5)
+            is_valid, reason = validate_lead_record(parcel)
+            if not is_valid:
+                logging.info(f"🛑 [{idx}/{len(real_leads)}] {reason} -> {parcel.get('owner_name', 'UNKNOWN')} ({parcel.get('address', 'NO ADDR')})")
+                blocked_count += 1
+                continue
+
+            logging.info(f"✅ [{passed_count + 1}/{MAX_TEST_LEADS or 'UNLIMITED'}] Processing Lead: {parcel.get('owner_name')} - {parcel.get('address')}")
+            dispatch_to_worker(parcel, browser_context=context)
+            passed_count += 1
+
+        browser.close()
 
     logging.info(f"\n📊 Batch Execution Summary: {passed_count} Dispatched to KV | {blocked_count} Blocked")

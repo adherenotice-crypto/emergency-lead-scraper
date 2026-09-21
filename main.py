@@ -7,8 +7,6 @@ import csv
 import pandas as pd
 import pdfplumber
 import logging
-from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
 
 # Set up clean logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -18,14 +16,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 # =====================================================================
 WORKER_URL = os.getenv("WORKER_URL") or "https://emergencyaudit.com"
 MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY") or "EmergencyAudit_Master_Key_2027!"
+APIFY_TOKEN = os.getenv("APIFY_TOKEN")
 
 # PRODUCTION LEAD CAP (Set to None for unlimited production volume)
 MAX_TEST_LEADS = None 
-
-# TARGET PROPWIRE LIVE STREAM URL
-TARGET_PROPWIRE_URL = os.getenv(
-    "TARGET_PROPWIRE_URL"
-) or "https://propwire.com/search?filters=%7B%22lead_type%22%3A%5B%22preforeclosure%22%5D%2C%22property_type%22%3A%5B%22commercial%22%2C%22mfh_5_plus%22%2C%22mfh_2_to_4%22%2C%22condo%22%2C%22sfr%22%5D%2C%22owner_type%22%3A%5B%22individual%22%2C%22company%22%5D%2C%22estimated_equity_percent%22%3A%7B%22min%22%3A30%2C%22max%22%3A100%7D%2C%22preforeclosure%22%3Atrue%2C%22notice_type%22%3A%22NOD%22%2C%22notice_date%22%3A%7B%22min%22%3A%222026-06-01%22%7D%2C%22locations%22%3A%5B%7B%22searchType%22%3A%22N%22%2C%22county%22%3A%22Los%20Angeles%22%2C%22state%22%3A%22CA%22%2C%22title%22%3A%22Los%20Angeles%2C%20CA%22%7D%5D%7D&location=Los%20Angeles%20County%2C%20CA"
 
 # SYSTEM CONTROLS & SAFETY FLAGS
 PAUSE_PIPELINE = (os.getenv("PAUSE_PIPELINE") or "false").lower() == "true"
@@ -87,83 +81,92 @@ def validate_lead_record(record):
 
 
 # =====================================================================
-# 3. $0 DUCKDUCKGO SEARCH SNIPPET MINING ENGINE
+# 3. APIFY BULK SKIP-TRACING ENGINE (Bypasses Cloudflare Anti-Bot)
 # =====================================================================
-def free_duckduckgo_phone_lookup(browser_context, name, address, city="Los Angeles", state="CA"):
-    try:
-        clean_name = re.sub(r"[^\w\s]", "", name).strip()
-        clean_city = city.strip()
-        clean_state = state.strip()
+def apify_bulk_skip_trace(lead_batch):
+    if not APIFY_TOKEN:
+        logging.warning("⚠️ APIFY_TOKEN secret not found in environment. Skipping Apify unmasking.")
+        return {}
 
-        # Query DuckDuckGo for public phone directory snippets
-        query = f'"{clean_name}" "{clean_city}" "{clean_state}" phone number'
-        encoded_query = requests.utils.quote(query)
-        target_url = f"https://html.duckduckgo.com/html/?q={encoded_query}"
+    logging.info(f"⚡ [APIFY ENGINE] Submitting batch of {len(lead_batch)} lead(s) for automated unmasking...")
 
-        page = browser_context.new_page()
-        page.goto(target_url, timeout=15000, wait_until="domcontentloaded")
-        page.wait_for_timeout(1000)
+    apify_searches = []
+    lookup_map = {}
 
-        html = page.content()
-        page.close()
+    for item in lead_batch:
+        raw_name = item.get("owner_name", "")
+        owner_type = classify_owner_type(raw_name)
 
-        soup = BeautifulSoup(html, "html.parser")
-        snippets = [s.get_text() for s in soup.find_all("a", class_="result__snippet")]
-        snippets.extend([s.get_text() for s in soup.find_all("td", class_="result-snippet")])
-        full_text = " ".join(snippets)
+        if owner_type == "TRUST":
+            target_name = re.sub(r"\b(TRUST|TRUSTEE|TTEE|FAMILY|REVOCABLE|LIVING|DATED|\d+)\b", "", raw_name, flags=re.I).strip()
+        else:
+            target_name = raw_name
 
-        # Extract 10-digit mobile patterns directly from indexed search snippet text
-        phones = re.findall(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}", full_text)
+        name_parts = target_name.strip().split()
+        if len(name_parts) >= 2:
+            first_name = name_parts[0]
+            last_name = " ".join(name_parts[1:])
+        else:
+            first_name = target_name
+            last_name = ""
 
-        valid_phones = []
-        for p in phones:
-            clean_p = re.sub(r"\D", "", p)
-            if len(clean_p) == 10 and not clean_p.startswith(("800", "888", "877", "866", "202", "900", "000")):
-                valid_phones.append(clean_p)
+        city = item.get("city", "Los Angeles")
+        state = item.get("state", "CA")
 
-        if valid_phones:
-            return f"+1{valid_phones[0]}"
+        match_key = f"{first_name.upper()}_{last_name.upper()}_{city.upper()}"
+        lookup_map[match_key] = item.get("record_id")
 
-    except Exception as e:
-        logging.error(f"[DuckDuckGo Snippet Search Exception] {e}")
-        try:
-            page.close()
-        except Exception:
-            pass
+        apify_searches.append({
+            "firstName": first_name,
+            "lastName": last_name,
+            "city": city,
+            "state": state
+        })
 
-    return None
-
-
-def skip_trace_with_playwright(browser_context, human_name, address, city="Los Angeles", state="CA", zip_code="90012"):
-    owner_type = classify_owner_type(human_name)
-    target_name = human_name
-
-    if owner_type == "TRUST":
-        target_name = re.sub(r"\b(TRUST|TRUSTEE|TTEE|FAMILY|REVOCABLE|LIVING|DATED|\d+)\b", "", human_name, flags=re.I).strip()
-        if not target_name:
-            target_name = human_name
-
-    logging.info(f"[$0 Search Snippet Mining] Unmasking contact for [{owner_type}] {target_name} at {address}...")
-    found_phone = free_duckduckgo_phone_lookup(browser_context, target_name, address, city, state)
+    actor_endpoint = f"https://api.apify.com/v2/acts/memo23~fastpeoplesearch-scraper/run-sync-get-dataset-items?token={APIFY_TOKEN}"
     
-    if found_phone:
-        return {
-            "phone": found_phone, 
-            "email": "N/A", 
-            "status": "VERIFIED", 
-            "phone_type": "MOBILE", 
-            "unmasked_owner": target_name
-        }
-
-    status_flag = "LLC_INDEXED" if owner_type == "CORPORATE_ENTITY" else ("TRUST_INDEXED" if owner_type == "TRUST" else "PUBLIC_DATA_INDEXED")
-
-    return {
-        "phone": "PENDING UNMASK", 
-        "email": "N/A", 
-        "status": status_flag, 
-        "phone_type": owner_type, 
-        "unmasked_owner": target_name
+    payload = {
+        "searches": apify_searches,
+        "maxItemsPerSearch": 1,
+        "flattenedOutput": True
     }
+
+    results_map = {}
+    try:
+        res = requests.post(actor_endpoint, json=payload, timeout=300)
+        if res.status_code in [200, 201]:
+            extracted_data = res.json()
+            for record in extracted_data:
+                fn = (record.get("firstName") or record.get("search_firstName") or "").upper()
+                ln = (record.get("lastName") or record.get("search_lastName") or "").upper()
+                ct = (record.get("city") or record.get("search_city") or "").upper()
+                match_key = f"{fn}_{ln}_{ct}"
+
+                # Extract phone number from Apify output
+                phone = record.get("Phone-1") or record.get("primaryPhone") or record.get("phone")
+                if not phone and record.get("phones"):
+                    phone_objs = record.get("phones", [])
+                    if phone_objs and isinstance(phone_objs, list):
+                        phone = phone_objs[0].get("number") if isinstance(phone_objs[0], dict) else str(phone_objs[0])
+
+                if phone:
+                    clean_p = re.sub(r"\D", "", str(phone))
+                    if len(clean_p) == 10:
+                        clean_p = f"+1{clean_p}"
+                    elif len(clean_p) == 11 and clean_p.startswith("1"):
+                        clean_p = f"+{clean_p}"
+                    
+                    citation_id = lookup_map.get(match_key)
+                    if citation_id:
+                        results_map[citation_id] = clean_p
+                        
+            logging.info(f"✅ [APIFY ENGINE] Successfully unmasked {len(results_map)} live phone number(s)!")
+        else:
+            logging.error(f"❌ Apify Actor Error [{res.status_code}]: {res.text}")
+    except Exception as e:
+        logging.error(f"⚠️ Apify Execution Exception: {e}")
+
+    return results_map
 
 
 # =====================================================================
@@ -339,90 +342,84 @@ def get_staging_fallback_leads():
 
 
 # =====================================================================
-# 5. MAIN EXECUTION LOOP (BULK DISPATCH)
+# 5. MAIN EXECUTION LOOP (BULK UNMASK & SINGLE-REQUEST DISPATCH)
 # =====================================================================
 if __name__ == "__main__":
-    logging.info(f"🚀 Universal Ingress Engine Active. Pipeline in PRODUCTION MODE.")
+    logging.info("🚀 Universal Ingress Engine Active. Pipeline in PRODUCTION MODE.")
 
     real_leads = load_all_lead_datasets()
     if not real_leads:
         logging.warning("⚠️ No live datasets retrieved. Activating Staging Fallback.")
         real_leads = get_staging_fallback_leads()
 
-    logging.info(f"\n📥 Total Aggregated Feed: {len(real_leads)} record(s). Mining Snippets & Queueing Bulk Dispatch...\n")
+    logging.info(f"\n📥 Total Aggregated Feed: {len(real_leads)} record(s). Processing...\n")
     
     passed_count = 0
     blocked_count = 0
     seen_identifiers = set()
+    needs_unmask_batch = []
+    prepared_records = []
+
+    for idx, parcel in enumerate(real_leads, 1):
+        if MAX_TEST_LEADS and passed_count >= MAX_TEST_LEADS:
+            break
+
+        apn = parcel.get("apn")
+        addr = parcel.get("address")
+        dedup_key = apn if (apn and apn != "PENDING VERIFICATION") else addr
+
+        if dedup_key in seen_identifiers:
+            continue
+        seen_identifiers.add(dedup_key)
+
+        is_valid, reason = validate_lead_record(parcel)
+        if not is_valid:
+            blocked_count += 1
+            continue
+
+        citation_id = parcel.get("record_id") or parcel.get("citation_id") or generate_deterministic_case_id(apn, addr)
+        parcel["record_id"] = citation_id
+
+        existing_phone = parcel.get("phone")
+        if not existing_phone or existing_phone in ["PENDING UNMASK", "Unmasked Upon Purchase", "+14537422249", "+13333333333"]:
+            needs_unmask_batch.append(parcel)
+        
+        prepared_records.append(parcel)
+        passed_count += 1
+
+    # Execute Apify Bulk Unmasking for leads missing phone numbers
+    unmasked_phones = {}
+    if needs_unmask_batch:
+        unmasked_phones = apify_bulk_skip_trace(needs_unmask_batch)
+
+    # Build final KV payload
     dispatch_queue = []
+    for parcel in prepared_records:
+        cid = parcel["record_id"]
+        phone = parcel.get("phone")
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            viewport={"width": 1920, "height": 1080}
-        )
+        if not phone or phone in ["PENDING UNMASK", "Unmasked Upon Purchase", "+14537422249", "+13333333333"]:
+            phone = unmasked_phones.get(cid, "PENDING UNMASK")
 
-        for idx, parcel in enumerate(real_leads, 1):
-            if MAX_TEST_LEADS and passed_count >= MAX_TEST_LEADS:
-                logging.info(f"\n🎯 TEST CAP REACHED: Processed {MAX_TEST_LEADS} leads. Halting batch.")
-                break
+        dispatch_queue.append({
+            "record_id": cid,
+            "citation_id": cid,
+            "caseId": cid,
+            "address": parcel.get("address"),
+            "owner_name": parcel.get("owner_name"),
+            "phone": phone,
+            "email": parcel.get("email", "N/A"),
+            "apn": parcel.get("apn"),
+            "category": parcel.get("category", "PRE-FORECLOSURE / REINSTATEMENT"),
+            "default_amount": parcel.get("default_amount") or "$35,420.00 Recorded",
+            "property_type": parcel.get("property_type") or "Single Family / Commercial",
+            "violation": parcel.get("violation") or "A statutory Notice of Default (NOD) has been logged in LA County public records.",
+            "status": "PENDING_REVIEW" if STAGING_MODE else "READY_FOR_DISPATCH"
+        })
 
-            apn = parcel.get("apn")
-            addr = parcel.get("address")
-            dedup_key = apn if (apn and apn != "PENDING VERIFICATION") else addr
-
-            if dedup_key in seen_identifiers:
-                logging.info(f"🔄 [{idx}/{len(real_leads)}] [DUPLICATE SKIPPED] {dedup_key}")
-                continue
-            seen_identifiers.add(dedup_key)
-
-            is_valid, reason = validate_lead_record(parcel)
-            if not is_valid:
-                logging.info(f"🛑 [{idx}/{len(real_leads)}] {reason} -> {parcel.get('owner_name', 'UNKNOWN')} ({parcel.get('address', 'NO ADDR')})")
-                blocked_count += 1
-                continue
-
-            owner = parcel.get("owner_name", "RECORDED OWNER")
-            city = parcel.get("city", "Los Angeles")
-            state = parcel.get("state", "CA")
-            zip_code = parcel.get("zip", "90012")
-
-            existing_phone = parcel.get("phone")
-            if not existing_phone or existing_phone in ["PENDING UNMASK", "Unmasked Upon Purchase", "+14537422249", "+13333333333"]:
-                trace_res = skip_trace_with_playwright(context, owner, addr, city, state, zip_code)
-                phone = trace_res["phone"]
-                email = trace_res["email"]
-            else:
-                phone = existing_phone
-                email = parcel.get("email", "N/A")
-
-            citation_id = parcel.get("record_id") or parcel.get("citation_id") or generate_deterministic_case_id(apn, addr)
-
-            dispatch_queue.append({
-                "record_id": citation_id,
-                "citation_id": citation_id,
-                "caseId": citation_id,
-                "address": addr,
-                "owner_name": owner,
-                "phone": phone,
-                "email": email,
-                "apn": apn,
-                "category": parcel.get("category", "PRE-FORECLOSURE / REINSTATEMENT"),
-                "default_amount": parcel.get("default_amount") or "$35,420.00 Recorded",
-                "property_type": parcel.get("property_type") or "Single Family / Commercial",
-                "violation": parcel.get("violation") or "A statutory Notice of Default (NOD) has been logged in LA County public records.",
-                "status": "PENDING_REVIEW" if STAGING_MODE else "READY_FOR_DISPATCH"
-            })
-
-            passed_count += 1
-            logging.info(f"📦 [{passed_count}/{len(real_leads)}] Queued Lead: {owner} -> Phone: {phone}")
-
-        browser.close()
-
-    # Single HTTP POST Request to Cloudflare Worker (Conserves Daily KV Write Limits)
+    # Dispatch Single Bulk Request to Cloudflare Worker (Conserves Daily KV Write Limits)
     if dispatch_queue:
-        logging.info(f"\n🚀 Sending 1 single bulk payload with {len(dispatch_queue)} record(s) to Worker...")
+        logging.info(f"\n🚀 Dispatching {len(dispatch_queue)} unmasked record(s) to Cloudflare KV...")
         endpoint = f"{WORKER_URL.rstrip('/')}/api/inbound-lead-hook"
         headers = {
             "Content-Type": "application/json",

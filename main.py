@@ -22,7 +22,7 @@ MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY") or "EmergencyAudit_Master_Key_2
 # PRODUCTION LEAD CAP (Set to None for unlimited production volume)
 MAX_TEST_LEADS = None 
 
-# SCRAPERAPI PROXY CONFIGURATION
+# SCRAPERAPI PROXY CONFIGURATION ($0 Free Unmask Engine)
 SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY") or "38c60fbbae81a8c17897a5b68da2e04c"
 
 # TARGET PROPWIRE LIVE STREAM URL
@@ -30,10 +30,10 @@ TARGET_PROPWIRE_URL = os.getenv(
     "TARGET_PROPWIRE_URL"
 ) or "https://propwire.com/search?filters=%7B%22lead_type%22%3A%5B%22preforeclosure%22%5D%2C%22property_type%22%3A%5B%22commercial%22%2C%22mfh_5_plus%22%2C%22mfh_2_to_4%22%2C%22condo%22%2C%22sfr%22%5D%2C%22owner_type%22%3A%5B%22individual%22%2C%22company%22%5D%2C%22estimated_equity_percent%22%3A%7B%22min%22%3A30%2C%22max%22%3A100%7D%2C%22preforeclosure%22%3Atrue%2C%22notice_type%22%3A%22NOD%22%2C%22notice_date%22%3A%7B%22min%22%3A%222026-06-01%22%7D%2C%22locations%22%3A%5B%7B%22searchType%22%3A%22N%22%2C%22county%22%3A%22Los%20Angeles%22%2C%22state%22%3A%22CA%22%2C%22title%22%3A%22Los%20Angeles%2C%20CA%22%7D%5D%7D&location=Los%20Angeles%20County%2C%20CA"
 
-# TRACERFY & PHONE UNMASK CONFIGURATION
-TRACERFY_API_KEY = os.getenv("TRACERFY_API_KEY") or ""
-TRACERFY_URL = os.getenv("TRACERFY_URL") or "https://tracerfy.com/v1/api/trace/lookup/"
-ENABLE_TRACERFY = (os.getenv("ENABLE_TRACERFY") or "false").lower() == "true"
+# TRACERFY DISABLED (Forced False to save credits)
+TRACERFY_API_KEY = ""
+TRACERFY_URL = "https://tracerfy.com/v1/api/trace/lookup/"
+ENABLE_TRACERFY = False
 
 # TWILIO CONFIGURATION
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID") or ""
@@ -105,7 +105,7 @@ def validate_lead_record(record):
 
 
 # =====================================================================
-# 3. PHONE UNMASKING & SKIP-TRACING ENGINE
+# 3. $0 FREE PUBLIC PHONE UNMASKING ENGINE (ScraperAPI JS Render)
 # =====================================================================
 def free_public_phone_lookup(name, address, city="Los Angeles", state="CA"):
     try:
@@ -116,7 +116,8 @@ def free_public_phone_lookup(name, address, city="Los Angeles", state="CA"):
         target_url = f"https://www.fastpeoplesearch.com/name/{clean_name}_{clean_city}-{clean_state}"
 
         if SCRAPERAPI_KEY:
-            request_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={target_url}&country_code=us"
+            # Added render=true to force headless Chromium rendering and solve Turnstile JS challenges
+            request_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={target_url}&country_code=us&render=true"
         else:
             request_url = target_url
 
@@ -124,18 +125,23 @@ def free_public_phone_lookup(name, address, city="Los Angeles", state="CA"):
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         }
 
-        res = requests.get(request_url, headers=headers, timeout=20)
+        res = requests.get(request_url, headers=headers, timeout=30)
         if res.status_code == 200:
-            phones = re.findall(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}", res.text)
-            valid_phones = [
-                re.sub(r"\D", "", p) for p in phones 
-                if not p.startswith(("800", "888", "877", "866", "202", "(202)"))
-            ]
+            # 1. First extract direct tel: links from rendered DOM
+            tel_matches = re.findall(r'href=["\']tel:([^"\']+)["\']', res.text, re.IGNORECASE)
+            
+            # 2. Fallback to standard phone regex
+            raw_phones = tel_matches if tel_matches else re.findall(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}", res.text)
+
+            valid_phones = []
+            for p in raw_phones:
+                clean_p = re.sub(r"\D", "", p)
+                if len(clean_p) == 10 and not clean_p.startswith(("800", "888", "877", "866", "202", "900", "000")):
+                    valid_phones.append(clean_p)
+
             if valid_phones:
                 phone_num = valid_phones[0]
-                if len(phone_num) == 10:
-                    phone_num = f"1{phone_num}"
-                return f"+{phone_num}" if not phone_num.startswith("+") else phone_num
+                return f"+1{phone_num}"
     except Exception as e:
         logging.error(f"[Public Search Proxy Exception] {e}")
     return None
@@ -149,34 +155,6 @@ def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90
         target_name = re.sub(r"\b(TRUST|TRUSTEE|TTEE|FAMILY|REVOCABLE|LIVING|DATED|\d+)\b", "", human_name, flags=re.I).strip()
         if not target_name:
             target_name = human_name
-
-    if ENABLE_TRACERFY and TRACERFY_API_KEY:
-        try:
-            payload = {
-                "key": TRACERFY_API_KEY, 
-                "name": target_name, 
-                "address": address, 
-                "city": city, 
-                "state": state, 
-                "zip": zip_code
-            }
-            res = requests.post(TRACERFY_URL, json=payload, timeout=6)
-            if res.status_code == 200:
-                data = res.json()
-                phone = data.get("phone") or data.get("mobile")
-                if phone:
-                    clean_p = re.sub(r"\D", "", phone)
-                    if len(clean_p) == 10: clean_p = f"1{clean_p}"
-                    formatted_phone = f"+{clean_p}" if not clean_p.startswith("+") else clean_p
-                    return {
-                        "phone": formatted_phone, 
-                        "email": data.get("email", "N/A"), 
-                        "status": "VERIFIED", 
-                        "phone_type": "MOBILE", 
-                        "unmasked_owner": target_name
-                    }
-        except Exception as e:
-            logging.error(f"[Tracerfy Exception] {e}")
 
     logging.info(f"[$0 Public Search] Unmasking contact for [{owner_type}] {target_name} at {address}...")
     found_phone = free_public_phone_lookup(target_name, address, city, state)
@@ -217,7 +195,7 @@ def dispatch_to_worker(parcel_record):
     apn = parcel_record.get("apn", "PENDING VERIFICATION")
 
     existing_phone = parcel_record.get("phone")
-    if not existing_phone or existing_phone in ["PENDING UNMASK", "Unmasked Upon Purchase"]:
+    if not existing_phone or existing_phone in ["PENDING UNMASK", "Unmasked Upon Purchase", "+14537422249"]:
         trace_res = skip_trace(owner, address, city, state, zip_code)
         phone = trace_res["phone"]
         email = trace_res["email"]
@@ -263,7 +241,7 @@ def dispatch_to_worker(parcel_record):
     try:
         res = requests.post(endpoint, data=json.dumps([payload]), headers=headers, timeout=15)
         if res.status_code == 200:
-            logging.info(f"✅ Dispatched [{citation_id}] -> Door 2 URL: {WORKER_URL}/c/{citation_id} (Status: {payload['status']})")
+            logging.info(f"✅ Dispatched [{citation_id}] -> Phone: {phone} (Status: {payload['status']})")
             return True
         else:
             logging.error(f"❌ Worker Error [{res.status_code}]: {res.text}")
@@ -277,32 +255,27 @@ def dispatch_to_worker(parcel_record):
 # 5. DATA INGESTION & FILE PARSING ENGINE
 # =====================================================================
 def normalize_lead_dict(raw_dict):
-    # Sanitize all column keys down to pure lowercase alphanumeric strings
     norm = {}
     for k, v in raw_dict.items():
         if k is not None and v is not None:
             clean_k = re.sub(r'[^a-z0-9]', '', str(k).lower())
             norm[clean_k] = str(v).strip()
 
-    # 1. APN Extraction
     apn_val = (
         norm.get("apn") or norm.get("parcelid") or norm.get("pin") 
         or norm.get("parcel") or norm.get("parcelnumber") or "PENDING VERIFICATION"
     )
 
-    # 2. Address Extraction
     addr_val = (
         norm.get("address") or norm.get("propertyaddress") or norm.get("siteaddress") 
         or norm.get("location") or norm.get("streetaddress") or norm.get("propaddress") 
         or "Recorded Parcel Location"
     )
 
-    # 3. Location Details
     city_val = norm.get("city") or norm.get("propertycity") or "Los Angeles"
     state_val = norm.get("state") or norm.get("propertystate") or "CA"
     zip_val = norm.get("zip") or norm.get("zipcode") or norm.get("propertyzip") or "90012"
 
-    # 4. Owner Name Extraction (Handles Propwire split & full-name layouts)
     owner_val = (
         norm.get("owner1fullname")
         or norm.get("ownerfullname")
@@ -330,7 +303,6 @@ def normalize_lead_dict(raw_dict):
     if not owner_val:
         owner_val = "RECORDED OWNER"
 
-    # 5. Case Citation ID
     citation = (
         norm.get("recordid")
         or norm.get("citationid")
@@ -339,7 +311,6 @@ def normalize_lead_dict(raw_dict):
         or generate_deterministic_case_id(apn_val, addr_val)
     )
 
-    # 6. Default Amount & Property Type
     amount = (
         norm.get("defaultamount")
         or norm.get("amountlogged")

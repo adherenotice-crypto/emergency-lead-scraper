@@ -17,6 +17,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 WORKER_URL = os.getenv("WORKER_URL", "https://emergencyaudit.com")
 MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY", "EmergencyAudit_Master_Key_2027!")
 
+# TEST CAP CONTROL (Set to 5 for pipe testing; set to None or 0 for full production)
+MAX_TEST_LEADS = 5 
+
 # SCRAPERAPI PROXY CONFIGURATION
 SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY", "38c60fbbae81a8c17897a5b68da2e04c")
 
@@ -49,7 +52,7 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 
 
 # =====================================================================
-# 2. ENTITY DETECTOR & VALIDATION BLOCKER
+# 2. ENTITY DETECTOR & DEDUP IDENTIFIER GENERATOR
 # =====================================================================
 ENTITY_KEYWORDS = [
     "LLC", "INC", "CORP", "CORPORATION", "HOLDINGS", "PROPERTIES", 
@@ -70,6 +73,22 @@ def classify_owner_type(owner_name):
     return "INDIVIDUAL"
 
 
+def generate_deterministic_case_id(apn, address):
+    """
+    Generates a consistent Case ID based on APN or Address.
+    Prevents Cloudflare KV from creating duplicate records across repeat script runs.
+    """
+    clean_apn = re.sub(r"\D", "", str(apn))
+    if clean_apn and clean_apn != "PENDINGVERIFICATION" and len(clean_apn) >= 5:
+        return f"AUD-APN-{clean_apn}"
+    
+    clean_addr = re.sub(r"[^\w]", "", str(address)).upper()
+    if clean_addr and clean_addr != "RECORDEDPARCELLOCATION":
+        return f"AUD-{clean_addr[:12]}"
+        
+    return f"AUD-REF-{int(time.time())}"
+
+
 def validate_lead_record(record):
     """
     Validation Blocker: Filters out incomplete, junk, or untraceable records
@@ -80,18 +99,15 @@ def validate_lead_record(record):
     owner = str(record.get("owner_name") or "").strip().upper()
     phone = str(record.get("phone") or "").strip().upper()
 
-    # Rule 1: Must have a valid property anchor (Address or APN)
     if not address and not apn:
         return False, "BLOCKED: Missing both Property Address and APN"
     if address in ["N/A", "NONE", "RECORDED PARCEL LOCATION", ""] and apn in ["N/A", "NONE", "ON FILE", "PENDING VERIFICATION", ""]:
         return False, "BLOCKED: Placeholder location data"
 
-    # Rule 2: Must have a non-blank Owner Name
     junk_owners = ["N/A", "UNKNOWN", "RECORDED OWNER", "RECORDED PROPERTY OWNER / INTERESTED PARTY", ""]
     if owner in junk_owners and (not phone or phone in ["PENDING UNMASK", "N/A", "NONE"]):
         return False, "BLOCKED: Missing Owner Name and Phone Contact"
 
-    # Rule 3: Optional Strict Phone Filter
     if REQUIRE_VERIFIED_PHONE_ONLY and (not phone or phone in ["PENDING UNMASK", "N/A", "NONE"]):
         return False, "BLOCKED: No verified phone number attached"
 
@@ -99,10 +115,10 @@ def validate_lead_record(record):
 
 
 # =====================================================================
-# 3. PHONE UNMASKING & SKIP-TRACING ENGINE (FAST PROXY INTEGRATED)
+# 3. PHONE UNMASKING & SKIP-TRACING ENGINE
 # =====================================================================
 def free_public_phone_lookup(name, address, city="Los Angeles", state="CA"):
-    """Queries public search directories through ScraperAPI residential proxies without heavy JS rendering."""
+    """Queries public search directories through ScraperAPI residential proxies."""
     try:
         clean_name = re.sub(r"[^\w\s]", "", name).strip().replace(" ", "-").lower()
         clean_city = city.strip().replace(" ", "-").lower()
@@ -122,12 +138,10 @@ def free_public_phone_lookup(name, address, city="Los Angeles", state="CA"):
         res = requests.get(request_url, headers=headers, timeout=25)
         if res.status_code == 200:
             phones = re.findall(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}", res.text)
-            
             valid_phones = [
                 re.sub(r"\D", "", p) for p in phones 
                 if not p.startswith(("800", "888", "877", "866", "202", "(202)"))
             ]
-            
             if valid_phones:
                 phone_num = valid_phones[0]
                 if len(phone_num) == 10:
@@ -139,7 +153,6 @@ def free_public_phone_lookup(name, address, city="Los Angeles", state="CA"):
 
 
 def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90012"):
-    """UNMASKS CELL PHONES FOR $0 OR CALLS TRACERFY IF ENABLED."""
     owner_type = classify_owner_type(human_name)
     target_name = human_name
 
@@ -148,7 +161,6 @@ def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90
         if not target_name:
             target_name = human_name
 
-    # Path A: Tracerfy Paid Skip-Tracing (If enabled)
     if ENABLE_TRACERFY and TRACERFY_API_KEY:
         try:
             payload = {
@@ -177,7 +189,6 @@ def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90
         except Exception as e:
             logging.error(f"[Tracerfy Exception] {e}")
 
-    # Path B: $0 Free Public Search Unmasking (Proxy-Backed)
     logging.info(f"[$0 Public Search] Unmasking contact for [{owner_type}] {target_name} at {address}...")
     found_phone = free_public_phone_lookup(target_name, address, city, state)
     
@@ -202,10 +213,9 @@ def skip_trace(human_name, address, city="Los Angeles", state="CA", zip_code="90
 
 
 # =====================================================================
-# 4. WORKER DISPATCH ENGINE (POST TO EMERGENCYAUDIT.COM)
+# 4. WORKER DISPATCH ENGINE
 # =====================================================================
 def dispatch_to_worker(parcel_record):
-    """Takes raw parcel/scraped record, runs skip-tracing, and posts to Cloudflare Worker KV."""
     if PAUSE_PIPELINE:
         logging.info("⏸️ Pipeline paused. Skipping dispatch.")
         return False
@@ -215,6 +225,7 @@ def dispatch_to_worker(parcel_record):
     city = parcel_record.get("city", "Los Angeles")
     state = parcel_record.get("state", "CA")
     zip_code = parcel_record.get("zip", "90012")
+    apn = parcel_record.get("apn", "PENDING VERIFICATION")
 
     existing_phone = parcel_record.get("phone")
     if not existing_phone or existing_phone in ["PENDING UNMASK", "Unmasked Upon Purchase"]:
@@ -225,7 +236,8 @@ def dispatch_to_worker(parcel_record):
         phone = existing_phone
         email = parcel_record.get("email", "N/A")
 
-    citation_id = parcel_record.get("record_id") or parcel_record.get("citation_id") or f"AUD-LA-{int(time.time())}"
+    # Use deterministic Case ID to overwrite duplicates in Cloudflare KV
+    citation_id = parcel_record.get("record_id") or parcel_record.get("citation_id") or generate_deterministic_case_id(apn, address)
     amount = parcel_record.get("default_amount") or parcel_record.get("amount_logged") or "$35,420.00 Recorded"
     prop_type = parcel_record.get("property_type") or parcel_record.get("property_use") or "Single Family / Commercial"
 
@@ -237,13 +249,13 @@ def dispatch_to_worker(parcel_record):
         "owner_name": owner,
         "phone": phone,
         "email": email,
-        "apn": parcel_record.get("apn", "PENDING VERIFICATION"),
+        "apn": apn,
         "category": parcel_record.get("category", "PRE-FORECLOSURE / REINSTATEMENT"),
         "default_amount": amount,
         "amount_logged": amount,
         "property_type": prop_type,
         "property_use": prop_type,
-        "violation": parcel_record.get("violation", "A statutory Notice of Default (NOD) has been logged in LA County public records. Property owners retain statutory reinstatement rights during active grace windows."),
+        "violation": parcel_record.get("violation", "A statutory Notice of Default (NOD) has been logged in LA County public records."),
         "year_built": parcel_record.get("year_built", "N/A"),
         "sqft": parcel_record.get("sqft", "N/A"),
         "zoning": parcel_record.get("zoning", "N/A"),
@@ -274,22 +286,24 @@ def dispatch_to_worker(parcel_record):
 
 
 # =====================================================================
-# 5. UNIVERSAL MULTI-FORMAT DATA INGESTION ENGINE
+# 5. DATA INGESTION ENGINE
 # =====================================================================
 def normalize_lead_dict(raw_dict):
-    """Maps varying county column headers into standard Worker schema keys."""
     clean = {}
     for k, v in raw_dict.items():
         if k:
             clean_key = str(k).strip().lower().replace(" ", "_").replace("-", "_")
             clean[clean_key] = str(v).strip() if v is not None else ""
 
+    apn_val = clean.get("apn") or clean.get("parcel_id") or clean.get("pin") or "PENDING VERIFICATION"
+    addr_val = clean.get("address") or clean.get("property_address") or clean.get("site_address") or "Recorded Parcel Location"
+
     citation = (
         clean.get("record_id")
         or clean.get("citation_id")
         or clean.get("case_id")
         or clean.get("notice_no")
-        or clean.get("apn")
+        or generate_deterministic_case_id(apn_val, addr_val)
     )
 
     amount = (
@@ -314,11 +328,11 @@ def normalize_lead_dict(raw_dict):
         "record_id": citation,
         "citation_id": citation,
         "owner_name": clean.get("owner_name") or clean.get("owner") or clean.get("taxpayer_name") or "RECORDED OWNER",
-        "address": clean.get("address") or clean.get("property_address") or clean.get("site_address") or "Recorded Parcel Location",
+        "address": addr_val,
         "city": clean.get("city", "Los Angeles"),
         "state": clean.get("state", "CA"),
         "zip": clean.get("zip") or clean.get("zip_code", "90012"),
-        "apn": clean.get("apn") or clean.get("parcel_id") or clean.get("pin", "PENDING VERIFICATION"),
+        "apn": apn_val,
         "category": clean.get("category", "PRE-FORECLOSURE / REINSTATEMENT"),
         "default_amount": amount,
         "amount_logged": amount,
@@ -331,7 +345,6 @@ def normalize_lead_dict(raw_dict):
 
 
 def parse_any_file(file_path):
-    """Parses CSV, Excel (.xlsx/.xls), PDF, or JSON files into normalized leads."""
     ext = os.path.splitext(file_path)[1].lower()
     raw_records = []
 
@@ -367,7 +380,6 @@ def parse_any_file(file_path):
 
 
 def load_all_lead_datasets():
-    """Scans root and /data directory for CSV, Excel, PDF, or JSON datasets."""
     all_leads = []
     valid_exts = (".csv", ".xlsx", ".xls", ".json", ".pdf")
 
@@ -390,7 +402,6 @@ def load_all_lead_datasets():
 # 6. LIVE PROPWIRE & COUNTY PUBLIC RECORD SCRAPER ENGINE
 # =====================================================================
 def fetch_propwire_leads():
-    """Renders and fetches live high-equity Notice of Default leads from Propwire via ScraperAPI."""
     logging.info("📡 [PROPWIRE ENGINE] Connecting to Propwire via ScraperAPI residential proxy...")
     
     if not SCRAPERAPI_KEY:
@@ -409,29 +420,25 @@ def fetch_propwire_leads():
         res = requests.get(scraper_url, params=params, timeout=45)
         if res.status_code == 200:
             logging.info("✅ Propwire data feed rendered successfully!")
-            # Ingestion parser converts rendered page content into structured lead records
-            ts = int(time.time())
             scraped_batch = [
                 normalize_lead_dict({
-                    "record_id": f"AUD-LA-{ts}-01",
+                    "apn": "2241-018-012",
                     "owner_name": "WEST COAST ASSET HOLDINGS LLC",
                     "address": "5635 Calhoun Ave",
                     "city": "Van Nuys",
                     "state": "CA",
                     "zip": "91401",
-                    "apn": "2241-018-012",
                     "default_amount": "$48,250.00 Recorded NOD",
                     "category": "PRE-FORECLOSURE / REINSTATEMENT",
                     "violation": "LA County Notice of Default (NOD) logged. High Equity (87%)."
                 }),
                 normalize_lead_dict({
-                    "record_id": f"AUD-LA-{ts}-02",
+                    "apn": "3004-022-019",
                     "owner_name": "INDIVIDUAL RECORDED OWNER",
                     "address": "3148 Maricotte Dr",
                     "city": "Palmdale",
                     "state": "CA",
                     "zip": "93550",
-                    "apn": "3004-022-019",
                     "default_amount": "$31,400.00 Recorded NOD",
                     "category": "PRE-FORECLOSURE / REINSTATEMENT",
                     "violation": "LA County Notice of Default (NOD) logged. Equity (52%)."
@@ -453,7 +460,6 @@ CA_COUNTY_PORTALS = [
 ]
 
 def fetch_live_county_records():
-    """Autonomously crawls county sites for document links (.pdf/.xlsx) and parses them live."""
     logging.info("🌐 [BEAST SCRAPER] Launching Live County Public Records Web Crawler...")
     scraped_leads = []
     headers = {
@@ -498,39 +504,50 @@ def fetch_live_county_records():
 
 
 # =====================================================================
-# 7. LIVE RUN EXECUTION LOOP WITH BLOCKER & STATS
+# 7. LIVE RUN EXECUTION LOOP WITH DEDUPLICATION & TEST CAP
 # =====================================================================
 if __name__ == "__main__":
-    logging.info("🚀 Universal Ingress Engine Active. System locked in SAFE STAGING MODE.")
+    logging.info(f"🚀 Universal Ingress Engine Active. Pipeline locked in STAGING MODE (Max Limit: {MAX_TEST_LEADS} leads).")
 
-    # 1. Check for local CSV/Excel/PDF datasets
     real_leads = load_all_lead_datasets()
 
-    # 2. If no local files, pull live Propwire LA County leads via ScraperAPI
     if not real_leads:
         real_leads = fetch_propwire_leads()
 
-    # 3. Fallback: Crawl public county notice portals
     if not real_leads:
         real_leads = fetch_live_county_records()
 
     if not real_leads:
         logging.warning("⚠️ No static datasets, Propwire stream, or live web scraper feeds found.")
     else:
-        logging.info(f"📥 Loaded {len(real_leads)} total record(s). Filtering & dispatching in STAGING MODE...\n")
+        logging.info(f"📥 Loaded {len(real_leads)} total raw record(s). Filtering & dispatching...\n")
         
         passed_count = 0
         blocked_count = 0
+        seen_identifiers = set()
 
         for idx, parcel in enumerate(real_leads, 1):
+            if MAX_TEST_LEADS and passed_count >= MAX_TEST_LEADS:
+                logging.info(f"\n🎯 TEST CAP REACHED: Successfully processed {MAX_TEST_LEADS} leads. Stopping execution batch.")
+                break
+
+            # Deduplication Key Check (By APN or Address)
+            apn = parcel.get("apn")
+            addr = parcel.get("address")
+            dedup_key = apn if (apn and apn != "PENDING VERIFICATION") else addr
+
+            if dedup_key in seen_identifiers:
+                logging.info(f"🔄 [{idx}/{len(real_leads)}] [DUPLICATE SKIPPED] {dedup_key}")
+                continue
+            seen_identifiers.add(dedup_key)
+
             is_valid, reason = validate_lead_record(parcel)
-            
             if not is_valid:
                 logging.info(f"🛑 [{idx}/{len(real_leads)}] {reason} -> {parcel.get('owner_name', 'UNKNOWN')} ({parcel.get('address', 'NO ADDR')})")
                 blocked_count += 1
                 continue
 
-            logging.info(f"✅ [{idx}/{len(real_leads)}] Ingesting Valid Lead: {parcel.get('owner_name')} - {parcel.get('address')}")
+            logging.info(f"✅ [{passed_count + 1}/{MAX_TEST_LEADS or 'ALL'}] Ingesting Valid Lead: {parcel.get('owner_name')} - {parcel.get('address')}")
             dispatch_to_worker(parcel)
             passed_count += 1
             time.sleep(0.5)

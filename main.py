@@ -84,7 +84,7 @@ def validate_lead_record(record):
 # 3. LOCAL CELL SCANNER & APIFY SKIP-TRACING ENGINE
 # =====================================================================
 def extract_phone_from_raw_row(raw_dict):
-    """Scans all cells in a record for existing valid 10-digit US phone numbers."""
+    """Deep scans every cell in a CSV/XLSX row for valid 10-digit US phone numbers."""
     phone_candidates = []
     
     priority_keys = ["phone", "mobile", "contact", "ownerphone", "phone1", "cell", "telephone", "phone_number"]
@@ -162,11 +162,9 @@ def apify_bulk_skip_trace(lead_batch):
         start_endpoint = f"https://api.apify.com/v2/acts/memo23~fastpeoplesearch-scraper/runs?token={APIFY_TOKEN}"
         payload = {
             "searchQueries": search_queries,
-            "queries": search_queries,
             "maxResults": 1,
             "proxyConfiguration": {
-                "useApifyProxy": True,
-                "apifyProxyGroups": ["RESIDENTIAL"]
+                "useApifyProxy": True
             }
         }
 
@@ -440,12 +438,10 @@ if __name__ == "__main__":
         prepared_records.append(parcel)
         passed_count += 1
 
-    # Attempt Apify unmasking for leads missing a valid phone contact
     unmasked_phones = {}
     if needs_unmask_batch:
         unmasked_phones = apify_bulk_skip_trace(needs_unmask_batch)
 
-    # Build final KV dispatch queue
     dispatch_queue = []
     for parcel in prepared_records:
         cid = parcel["record_id"]
@@ -470,7 +466,6 @@ if __name__ == "__main__":
             "status": "PENDING_REVIEW" if STAGING_MODE else "READY_FOR_DISPATCH"
         })
 
-    # Chunked Dispatch to Cloudflare Worker (25 records per POST payload)
     if dispatch_queue:
         logging.info(f"\n🚀 Dispatching {len(dispatch_queue)} record(s) to Cloudflare KV in chunks...")
         endpoint = f"{WORKER_URL.rstrip('/')}/api/inbound-lead-hook"

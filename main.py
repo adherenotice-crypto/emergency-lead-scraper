@@ -62,20 +62,11 @@ def generate_deterministic_case_id(apn, address):
 def validate_lead_record(record):
     address = str(record.get("address") or "").strip().upper()
     apn = str(record.get("apn") or "").strip().upper()
-    owner = str(record.get("owner_name") or "").strip().upper()
-    phone = str(record.get("phone") or "").strip().upper()
 
     if not address and not apn:
         return False, "BLOCKED: Missing both Property Address and APN"
     if address in ["N/A", "NONE", "RECORDED PARCEL LOCATION", ""] and apn in ["N/A", "NONE", "ON FILE", "PENDING VERIFICATION", ""]:
         return False, "BLOCKED: Placeholder location data"
-
-    junk_owners = ["N/A", "UNKNOWN", "RECORDED OWNER", "RECORDED PROPERTY OWNER / INTERESTED PARTY", ""]
-    if owner in junk_owners and (not phone or phone in ["PENDING UNMASK", "N/A", "NONE"]):
-        return False, "BLOCKED: Missing Owner Name and Phone Contact"
-
-    if REQUIRE_VERIFIED_PHONE_ONLY and (not phone or phone in ["PENDING UNMASK", "N/A", "NONE"]):
-        return False, "BLOCKED: No verified phone number attached"
 
     return True, "VALID"
 
@@ -160,12 +151,11 @@ def apify_bulk_skip_trace(lead_batch):
             continue
 
         start_endpoint = f"https://api.apify.com/v2/acts/memo23~fastpeoplesearch-scraper/runs?token={APIFY_TOKEN}"
+        
+        # Clean native payload without proxy overrides
         payload = {
             "searchQueries": search_queries,
-            "maxResults": 1,
-            "proxyConfiguration": {
-                "useApifyProxy": True
-            }
+            "maxResults": 1
         }
 
         try:

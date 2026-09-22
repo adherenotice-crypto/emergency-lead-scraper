@@ -8,7 +8,6 @@ import pandas as pd
 import pdfplumber
 import logging
 
-# Set up clean logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # =====================================================================
@@ -18,24 +17,16 @@ WORKER_URL = os.getenv("WORKER_URL") or "https://emergencyaudit.com"
 MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY") or "EmergencyAudit_Master_Key_2027!"
 APIFY_TOKEN = os.getenv("APIFY_TOKEN")
 
-# PRODUCTION LEAD CAP (Set to None for unlimited production volume)
 MAX_TEST_LEADS = None
-
-# SYSTEM CONTROLS & SAFETY FLAGS
 PAUSE_PIPELINE = (os.getenv("PAUSE_PIPELINE") or "false").lower() == "true"
 DRY_RUN = (os.getenv("DRY_RUN") or "false").lower() in ["true", "1", "yes"]
 STAGING_MODE = (os.getenv("STAGING_MODE") or "false").lower() == "true"
-REQUIRE_VERIFIED_PHONE_ONLY = (os.getenv("REQUIRE_VERIFIED_PHONE_ONLY") or "false").lower() == "true"
 
 
 # =====================================================================
-# 2. ENTITY DETECTOR & DEDUP IDENTIFIER GENERATOR
+# 2. ENTITY DETECTOR & CASE ID GENERATOR
 # =====================================================================
-ENTITY_KEYWORDS = [
-    "LLC", "INC", "CORP", "CORPORATION", "HOLDINGS", "PROPERTIES",
-    "INVESTMENTS", "LTD", "LP", "GROUP", "PARTNERS", "REALTY", "COMPANY", "CO"
-]
-
+ENTITY_KEYWORDS = ["LLC", "INC", "CORP", "CORPORATION", "HOLDINGS", "PROPERTIES", "INVESTMENTS", "LTD", "LP", "GROUP", "PARTNERS", "REALTY", "COMPANY", "CO"]
 TRUST_KEYWORDS = ["TRUST", "TRUSTEE", "FAMILY TRUST", "REVOCABLE", "LIVING TRUST", "ESTATE"]
 
 def classify_owner_type(owner_name):
@@ -46,38 +37,30 @@ def classify_owner_type(owner_name):
         return "CORPORATE_ENTITY"
     return "INDIVIDUAL"
 
-
 def generate_deterministic_case_id(apn, address):
     clean_apn = re.sub(r"\D", "", str(apn))
     if clean_apn and clean_apn != "PENDINGVERIFICATION" and len(clean_apn) >= 5:
         return f"AUD-APN-{clean_apn}"
-    
     clean_addr = re.sub(r"[^\w]", "", str(address)).upper()
     if clean_addr and clean_addr != "RECORDEDPARCELLOCATION":
         return f"AUD-{clean_addr[:12]}"
-        
     return f"AUD-REF-{int(time.time())}"
-
 
 def validate_lead_record(record):
     address = str(record.get("address") or "").strip().upper()
     apn = str(record.get("apn") or "").strip().upper()
-
     if not address and not apn:
         return False, "BLOCKED: Missing both Property Address and APN"
     if address in ["N/A", "NONE", "RECORDED PARCEL LOCATION", ""] and apn in ["N/A", "NONE", "ON FILE", "PENDING VERIFICATION", ""]:
         return False, "BLOCKED: Placeholder location data"
-
     return True, "VALID"
 
 
 # =====================================================================
-# 3. LOCAL CELL SCANNER & APIFY SKIP-TRACING ENGINE
+# 3. TRUEPEOPLESEARCH APIFY UNMASKING ENGINE
 # =====================================================================
 def extract_phone_from_raw_row(raw_dict):
-    """Deep scans every cell in a CSV/XLSX row for valid 10-digit US phone numbers."""
     phone_candidates = []
-    
     priority_keys = ["phone", "mobile", "contact", "ownerphone", "phone1", "cell", "telephone", "phone_number"]
     for k, v in raw_dict.items():
         if not k or not v:
@@ -111,8 +94,7 @@ def apify_bulk_skip_trace(lead_batch):
         logging.warning("⚠️ APIFY_TOKEN secret not found in environment. Skipping Apify unmasking.")
         return {}
 
-    logging.info(f"⚡ [APIFY ENGINE] Querying public registries for {len(lead_batch)} lead(s)...")
-
+    logging.info(f"⚡ [TRUEPEOPLESEARCH ENGINE] Querying public registries for {len(lead_batch)} lead(s)...")
     results_map = {}
     CHUNK_SIZE = 25
 
@@ -124,19 +106,14 @@ def apify_bulk_skip_trace(lead_batch):
         for item in chunk:
             raw_name = item.get("owner_name", "")
             owner_type = classify_owner_type(raw_name)
-
             if owner_type == "TRUST":
                 target_name = re.sub(r"\b(TRUST|TRUSTEE|TTEE|FAMILY|REVOCABLE|LIVING|DATED|\d+)\b", "", raw_name, flags=re.I).strip()
             else:
                 target_name = raw_name
 
             name_parts = target_name.strip().split()
-            if len(name_parts) >= 2:
-                first_name = name_parts[0]
-                last_name = " ".join(name_parts[1:])
-            else:
-                first_name = target_name
-                last_name = ""
+            first_name = name_parts[0] if len(name_parts) >= 1 else target_name
+            last_name = " ".join(name_parts[1:]) if len(name_parts) >= 2 else ""
 
             city = item.get("city", "Los Angeles")
             state = item.get("state", "CA")
@@ -150,18 +127,17 @@ def apify_bulk_skip_trace(lead_batch):
         if not search_queries:
             continue
 
-        start_endpoint = f"https://api.apify.com/v2/acts/memo23~fastpeoplesearch-scraper/runs?token={APIFY_TOKEN}"
-        
-        # Clean native payload without proxy overrides
+        # SWAPPED TO UNBLOCKED TRUEPEOPLESEARCH ACTOR
+        start_endpoint = f"https://api.apify.com/v2/acts/memo23~truepeoplesearch-people-search-scraper/runs?token={APIFY_TOKEN}"
         payload = {
             "searchQueries": search_queries,
             "maxResults": 1
         }
 
         try:
-            run_res = requests.post(start_endpoint, json=payload, timeout=30)
+            run_res = requests.post(start_endpoint, json=payload, timeout=20)
             if run_res.status_code not in [200, 201]:
-                logging.error(f"❌ Apify Start Run Error [{run_res.status_code}]: {run_res.text}")
+                logging.warning(f"⚠️ Start Run Bypassed [{run_res.status_code}]")
                 continue
 
             run_data = run_res.json().get("data", {})
@@ -171,47 +147,42 @@ def apify_bulk_skip_trace(lead_batch):
             logging.info(f"⏳ Apify Run [{run_id}] active. Polling status...")
 
             status_endpoint = f"https://api.apify.com/v2/actor-runs/{run_id}?token={APIFY_TOKEN}"
-            for _ in range(36):
-                time.sleep(5)
-                poll_res = requests.get(status_endpoint, timeout=15)
+            for _ in range(12):
+                time.sleep(4)
+                poll_res = requests.get(status_endpoint, timeout=10)
                 if poll_res.status_code == 200:
-                    status = poll_res.json().get("data", {}).get("status")
+                    poll_data = poll_res.json().get("data", {})
+                    status = poll_data.get("status")
                     if status == "SUCCEEDED":
                         break
                     elif status in ["FAILED", "ABORTED", "TIMED-OUT"]:
-                        logging.error(f"❌ Apify Run [{run_id}] ended with status: {status}")
+                        logging.warning(f"⚠️ Apify Run [{run_id}] status: {status}")
                         break
 
             dataset_endpoint = f"https://api.apify.com/v2/datasets/{dataset_id}/items?token={APIFY_TOKEN}"
-            items_res = requests.get(dataset_endpoint, timeout=30)
-            
+            items_res = requests.get(dataset_endpoint, timeout=15)
             if items_res.status_code == 200:
                 extracted_data = items_res.json()
-                if extracted_data and len(extracted_data) > 0:
+                if isinstance(extracted_data, list) and len(extracted_data) > 0:
                     for record in extracted_data:
                         phone = extract_phone_from_raw_row(record)
                         if not phone:
                             continue
-
                         rec_fn = re.sub(r"[^\w]", "", str(record.get("firstName") or record.get("first_name") or "")).upper()
                         rec_ln = re.sub(r"[^\w]", "", str(record.get("lastName") or record.get("last_name") or "")).upper()
                         match_key = f"{rec_fn}_{rec_ln}"
-
                         citation_id = lookup_map.get(match_key)
                         if citation_id:
                             results_map[citation_id] = phone
-                else:
-                    logging.warning(f"⚠️ Apify Run [{run_id}] returned 0 dataset items.")
-
         except Exception as e:
-            logging.error(f"⚠️ Apify Execution Exception: {e}")
+            logging.warning(f"⚠️ Apify Engine Exception Handled: {e}")
 
-    logging.info(f"✅ [APIFY ENGINE] Verified {len(results_map)} authentic phone number(s)!")
+    logging.info(f"✅ Unmasking complete. Extracted {len(results_map)} live number(s).")
     return results_map
 
 
 # =====================================================================
-# 4. DATA INGESTION & FILE PARSING ENGINE
+# 4. DATA INGESTION ENGINE
 # =====================================================================
 def normalize_lead_dict(raw_dict):
     norm = {}
@@ -220,77 +191,18 @@ def normalize_lead_dict(raw_dict):
             clean_k = re.sub(r'[^a-z0-9]', '', str(k).lower())
             norm[clean_k] = str(v).strip()
 
-    apn_val = (
-        norm.get("apn") or norm.get("parcelid") or norm.get("pin")
-        or norm.get("parcel") or norm.get("parcelnumber") or "PENDING VERIFICATION"
-    )
-
-    addr_val = (
-        norm.get("address") or norm.get("propertyaddress") or norm.get("siteaddress")
-        or norm.get("location") or norm.get("streetaddress") or norm.get("propaddress")
-        or "Recorded Parcel Location"
-    )
-
+    apn_val = norm.get("apn") or norm.get("parcelid") or norm.get("pin") or norm.get("parcel") or "PENDING VERIFICATION"
+    addr_val = norm.get("address") or norm.get("propertyaddress") or norm.get("siteaddress") or "Recorded Parcel Location"
     city_val = norm.get("city") or norm.get("propertycity") or "Los Angeles"
     state_val = norm.get("state") or norm.get("propertystate") or "CA"
-    zip_val = norm.get("zip") or norm.get("zipcode") or norm.get("propertyzip") or "90012"
 
-    owner_val = (
-        norm.get("owner1fullname")
-        or norm.get("ownerfullname")
-        or norm.get("ownername")
-        or norm.get("owner1")
-        or norm.get("owner")
-        or norm.get("owner1companyname")
-        or norm.get("companyname")
-        or norm.get("taxpayername")
-    )
+    fname = norm.get("owner1firstname") or norm.get("ownerfirstname") or ""
+    lname = norm.get("owner1lastname") or norm.get("ownerlastname") or ""
+    owner_val = f"{fname} {lname}".strip() or norm.get("ownerfullname") or norm.get("ownername") or norm.get("owner1") or "RECORDED OWNER"
 
-    if not owner_val:
-        fname = norm.get("owner1firstname") or norm.get("ownerfirstname") or norm.get("firstname") or ""
-        lname = norm.get("owner1lastname") or norm.get("ownerlastname") or norm.get("lastname") or ""
-        combined = f"{fname} {lname}".strip()
-        if combined:
-            owner_val = combined
-
-    if not owner_val:
-        for k, v in norm.items():
-            if "owner" in k and v and v.upper() not in ["N/A", "NONE", "UNKNOWN", "NULL", ""]:
-                owner_val = v
-                break
-
-    if not owner_val:
-        owner_val = "RECORDED OWNER"
-
-    citation = (
-        norm.get("recordid")
-        or norm.get("citationid")
-        or norm.get("caseid")
-        or norm.get("noticeno")
-        or generate_deterministic_case_id(apn_val, addr_val)
-    )
-
-    amount = (
-        norm.get("defaultamount")
-        or norm.get("amountlogged")
-        or norm.get("amount")
-        or norm.get("surplus")
-        or norm.get("default")
-        or norm.get("cureamount")
-        or norm.get("estequity")
-        or "$35,420.00 Recorded"
-    )
-
-    prop_type = (
-        norm.get("propertytype")
-        or norm.get("propertyuse")
-        or norm.get("use")
-        or norm.get("type")
-        or "Single Family / Commercial"
-    )
-
+    citation = norm.get("recordid") or norm.get("caseid") or generate_deterministic_case_id(apn_val, addr_val)
+    amount = norm.get("defaultamount") or norm.get("amountlogged") or "$35,420.00 Recorded"
     phone_val = extract_phone_from_raw_row(raw_dict) or "PENDING UNMASK"
-    email_val = norm.get("email") or norm.get("owneremail") or "N/A"
 
     return {
         "record_id": citation,
@@ -299,130 +211,77 @@ def normalize_lead_dict(raw_dict):
         "address": addr_val,
         "city": city_val,
         "state": state_val,
-        "zip": zip_val,
+        "zip": norm.get("zip") or "90012",
         "apn": apn_val,
         "category": norm.get("category") or "PRE-FORECLOSURE / REINSTATEMENT",
         "default_amount": amount,
-        "amount_logged": amount,
-        "property_type": prop_type,
-        "property_use": prop_type,
-        "violation": norm.get("violation") or norm.get("description") or "A statutory Notice of Default (NOD) has been logged in CA public records.",
+        "property_type": norm.get("propertytype") or "Single Family / Commercial",
+        "violation": "A statutory Notice of Default (NOD) has been logged in CA public records.",
         "phone": phone_val,
-        "email": email_val
+        "email": norm.get("email") or "N/A"
     }
-
 
 def parse_any_file(file_path):
     ext = os.path.splitext(file_path)[1].lower()
     raw_records = []
-
     try:
         if ext == ".csv":
             with open(file_path, mode="r", encoding="utf-8-sig") as f:
                 raw_records = list(csv.DictReader(f))
-
         elif ext in [".xlsx", ".xls"]:
             df = pd.read_excel(file_path).fillna("")
             raw_records = df.to_dict(orient="records")
-
         elif ext == ".json":
             with open(file_path, mode="r", encoding="utf-8") as f:
                 data = json.load(f)
                 raw_records = data if isinstance(data, list) else [data]
-
-        elif ext == ".pdf":
-            with pdfplumber.open(file_path) as pdf:
-                for page in pdf.pages:
-                    table = page.extract_table()
-                    if table and len(table) > 1:
-                        headers = [str(h).strip().lower().replace(" ", "_") for h in table[0] if h]
-                        for row in table[1:]:
-                            if len(row) == len(headers):
-                                raw_records.append(dict(zip(headers, row)))
-
     except Exception as e:
         logging.error(f"❌ Error reading file {file_path}: {e}")
         return []
-
     return [normalize_lead_dict(rec) for rec in raw_records if rec]
-
 
 def load_all_lead_datasets():
     all_leads = []
-    valid_exts = (".csv", ".xlsx", ".xls", ".json", ".pdf")
-
+    valid_exts = (".csv", ".xlsx", ".xls", ".json")
     root_files = [f for f in os.listdir(".") if f.lower().endswith(valid_exts) and not f.startswith("temp_")]
     for f in root_files:
         logging.info(f"📁 Processing repository dataset: {f}")
         all_leads.extend(parse_any_file(f))
-
-    data_dir = "./data"
-    if os.path.exists(data_dir):
-        data_files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.lower().endswith(valid_exts)]
-        for f in data_files:
-            logging.info(f"📂 Processing /data folder dataset: {f}")
-            all_leads.extend(parse_any_file(f))
-
     return all_leads
 
 
-def get_staging_fallback_leads():
-    return [
-        normalize_lead_dict({
-            "apn": "2241-018-012",
-            "owner_name": "WEST COAST ASSET HOLDINGS LLC",
-            "address": "5635 Calhoun Ave",
-            "city": "Van Nuys",
-            "state": "CA",
-            "zip": "91401",
-            "default_amount": "$48,250.00 Recorded NOD",
-            "category": "PRE-FORECLOSURE / REINSTATEMENT",
-            "violation": "LA County Notice of Default (NOD) logged. High Equity (87%)."
-        })
-    ]
-
-
 # =====================================================================
-# 5. MAIN EXECUTION LOOP (HYBRID UNMASK & CHUNKED KV DISPATCH)
+# 5. MAIN EXECUTION LOOP (CHUNKED DISPATCH TO CLOUDFLARE KV)
 # =====================================================================
 if __name__ == "__main__":
     logging.info("🚀 Universal Ingress Engine Active. Pipeline in PRODUCTION MODE.")
-
     real_leads = load_all_lead_datasets()
-    if not real_leads:
-        logging.warning("⚠️ No live datasets retrieved. Activating Staging Fallback.")
-        real_leads = get_staging_fallback_leads()
-
     logging.info(f"\n📥 Total Aggregated Feed: {len(real_leads)} record(s). Processing...\n")
     
     passed_count = 0
-    blocked_count = 0
     seen_identifiers = set()
     needs_unmask_batch = []
     prepared_records = []
 
-    for idx, parcel in enumerate(real_leads, 1):
+    for parcel in real_leads:
         if MAX_TEST_LEADS and passed_count >= MAX_TEST_LEADS:
             break
-
         apn = parcel.get("apn")
         addr = parcel.get("address")
         dedup_key = apn if (apn and apn != "PENDING VERIFICATION") else addr
-
         if dedup_key in seen_identifiers:
             continue
         seen_identifiers.add(dedup_key)
 
-        is_valid, reason = validate_lead_record(parcel)
+        is_valid, _ = validate_lead_record(parcel)
         if not is_valid:
-            blocked_count += 1
             continue
 
-        citation_id = parcel.get("record_id") or parcel.get("citation_id") or generate_deterministic_case_id(apn, addr)
-        parcel["record_id"] = citation_id
+        cid = parcel.get("record_id") or generate_deterministic_case_id(apn, addr)
+        parcel["record_id"] = cid
 
         existing_phone = parcel.get("phone")
-        if not existing_phone or existing_phone in ["PENDING UNMASK", "Unmasked Upon Purchase", "+14537422249", "+13333333333"]:
+        if not existing_phone or existing_phone in ["PENDING UNMASK", "Unmasked Upon Purchase"]:
             needs_unmask_batch.append(parcel)
         
         prepared_records.append(parcel)
@@ -436,8 +295,7 @@ if __name__ == "__main__":
     for parcel in prepared_records:
         cid = parcel["record_id"]
         phone = parcel.get("phone")
-
-        if not phone or phone in ["PENDING UNMASK", "Unmasked Upon Purchase", "+14537422249", "+13333333333"]:
+        if not phone or phone in ["PENDING UNMASK", "Unmasked Upon Purchase"]:
             phone = unmasked_phones.get(cid, "PENDING UNMASK")
 
         dispatch_queue.append({
@@ -452,24 +310,19 @@ if __name__ == "__main__":
             "category": parcel.get("category", "PRE-FORECLOSURE / REINSTATEMENT"),
             "default_amount": parcel.get("default_amount") or "$35,420.00 Recorded",
             "property_type": parcel.get("property_type") or "Single Family / Commercial",
-            "violation": parcel.get("violation") or "A statutory Notice of Default (NOD) has been logged in LA County public records.",
+            "violation": "A statutory Notice of Default (NOD) has been logged in LA County public records.",
             "status": "PENDING_REVIEW" if STAGING_MODE else "READY_FOR_DISPATCH"
         })
 
     if dispatch_queue:
         logging.info(f"\n🚀 Dispatching {len(dispatch_queue)} record(s) to Cloudflare KV in chunks...")
         endpoint = f"{WORKER_URL.rstrip('/')}/api/inbound-lead-hook"
-        headers = {
-            "Content-Type": "application/json",
-            "X-Emergency-Key": MASTER_ADMIN_KEY
-        }
+        headers = {"Content-Type": "application/json", "X-Emergency-Key": MASTER_ADMIN_KEY}
 
         POST_CHUNK_SIZE = 25
         successful_dispatches = 0
-
         for j in range(0, len(dispatch_queue), POST_CHUNK_SIZE):
             post_chunk = dispatch_queue[j:j + POST_CHUNK_SIZE]
-            
             if DRY_RUN:
                 logging.info(f"🧪 [DRY RUN] Would post chunk of {len(post_chunk)} items")
             else:
@@ -481,8 +334,6 @@ if __name__ == "__main__":
                     else:
                         logging.error(f"❌ Worker Error [{res.status_code}]: {res.text}")
                 except Exception as e:
-                    logging.error(f"⚠️ Dispatch Chunk Exception: {e}")
+                    logging.error(f"⚠️ Dispatch Exception: {e}")
 
         logging.info(f"\n🎉 Dispatch Completed! {successful_dispatches}/{len(dispatch_queue)} records populated on dashboard.")
-
-    logging.info(f"\n📊 Batch Execution Summary: {passed_count} Processed | {len(dispatch_queue)} Dispatched | {blocked_count} Blocked")

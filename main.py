@@ -81,61 +81,54 @@ def validate_lead_record(record):
 
 
 # =====================================================================
-# 3. AUTHENTIC APIFY SKIP-TRACING ENGINE (REAL NUMBERS ONLY)
+# 3. LOCAL CELL SCANNER & APIFY SKIP-TRACING ENGINE
 # =====================================================================
-def clean_url_key(url_str):
-    if not url_str:
-        return ""
-    return re.sub(r"^https?://(www\.)?", "", str(url_str)).rstrip("/").lower()
+def extract_phone_from_raw_row(raw_dict):
+    """Scans all cells in a record for existing valid 10-digit US phone numbers."""
+    phone_candidates = []
+    
+    priority_keys = ["phone", "mobile", "contact", "ownerphone", "phone1", "cell", "telephone", "phone_number"]
+    for k, v in raw_dict.items():
+        if not k or not v:
+            continue
+        clean_k = str(k).lower().replace("_", "").replace(" ", "")
+        if any(pk in clean_k for pk in priority_keys):
+            matches = re.findall(r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b", str(v))
+            for m in matches:
+                digits = re.sub(r"\D", "", m)
+                if len(digits) == 10 and not digits.startswith(("800", "888", "877", "866", "900", "000")):
+                    return f"+1{digits}"
+                elif len(digits) == 11 and digits.startswith("1"):
+                    return f"+{digits}"
 
+    for k, v in raw_dict.items():
+        if not v:
+            continue
+        matches = re.findall(r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b", str(v))
+        for m in matches:
+            digits = re.sub(r"\D", "", m)
+            if len(digits) == 10 and not digits.startswith(("800", "888", "877", "866", "900", "000")):
+                phone_candidates.append(f"+1{digits}")
+            elif len(digits) == 11 and digits.startswith("1"):
+                phone_candidates.append(f"+{digits}")
 
-def extract_phone_from_record(record):
-    """Extracts authentic phone numbers from Apify JSON payload."""
-    candidate_keys = ["Phone-1", "primaryPhone", "phone", "mobilePhone", "Phone", "telephone", "phone_number", "contact_phone"]
-    for k in candidate_keys:
-        val = record.get(k)
-        if val:
-            clean_p = re.sub(r"\D", "", str(val))
-            if len(clean_p) == 10 and not clean_p.startswith(("800", "888", "877", "866", "900", "000")):
-                return f"+1{clean_p}"
-            elif len(clean_p) == 11 and clean_p.startswith("1"):
-                return f"+{clean_p}"
-
-    phones_obj = record.get("phones") or record.get("phoneNumbers") or record.get("allPhones") or record.get("numbers")
-    if phones_obj and isinstance(phones_obj, list):
-        for item in phones_obj:
-            p_val = item.get("number") if isinstance(item, dict) else str(item)
-            clean_p = re.sub(r"\D", "", str(p_val))
-            if len(clean_p) == 10 and not clean_p.startswith(("800", "888", "877", "866", "900", "000")):
-                return f"+1{clean_p}"
-            elif len(clean_p) == 11 and clean_p.startswith("1"):
-                return f"+{clean_p}"
-
-    raw_str = json.dumps(record)
-    matches = re.findall(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}", raw_str)
-    for m in matches:
-        clean_p = re.sub(r"\D", "", m)
-        if len(clean_p) == 10 and not clean_p.startswith(("800", "888", "877", "866", "900", "000")):
-            return f"+1{clean_p}"
-
-    return None
+    return phone_candidates[0] if phone_candidates else None
 
 
 def apify_bulk_skip_trace(lead_batch):
     if not APIFY_TOKEN:
-        logging.warning("⚠️ APIFY_TOKEN secret not found in environment. Skipping unmasking.")
+        logging.warning("⚠️ APIFY_TOKEN secret not found in environment. Skipping Apify unmasking.")
         return {}
 
-    logging.info(f"⚡ [APIFY ENGINE] Querying live public registries for {len(lead_batch)} lead(s)...")
+    logging.info(f"⚡ [APIFY ENGINE] Querying public registries for {len(lead_batch)} lead(s)...")
 
     results_map = {}
     CHUNK_SIZE = 25
 
     for i in range(0, len(lead_batch), CHUNK_SIZE):
         chunk = lead_batch[i:i + CHUNK_SIZE]
-        start_urls = []
+        search_queries = []
         lookup_map = {}
-        fallback_name_map = {}
 
         for item in chunk:
             raw_name = item.get("owner_name", "")
@@ -157,26 +150,20 @@ def apify_bulk_skip_trace(lead_batch):
             city = item.get("city", "Los Angeles")
             state = item.get("state", "CA")
 
-            clean_fn = re.sub(r"[^\w]", "", first_name).lower()
-            clean_ln = re.sub(r"[^\w]", "", last_name).lower()
-            clean_city = re.sub(r"[^\w]", "-", city).lower()
-            clean_state = re.sub(r"[^\w]", "", state).lower()
+            if first_name and last_name:
+                query_str = f"{first_name} {last_name}, {city}, {state}"
+                search_queries.append(query_str)
+                lookup_key = f"{first_name.upper()}_{last_name.upper()}"
+                lookup_map[lookup_key] = item.get("record_id")
 
-            if clean_fn and clean_ln:
-                target_url = f"https://www.fastpeoplesearch.com/name/{clean_fn}-{clean_ln}_{clean_city}-{clean_state}"
-                norm_key = clean_url_key(target_url)
-                
-                start_urls.append({"url": target_url})
-                lookup_map[norm_key] = item.get("record_id")
-                fallback_name_map[f"{clean_fn}_{clean_ln}"] = item.get("record_id")
-
-        if not start_urls:
+        if not search_queries:
             continue
 
         start_endpoint = f"https://api.apify.com/v2/acts/memo23~fastpeoplesearch-scraper/runs?token={APIFY_TOKEN}"
         payload = {
-            "startUrls": start_urls,
-            "maxItems": len(start_urls),
+            "searchQueries": search_queries,
+            "queries": search_queries,
+            "maxResults": 1,
             "proxyConfiguration": {
                 "useApifyProxy": True,
                 "apifyProxyGroups": ["RESIDENTIAL"]
@@ -213,27 +200,16 @@ def apify_bulk_skip_trace(lead_batch):
             if items_res.status_code == 200:
                 extracted_data = items_res.json()
                 if extracted_data and len(extracted_data) > 0:
-                    logging.info(f"🔍 [APIFY RAW RECORD SAMPLE]:\n{json.dumps(extracted_data[0], indent=2)[:400]}")
-                    
                     for record in extracted_data:
-                        phone = extract_phone_from_record(record)
+                        phone = extract_phone_from_raw_row(record)
                         if not phone:
                             continue
 
-                        citation_id = None
-                        possible_urls = [record.get("url"), record.get("loadedUrl"), record.get("inputUrl"), record.get("searchUrl")]
-                        for u in possible_urls:
-                            if u:
-                                norm_u = clean_url_key(u)
-                                if norm_u in lookup_map:
-                                    citation_id = lookup_map[norm_u]
-                                    break
+                        rec_fn = re.sub(r"[^\w]", "", str(record.get("firstName") or record.get("first_name") or "")).upper()
+                        rec_ln = re.sub(r"[^\w]", "", str(record.get("lastName") or record.get("last_name") or "")).upper()
+                        match_key = f"{rec_fn}_{rec_ln}"
 
-                        if not citation_id:
-                            rec_fn = re.sub(r"[^\w]", "", str(record.get("firstName") or record.get("first_name") or "")).lower()
-                            rec_ln = re.sub(r"[^\w]", "", str(record.get("lastName") or record.get("last_name") or "")).lower()
-                            citation_id = fallback_name_map.get(f"{rec_fn}_{rec_ln}")
-
+                        citation_id = lookup_map.get(match_key)
                         if citation_id:
                             results_map[citation_id] = phone
                 else:
@@ -242,7 +218,7 @@ def apify_bulk_skip_trace(lead_batch):
         except Exception as e:
             logging.error(f"⚠️ Apify Execution Exception: {e}")
 
-    logging.info(f"✅ [UNMASKING COMPLETE] Verified {len(results_map)} authentic phone number(s)!")
+    logging.info(f"✅ [APIFY ENGINE] Verified {len(results_map)} authentic phone number(s)!")
     return results_map
 
 
@@ -325,8 +301,8 @@ def normalize_lead_dict(raw_dict):
         or "Single Family / Commercial"
     )
 
-    phone_val = norm.get("phone") or norm.get("phone1") or norm.get("mobile") or norm.get("ownerphone")
-    email_val = norm.get("email") or norm.get("owneremail")
+    phone_val = extract_phone_from_raw_row(raw_dict) or "PENDING UNMASK"
+    email_val = norm.get("email") or norm.get("owneremail") or "N/A"
 
     return {
         "record_id": citation,
@@ -419,7 +395,7 @@ def get_staging_fallback_leads():
 
 
 # =====================================================================
-# 5. MAIN EXECUTION LOOP (STRICT DISPATCH OF VERIFIED NUMBERS ONLY)
+# 5. MAIN EXECUTION LOOP (HYBRID UNMASK & CHUNKED KV DISPATCH)
 # =====================================================================
 if __name__ == "__main__":
     logging.info("🚀 Universal Ingress Engine Active. Pipeline in PRODUCTION MODE.")
@@ -464,23 +440,19 @@ if __name__ == "__main__":
         prepared_records.append(parcel)
         passed_count += 1
 
-    # Execute Apify Skip Tracing
+    # Attempt Apify unmasking for leads missing a valid phone contact
     unmasked_phones = {}
     if needs_unmask_batch:
         unmasked_phones = apify_bulk_skip_trace(needs_unmask_batch)
 
-    # STRICT QUEUE: ONLY LEADS WITH VERIFIED UNMASKED PHONES ARE DISPATCHED
+    # Build final KV dispatch queue
     dispatch_queue = []
     for parcel in prepared_records:
         cid = parcel["record_id"]
         phone = parcel.get("phone")
 
         if not phone or phone in ["PENDING UNMASK", "Unmasked Upon Purchase", "+14537422249", "+13333333333"]:
-            phone = unmasked_phones.get(cid)
-
-        # REJECT UNMASKED / DUMMY LEADS
-        if not phone or phone in ["PENDING UNMASK", "Unmasked Upon Purchase", "+14537422249", "+13333333333"]:
-            continue
+            phone = unmasked_phones.get(cid, "PENDING UNMASK")
 
         dispatch_queue.append({
             "record_id": cid,
@@ -498,9 +470,9 @@ if __name__ == "__main__":
             "status": "PENDING_REVIEW" if STAGING_MODE else "READY_FOR_DISPATCH"
         })
 
-    # Dispatch to Cloudflare KV in chunks
+    # Chunked Dispatch to Cloudflare Worker (25 records per POST payload)
     if dispatch_queue:
-        logging.info(f"\n🚀 Dispatching {len(dispatch_queue)} VERIFIED REAL PHONE record(s) to Cloudflare KV...")
+        logging.info(f"\n🚀 Dispatching {len(dispatch_queue)} record(s) to Cloudflare KV in chunks...")
         endpoint = f"{WORKER_URL.rstrip('/')}/api/inbound-lead-hook"
         headers = {
             "Content-Type": "application/json",
@@ -520,14 +492,12 @@ if __name__ == "__main__":
                     res = requests.post(endpoint, data=json.dumps(post_chunk), headers=headers, timeout=30)
                     if res.status_code == 200:
                         successful_dispatches += len(post_chunk)
-                        logging.info(f"✅ Batch [{j//POST_CHUNK_SIZE + 1}] Stored {len(post_chunk)} verified live records in KV.")
+                        logging.info(f"✅ Batch [{j//POST_CHUNK_SIZE + 1}] Stored {len(post_chunk)} records in KV.")
                     else:
                         logging.error(f"❌ Worker Error [{res.status_code}]: {res.text}")
                 except Exception as e:
                     logging.error(f"⚠️ Dispatch Chunk Exception: {e}")
 
-        logging.info(f"\n🎉 Dispatch Completed! {successful_dispatches}/{len(dispatch_queue)} authentic leads populated on dashboard.")
-    else:
-        logging.info("\nℹ️ No verified live phone numbers were extracted in this batch. Zero Cloudflare KV writes consumed.")
+        logging.info(f"\n🎉 Dispatch Completed! {successful_dispatches}/{len(dispatch_queue)} records populated on dashboard.")
 
-    logging.info(f"\n📊 Batch Execution Summary: {passed_count} Processed | {len(dispatch_queue)} Verified & Dispatched | {blocked_count} Blocked")
+    logging.info(f"\n📊 Batch Execution Summary: {passed_count} Processed | {len(dispatch_queue)} Dispatched | {blocked_count} Blocked")

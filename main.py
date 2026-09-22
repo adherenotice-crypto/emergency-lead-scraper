@@ -81,7 +81,7 @@ def validate_lead_record(record):
 
 
 # =====================================================================
-# 3. APIFY ASYNC SKIP-TRACING ENGINE (WITH RAW PAYLOAD INSPECTION)
+# 3. APIFY ASYNC ENGINE WITH RESIDENTIAL PROXY ROUTING
 # =====================================================================
 def clean_url_key(url_str):
     if not url_str:
@@ -125,7 +125,7 @@ def apify_bulk_skip_trace(lead_batch):
         logging.warning("⚠️ APIFY_TOKEN secret not found in environment. Skipping Apify unmasking.")
         return {}
 
-    logging.info(f"⚡ [APIFY ASYNC ENGINE] Submitting {len(lead_batch)} lead(s) for cloud unmasking...")
+    logging.info(f"⚡ [APIFY ASYNC ENGINE] Submitting {len(lead_batch)} lead(s) via Residential Proxies...")
 
     results_map = {}
     CHUNK_SIZE = 25
@@ -173,7 +173,16 @@ def apify_bulk_skip_trace(lead_batch):
             continue
 
         start_endpoint = f"https://api.apify.com/v2/acts/memo23~fastpeoplesearch-scraper/runs?token={APIFY_TOKEN}"
-        payload = {"startUrls": start_urls, "maxItems": len(start_urls)}
+        
+        # PAYLOAD WITH RESIDENTIAL PROXY ROUTING ENFORCED
+        payload = {
+            "startUrls": start_urls,
+            "maxItems": len(start_urls),
+            "proxyConfiguration": {
+                "useApifyProxy": True,
+                "apifyProxyGroups": ["RESIDENTIAL"]
+            }
+        }
 
         try:
             run_res = requests.post(start_endpoint, json=payload, timeout=30)
@@ -185,7 +194,7 @@ def apify_bulk_skip_trace(lead_batch):
             run_id = run_data.get("id")
             dataset_id = run_data.get("defaultDatasetId")
 
-            logging.info(f"⏳ Apify Run [{run_id}] started. Polling status...")
+            logging.info(f"⏳ Apify Run [{run_id}] started with Residential Proxies. Polling status...")
 
             status_endpoint = f"https://api.apify.com/v2/actor-runs/{run_id}?token={APIFY_TOKEN}"
             for _ in range(36):
@@ -206,6 +215,8 @@ def apify_bulk_skip_trace(lead_batch):
                 
                 if extracted_data and len(extracted_data) > 0:
                     logging.info(f"🔍 [DEBUG APIFY SAMPLE RECORD]:\n{json.dumps(extracted_data[0], indent=2)[:500]}")
+                else:
+                    logging.warning(f"⚠️ Apify Dataset for run [{run_id}] returned 0 items. Checking input/proxy config.")
 
                 for record in extracted_data:
                     phone = extract_phone_from_record(record)
@@ -495,7 +506,7 @@ if __name__ == "__main__":
             "status": "PENDING_REVIEW" if STAGING_MODE else "READY_FOR_DISPATCH"
         })
 
-    # Chunked Dispatch to Cloudflare Worker (25 records per POST to prevent 30s read timeouts)
+    # Chunked Dispatch to Cloudflare Worker (25 records per POST)
     if dispatch_queue:
         logging.info(f"\n🚀 Dispatching {len(dispatch_queue)} VERIFIED unmasked record(s) to Cloudflare KV in chunks...")
         endpoint = f"{WORKER_URL.rstrip('/')}/api/inbound-lead-hook"

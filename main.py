@@ -81,7 +81,7 @@ def validate_lead_record(record):
 
 
 # =====================================================================
-# 3. APIFY ASYNC SKIP-TRACING ENGINE (WITH NORMALIZED URL & DATA MATCHING)
+# 3. APIFY ASYNC SKIP-TRACING ENGINE (WITH RAW PAYLOAD INSPECTION)
 # =====================================================================
 def clean_url_key(url_str):
     if not url_str:
@@ -90,8 +90,7 @@ def clean_url_key(url_str):
 
 
 def extract_phone_from_record(record):
-    # Direct field checks
-    candidate_keys = ["Phone-1", "primaryPhone", "phone", "mobilePhone", "Phone", "telephone"]
+    candidate_keys = ["Phone-1", "primaryPhone", "phone", "mobilePhone", "Phone", "telephone", "phone_number", "contact_phone"]
     for k in candidate_keys:
         val = record.get(k)
         if val:
@@ -101,8 +100,7 @@ def extract_phone_from_record(record):
             elif len(clean_p) == 11 and clean_p.startswith("1"):
                 return f"+{clean_p}"
 
-    # Nested array/dict checks
-    phones_obj = record.get("phones") or record.get("phoneNumbers") or record.get("allPhones")
+    phones_obj = record.get("phones") or record.get("phoneNumbers") or record.get("allPhones") or record.get("numbers")
     if phones_obj and isinstance(phones_obj, list):
         for item in phones_obj:
             p_val = item.get("number") if isinstance(item, dict) else str(item)
@@ -112,7 +110,6 @@ def extract_phone_from_record(record):
             elif len(clean_p) == 11 and clean_p.startswith("1"):
                 return f"+{clean_p}"
 
-    # Fallback Regex Search over raw JSON string of record
     raw_str = json.dumps(record)
     matches = re.findall(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}", raw_str)
     for m in matches:
@@ -206,6 +203,10 @@ def apify_bulk_skip_trace(lead_batch):
             items_res = requests.get(dataset_endpoint, timeout=30)
             if items_res.status_code == 200:
                 extracted_data = items_res.json()
+                
+                if extracted_data and len(extracted_data) > 0:
+                    logging.info(f"🔍 [DEBUG APIFY SAMPLE RECORD]:\n{json.dumps(extracted_data[0], indent=2)[:500]}")
+
                 for record in extracted_data:
                     phone = extract_phone_from_record(record)
                     if not phone:
@@ -226,10 +227,9 @@ def apify_bulk_skip_trace(lead_batch):
                                 citation_id = lookup_map[norm_u]
                                 break
 
-                    # Fallback to name matching if URL matching missed due to redirect
                     if not citation_id:
-                        rec_fn = re.sub(r"[^\w]", "", str(record.get("firstName") or "")).lower()
-                        rec_ln = re.sub(r"[^\w]", "", str(record.get("lastName") or "")).lower()
+                        rec_fn = re.sub(r"[^\w]", "", str(record.get("firstName") or record.get("first_name") or "")).lower()
+                        rec_ln = re.sub(r"[^\w]", "", str(record.get("lastName") or record.get("last_name") or "")).lower()
                         citation_id = fallback_name_map.get(f"{rec_fn}_{rec_ln}")
 
                     if citation_id:
@@ -416,7 +416,7 @@ def get_staging_fallback_leads():
 
 
 # =====================================================================
-# 5. MAIN EXECUTION LOOP (BULK UNMASK & SINGLE-REQUEST DISPATCH)
+# 5. MAIN EXECUTION LOOP (CHUNKED DISPATCH TO CLOUDFLARE KV)
 # =====================================================================
 if __name__ == "__main__":
     logging.info("🚀 Universal Ingress Engine Active. Pipeline in PRODUCTION MODE.")
@@ -466,14 +466,18 @@ if __name__ == "__main__":
     if needs_unmask_batch:
         unmasked_phones = apify_bulk_skip_trace(needs_unmask_batch)
 
-    # Build final KV payload
+    # Build final KV payload — ONLY VERIFIED UNMASKED PHONES ARE QUEUED
     dispatch_queue = []
     for parcel in prepared_records:
         cid = parcel["record_id"]
         phone = parcel.get("phone")
 
         if not phone or phone in ["PENDING UNMASK", "Unmasked Upon Purchase", "+14537422249", "+13333333333"]:
-            phone = unmasked_phones.get(cid, "PENDING UNMASK")
+            phone = unmasked_phones.get(cid)
+
+        # SKIP IF PHONE REMAINS UNMASKED TO CONSERVE KV QUOTA
+        if not phone or phone in ["PENDING UNMASK", "Unmasked Upon Purchase", "+14537422249", "+13333333333"]:
+            continue
 
         dispatch_queue.append({
             "record_id": cid,
@@ -491,25 +495,36 @@ if __name__ == "__main__":
             "status": "PENDING_REVIEW" if STAGING_MODE else "READY_FOR_DISPATCH"
         })
 
-    # Dispatch Single Bulk Request to Cloudflare Worker
+    # Chunked Dispatch to Cloudflare Worker (25 records per POST to prevent 30s read timeouts)
     if dispatch_queue:
-        logging.info(f"\n🚀 Dispatching {len(dispatch_queue)} unmasked record(s) to Cloudflare KV...")
+        logging.info(f"\n🚀 Dispatching {len(dispatch_queue)} VERIFIED unmasked record(s) to Cloudflare KV in chunks...")
         endpoint = f"{WORKER_URL.rstrip('/')}/api/inbound-lead-hook"
         headers = {
             "Content-Type": "application/json",
             "X-Emergency-Key": MASTER_ADMIN_KEY
         }
 
-        if DRY_RUN:
-            logging.info(f"🧪 [DRY RUN] Would post bulk payload to Worker:\n{json.dumps(dispatch_queue[:2], indent=2)}")
-        else:
-            try:
-                res = requests.post(endpoint, data=json.dumps(dispatch_queue), headers=headers, timeout=30)
-                if res.status_code == 200:
-                    logging.info(f"✅ Bulk Dispatch Successful! All {len(dispatch_queue)} records stored in KV.")
-                else:
-                    logging.error(f"❌ Worker Error [{res.status_code}]: {res.text}")
-            except Exception as e:
-                logging.error(f"⚠️ Dispatch Exception: {e}")
+        POST_CHUNK_SIZE = 25
+        successful_dispatches = 0
 
-    logging.info(f"\n📊 Batch Execution Summary: {passed_count} Processed & Dispatched | {blocked_count} Blocked")
+        for j in range(0, len(dispatch_queue), POST_CHUNK_SIZE):
+            post_chunk = dispatch_queue[j:j + POST_CHUNK_SIZE]
+            
+            if DRY_RUN:
+                logging.info(f"🧪 [DRY RUN] Would post chunk of {len(post_chunk)} items")
+            else:
+                try:
+                    res = requests.post(endpoint, data=json.dumps(post_chunk), headers=headers, timeout=30)
+                    if res.status_code == 200:
+                        successful_dispatches += len(post_chunk)
+                        logging.info(f"✅ Batch [{j//POST_CHUNK_SIZE + 1}] Successfully stored {len(post_chunk)} records in KV.")
+                    else:
+                        logging.error(f"❌ Worker Error [{res.status_code}]: {res.text}")
+                except Exception as e:
+                    logging.error(f"⚠️ Dispatch Chunk Exception: {e}")
+
+        logging.info(f"\n🎉 Dispatch Completed! {successful_dispatches}/{len(dispatch_queue)} records stored in KV.")
+    else:
+        logging.info("\nℹ️ No new unmasked numbers found in this run. Skipping Cloudflare KV dispatch to conserve daily quota.")
+
+    logging.info(f"\n📊 Batch Execution Summary: {passed_count} Processed | {len(dispatch_queue)} Dispatched | {blocked_count} Blocked")

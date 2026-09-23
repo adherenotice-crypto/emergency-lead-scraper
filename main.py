@@ -97,6 +97,7 @@ def apify_bulk_skip_trace(lead_batch):
         chunk = lead_batch[i:i + CHUNK_SIZE]
         search_queries = []
         start_urls = []
+        structured_queries = []
         chunk_order_cids = []
         lookup_map = {}
         lookup_query_map = {}
@@ -127,6 +128,14 @@ def apify_bulk_skip_trace(lead_batch):
                 tps_url = f"https://www.truepeoplesearch.com/results?name={encoded_name}&citystatezip={encoded_loc}"
                 start_urls.append({"url": tps_url})
 
+                structured_queries.append({
+                    "name": f"{first_name} {last_name}",
+                    "cityStateZip": f"{city}, {state}",
+                    "location": f"{city}, {state}",
+                    "city": city,
+                    "state": state
+                })
+
                 lookup_key = f"{first_name.upper()}_{last_name.upper()}"
                 lookup_map[lookup_key] = cid
                 lookup_query_map[query_str.upper()] = cid
@@ -137,15 +146,19 @@ def apify_bulk_skip_trace(lead_batch):
         start_endpoint = f"https://api.apify.com/v2/acts/memo23~truepeoplesearch-people-search-scraper/runs?token={APIFY_TOKEN}"
         
         payload = {
-            "searchQueries": search_queries,
-            "queries": search_queries,
             "startUrls": start_urls,
+            "searchQueries": search_queries,
+            "queries": structured_queries,
+            "search": search_queries,
+            "proxyConfiguration": {
+                "useApifyProxy": True
+            },
             "maxResults": 1,
             "maxItems": len(search_queries)
         }
 
         try:
-            run_res = requests.post(start_endpoint, json=payload, timeout=20)
+            run_res = requests.post(start_endpoint, json=payload, timeout=25)
             if run_res.status_code not in [200, 201]:
                 logging.warning(f"⚠️ Start Run Bypassed [{run_res.status_code}]")
                 continue
@@ -157,7 +170,7 @@ def apify_bulk_skip_trace(lead_batch):
             logging.info(f"⏳ Apify Run [{run_id}] active. Polling status...")
 
             status_endpoint = f"https://api.apify.com/v2/actor-runs/{run_id}?token={APIFY_TOKEN}"
-            for _ in range(12):
+            for _ in range(16):
                 time.sleep(4)
                 poll_res = requests.get(status_endpoint, timeout=10)
                 if poll_res.status_code == 200:

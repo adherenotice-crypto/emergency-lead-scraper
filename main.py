@@ -1,4 +1,250 @@
-import os
+// =====================================================================
+// CLOUDFLARE WORKER: emergencyaudit.com
+// Bindings required in wragler.toml / Cloudflare Dashboard:
+// - KV Namespace: LEADS_KV
+// - Environment Variable: MASTER_ADMIN_KEY (Optional secret)
+// =====================================================================
+
+const MASTER_ADMIN_KEY = "EmergencyAudit_Master_Key_2027!";
+const SUPPORT_PHONE_RAW = "+14246108853";
+const SUPPORT_PHONE_DISPLAY = "(424) 610-8853";
+
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    // CORS Headers
+    const corsHeaders = {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, X-Emergency-Key",
+    };
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, { headers: corsHeaders });
+    }
+
+    // -----------------------------------------------------------------
+    // 1. INBOUND LEAD HOOK (POST /api/inbound-lead-hook)
+    // -----------------------------------------------------------------
+    if (path === "/api/inbound-lead-hook" && request.method === "POST") {
+      const authKey = request.headers.get("X-Emergency-Key");
+      const validKey = env.MASTER_ADMIN_KEY || MASTER_ADMIN_KEY;
+
+      if (authKey !== validKey) {
+        return new Response(JSON.stringify({ error: "Unauthorized access key" }), {
+          status: 401,
+          headers: { ...corsHeaders, "Content-Type": "application/json" }
+        });
+      }
+
+      try {
+        const payload = await request.json();
+        const records = Array.isArray(payload) ? payload : [payload];
+        
+        let storedCount = 0;
+        for (const item of records) {
+          const caseId = item.record_id || item.citation_id || item.caseId;
+          if (caseId) {
+            await env.LEADS_KV.put(caseId, JSON.stringify(item));
+            storedCount++;
+          }
+        }
+
+        return new Response(JSON.stringify({ success: true, stored: storedCount }), {
+          status: 200,
+          headers: { ...corsHeaders, "Content-Type": "application/json" }
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" }
+        });
+      }
+    }
+
+    // -----------------------------------------------------------------
+    // 2. PUBLIC CITATION RECORD PAGE (GET /c/:caseId)
+    // -----------------------------------------------------------------
+    if (path.startsWith("/c/")) {
+      const caseId = path.replace("/c/", "").trim();
+      if (!caseId) {
+        return new Response("Case ID required", { status: 400 });
+      }
+
+      let leadData = null;
+      if (env.LEADS_KV) {
+        const rawJson = await env.LEADS_KV.get(caseId);
+        if (rawJson) {
+          leadData = JSON.parse(rawJson);
+        }
+      }
+
+      // Fallback display formatting if record is not found in KV yet
+      const record = leadData || {
+        record_id: caseId,
+        apn: caseId.replace("AUD-APN-", "").replace("AUD-", ""),
+        owner_name: "RECORDED PUBLIC OWNER",
+        address: "RECORDED LA COUNTY LOCATION",
+        default_amount: "108828",
+        property_type: "Single Family / Commercial",
+        violation: "A statutory Notice of Default (NOD) has been logged in LA County public records."
+      };
+
+      const html = generatePublicPageHTML(record);
+      return new Response(html, {
+        status: 200,
+        headers: { "Content-Type": "text/html; charset=utf-8" }
+      });
+    }
+
+    // Default Fallback
+    return new Response("EmergencyAudit Network Active", { status: 200 });
+  }
+};
+
+
+// =====================================================================
+// HTML TEMPLATE GENERATOR WITH FUNCTIONAL CLICK-TO-CALL BUTTON
+// =====================================================================
+function generatePublicPageHTML(rec) {
+  const apn = rec.apn || "N/A";
+  const caseId = rec.record_id || rec.caseId || "N/A";
+  const address = rec.address || "N/A";
+  const owner = rec.owner_name || "N/A";
+  const amount = rec.default_amount || rec.amount_logged || "N/A";
+  const propType = rec.property_type || "Single Family / Commercial";
+  const violation = rec.violation || "A statutory Notice of Default (NOD) has been logged in LA County public records.";
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Public Record File #${caseId} | EmergencyAudit.com</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+    body { background-color: #0b0f19; color: #f3f4f6; display: flex; justify-content: center; padding: 20px; min-height: 100vh; }
+    .container { width: 100%; max-width: 680px; display: flex; flex-direction: column; gap: 16px; }
+    .card { background-color: #111827; border: 1px solid #1f2937; border-radius: 12px; padding: 20px; }
+    
+    .header-bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+    .file-id { font-size: 1.1rem; font-weight: 700; color: #facc15; }
+    .status-badge { background-color: #064e3b; color: #34d399; font-size: 0.75rem; font-weight: 700; padding: 4px 10px; border-radius: 20px; text-transform: uppercase; }
+    .status-title { font-size: 1.25rem; font-weight: 800; color: #fbbf24; margin-top: 4px; }
+    
+    .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 16px; }
+    .grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; margin-top: 12px; }
+    .field-box { background-color: #1f2937; padding: 12px; border-radius: 8px; border: 1px solid #374151; }
+    .field-label { font-size: 0.7rem; color: #9ca3af; font-weight: 700; text-transform: uppercase; }
+    .field-value { font-size: 1rem; font-weight: 700; color: #ffffff; margin-top: 4px; overflow-wrap: break-word; }
+    .highlight-red { color: #f87171; }
+
+    .summary-box { background-color: #131c2e; border: 1px solid #1e293b; border-radius: 8px; padding: 16px; margin-top: 12px; }
+    .summary-title { font-size: 0.75rem; color: #60a5fa; font-weight: 700; text-transform: uppercase; margin-bottom: 8px; }
+    .summary-text { font-size: 0.95rem; color: #d1d5db; line-height: 1.5; }
+    .options-list { margin-top: 12px; padding-left: 18px; font-size: 0.85rem; color: #9ca3af; line-height: 1.6; }
+
+    .action-card { background-color: #062016; border: 2px solid #059669; border-radius: 12px; padding: 24px; text-align: center; margin-top: 8px; }
+    .action-title { font-size: 1rem; font-weight: 800; color: #ffffff; text-transform: uppercase; letter-spacing: 0.5px; }
+    .action-sub { font-size: 0.85rem; color: #a7f3d0; margin-top: 4px; margin-bottom: 16px; }
+    
+    /* CLICK-TO-CALL BUTTON FIX */
+    .call-button-link { text-decoration: none; display: block; width: 100%; }
+    .call-button {
+      width: 100%;
+      background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+      color: #ffffff;
+      padding: 18px 24px;
+      font-size: 1.15rem;
+      font-weight: 800;
+      border: none;
+      border-radius: 10px;
+      cursor: pointer;
+      box-shadow: 0 4px 14px rgba(16, 185, 129, 0.4);
+      transition: transform 0.1s ease, box-shadow 0.1s ease;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+    }
+    .call-button:hover { transform: translateY(-1px); box-shadow: 0 6px 20px rgba(16, 185, 129, 0.6); }
+    .call-button:active { transform: translateY(1px); }
+
+    .footer { display: flex; justify-content: space-between; align-items: center; font-size: 0.75rem; color: #6b7280; padding: 0 4px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="card">
+      <div class="header-bar">
+        <span class="file-id">FILE : #${caseId}</span>
+        <span class="status-badge">• INDEX ACTIVE</span>
+      </div>
+      <div class="status-title">Status: RECORDED PUBLIC NOTICE ENTRY</div>
+
+      <div class="grid">
+        <div class="field-box">
+          <div class="field-label">PARCEL (APN)</div>
+          <div class="field-value">${apn}</div>
+        </div>
+        <div class="field-box">
+          <div class="field-label">CLASSIFICATION</div>
+          <div class="field-value">${propType}</div>
+        </div>
+        <div class="field-box">
+          <div class="field-label">BUILDING SQFT</div>
+          <div class="field-value">N/A</div>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="field-box">
+          <div class="field-label">RECORDED NOTICE AMOUNT</div>
+          <div class="field-value highlight-red">$${amount}</div>
+        </div>
+        <div class="field-box">
+          <div class="field-label">RECORDED OWNER</div>
+          <div class="field-value">${owner}</div>
+        </div>
+      </div>
+
+      <div class="field-box" style="margin-top: 12px;">
+        <div class="field-label">PARCEL LOCATION</div>
+        <div class="field-value">${address}</div>
+      </div>
+
+      <div class="summary-box">
+        <div class="summary-title">PUBLIC RECORD SUMMARY FOR PARCEL ${apn}</div>
+        <div class="summary-text">${violation}</div>
+        <ul class="options-list">
+          <li><strong>Private Bridge Funding:</strong> Direct connection to private lenders providing short-term property capital.</li>
+          <li><strong>Foreclosure Defense & Emergency Legal Stays:</strong> Connect with foreclosure defense attorneys and legal specialists for immediate sale stays or bankruptcy filings.</li>
+          <li><strong>Commercial & DSCR Refinancing:</strong> Connect with licensed mortgage brokers to evaluate property equity restructuring.</li>
+        </ul>
+      </div>
+
+      <!-- CLICK-TO-CALL ACTION BUTTON (OPERATIONAL) -->
+      <div class="action-card">
+        <div class="action-title">📞 CONNECT WITH A PROPERTY SPECIALIST</div>
+        <div class="action-sub">To speak with a licensed specialist regarding File #${caseId}:</div>
+        <a href="tel:${SUPPORT_PHONE_RAW}" class="call-button-link">
+          <button class="call-button">
+            📞 CALL SUPPORT LINE: ${SUPPORT_PHONE_DISPLAY}
+          </button>
+        </a>
+      </div>
+    </div>
+
+    <div class="footer">
+      <span>EmergencyAudit Network Portal</span>
+      <span>Learn more about our public record indexing and resolution process.</span>
+    </div>
+  </div>
+</body>
+</html>`;
+}import os
 import re
 import requests
 import time

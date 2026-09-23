@@ -39,11 +39,11 @@ def classify_owner_type(owner_name):
 def generate_deterministic_case_id(apn, address):
     clean_apn = re.sub(r"\D", "", str(apn))
     if clean_apn and clean_apn != "PENDINGVERIFICATION" and len(clean_apn) >= 5:
-        return f"AUD-APN-{clean_apn}"
+        return "AUD-APN-" + clean_apn
     clean_addr = re.sub(r"[^\w]", "", str(address)).upper()
     if clean_addr and clean_addr != "RECORDEDPARCELLOCATION":
-        return f"AUD-{clean_addr[:12]}"
-    return f"AUD-REF-{int(time.time())}"
+        return "AUD-" + clean_addr[:12]
+    return "AUD-REF-" + str(int(time.time()))
 
 def validate_lead_record(record):
     address = str(record.get("address") or "").strip().upper()
@@ -56,36 +56,31 @@ def validate_lead_record(record):
 
 
 # =====================================================================
-# 3. TRUEPEOPLESEARCH APIFY UNMASKING ENGINE
+# 3. REFINED TRUEPEOPLESEARCH APIFY UNMASKING ENGINE
 # =====================================================================
 def extract_phone_from_raw_row(raw_dict):
-    phone_candidates = []
-    priority_keys = ["phone", "mobile", "contact", "ownerphone", "phone1", "cell", "telephone", "phone_number"]
-    for k, v in raw_dict.items():
-        if not k or not v:
-            continue
-        clean_k = str(k).lower().replace("_", "").replace(" ", "")
-        if any(pk in clean_k for pk in priority_keys):
-            matches = re.findall(r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b", str(v))
+    if not isinstance(raw_dict, dict):
+        return None
+    found_phones = []
+
+    def search_obj(obj):
+        if isinstance(obj, str):
+            matches = re.findall(r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b", obj)
             for m in matches:
                 digits = re.sub(r"\D", "", m)
                 if len(digits) == 10 and not digits.startswith(("800", "888", "877", "866", "900", "000")):
-                    return f"+1{digits}"
+                    found_phones.append("+1" + digits)
                 elif len(digits) == 11 and digits.startswith("1"):
-                    return f"+{digits}"
+                    found_phones.append("+" + digits)
+        elif isinstance(obj, dict):
+            for k, v in obj.items():
+                search_obj(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                search_obj(item)
 
-    for k, v in raw_dict.items():
-        if not v:
-            continue
-        matches = re.findall(r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b", str(v))
-        for m in matches:
-            digits = re.sub(r"\D", "", m)
-            if len(digits) == 10 and not digits.startswith(("800", "888", "877", "866", "900", "000")):
-                phone_candidates.append(f"+1{digits}")
-            elif len(digits) == 11 and digits.startswith("1"):
-                phone_candidates.append(f"+{digits}")
-
-    return phone_candidates[0] if phone_candidates else None
+    search_obj(raw_dict)
+    return found_phones[0] if found_phones else None
 
 
 def apify_bulk_skip_trace(lead_batch):
@@ -101,6 +96,7 @@ def apify_bulk_skip_trace(lead_batch):
         chunk = lead_batch[i:i + CHUNK_SIZE]
         search_queries = []
         lookup_map = {}
+        lookup_query_map = {}
 
         for item in chunk:
             raw_name = item.get("owner_name", "")
@@ -120,8 +116,11 @@ def apify_bulk_skip_trace(lead_batch):
             if first_name and last_name:
                 query_str = f"{first_name} {last_name}, {city}, {state}"
                 search_queries.append(query_str)
+                cid = item.get("record_id")
+                
                 lookup_key = f"{first_name.upper()}_{last_name.upper()}"
-                lookup_map[lookup_key] = item.get("record_id")
+                lookup_map[lookup_key] = cid
+                lookup_query_map[query_str.upper()] = cid
 
         if not search_queries:
             continue
@@ -166,12 +165,31 @@ def apify_bulk_skip_trace(lead_batch):
                         phone = extract_phone_from_raw_row(record)
                         if not phone:
                             continue
-                        rec_fn = re.sub(r"[^\w]", "", str(record.get("firstName") or record.get("first_name") or "")).upper()
-                        rec_ln = re.sub(r"[^\w]", "", str(record.get("lastName") or record.get("last_name") or "")).upper()
-                        match_key = f"{rec_fn}_{rec_ln}"
-                        citation_id = lookup_map.get(match_key)
-                        if citation_id:
-                            results_map[citation_id] = phone
+
+                        # 1. Match by Search Query String
+                        sq = str(record.get("searchQuery") or record.get("query") or "").upper().strip()
+                        matched_cid = None
+                        for q_key, cid in lookup_query_map.items():
+                            if q_key in sq or sq in q_key:
+                                matched_cid = cid
+                                break
+
+                        # 2. Fallback Match by Name
+                        if not matched_cid:
+                            fn = record.get("firstName") or record.get("first_name") or ""
+                            ln = record.get("lastName") or record.get("last_name") or ""
+                            if not fn and not ln and record.get("name"):
+                                parts = str(record.get("name")).strip().split()
+                                fn = parts[0] if len(parts) >= 1 else ""
+                                ln = " ".join(parts[1:]) if len(parts) >= 2 else ""
+
+                            rec_fn = re.sub(r"[^\w]", "", str(fn)).upper()
+                            rec_ln = re.sub(r"[^\w]", "", str(ln)).upper()
+                            match_key = f"{rec_fn}_{rec_ln}"
+                            matched_cid = lookup_map.get(match_key)
+
+                        if matched_cid:
+                            results_map[matched_cid] = phone
         except Exception as e:
             logging.warning(f"⚠️ Apify Engine Exception Handled: {e}")
 
@@ -185,9 +203,11 @@ def apify_bulk_skip_trace(lead_batch):
 def normalize_lead_dict(raw_dict):
     norm = {}
     for k, v in raw_dict.items():
-        if k is not None and v is not None:
+        if k is not None and not (isinstance(v, float) and pd.isna(v)):
             clean_k = re.sub(r'[^a-z0-9]', '', str(k).lower())
-            norm[clean_k] = str(v).strip()
+            val_str = str(v).strip()
+            if val_str.lower() != 'nan':
+                norm[clean_k] = val_str
 
     apn_val = norm.get("apn") or norm.get("parcelid") or norm.get("pin") or norm.get("parcel") or "PENDING VERIFICATION"
     addr_val = norm.get("address") or norm.get("propertyaddress") or norm.get("siteaddress") or "Recorded Parcel Location"

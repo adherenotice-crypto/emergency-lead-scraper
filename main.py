@@ -1,6 +1,8 @@
 import os
 import re
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import time
 import json
 import csv
@@ -11,7 +13,7 @@ import urllib.parse
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # =====================================================================
-# 1. ENVIRONMENT CONFIGURATION & SYSTEM CONTROLS
+# 1. ENVIRONMENT CONFIGURATION & HTTP SESSION SETUP
 # =====================================================================
 WORKER_URL = os.getenv("WORKER_URL") or "https://emergencyaudit.com"
 MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY") or "EmergencyAudit_Master_Key_2027!"
@@ -21,6 +23,12 @@ MAX_TEST_LEADS = None
 PAUSE_PIPELINE = (os.getenv("PAUSE_PIPELINE") or "false").lower() == "true"
 DRY_RUN = (os.getenv("DRY_RUN") or "false").lower() in ["true", "1", "yes"]
 STAGING_MODE = (os.getenv("STAGING_MODE") or "false").lower() == "true"
+
+# Set up reusable HTTP session with exponential backoff retries
+session = requests.Session()
+retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+session.mount("https://", HTTPAdapter(max_retries=retries))
+session.mount("http://", HTTPAdapter(max_retries=retries))
 
 
 # =====================================================================
@@ -99,7 +107,6 @@ def apify_bulk_skip_trace(lead_batch):
         start_urls = []
         structured_queries = []
         chunk_order_cids = []
-        lookup_map = {}
         lookup_query_map = {}
 
         for item in chunk:
@@ -136,8 +143,6 @@ def apify_bulk_skip_trace(lead_batch):
                     "state": state
                 })
 
-                lookup_key = f"{first_name.upper()}_{last_name.upper()}"
-                lookup_map[lookup_key] = cid
                 lookup_query_map[query_str.upper()] = cid
 
         if not search_queries:
@@ -158,7 +163,7 @@ def apify_bulk_skip_trace(lead_batch):
         }
 
         try:
-            run_res = requests.post(start_endpoint, json=payload, timeout=25)
+            run_res = session.post(start_endpoint, json=payload, timeout=25)
             if run_res.status_code not in [200, 201]:
                 logging.warning(f"⚠️ Start Run Bypassed [{run_res.status_code}]")
                 continue
@@ -170,20 +175,26 @@ def apify_bulk_skip_trace(lead_batch):
             logging.info(f"⏳ Apify Run [{run_id}] active. Polling status...")
 
             status_endpoint = f"https://api.apify.com/v2/actor-runs/{run_id}?token={APIFY_TOKEN}"
-            for _ in range(16):
+            run_succeeded = False
+            for _ in range(12):  # Max 48 seconds poll time per chunk
                 time.sleep(4)
-                poll_res = requests.get(status_endpoint, timeout=10)
+                poll_res = session.get(status_endpoint, timeout=10)
                 if poll_res.status_code == 200:
                     poll_data = poll_res.json().get("data", {})
                     status = poll_data.get("status")
                     if status == "SUCCEEDED":
+                        run_succeeded = True
                         break
                     elif status in ["FAILED", "ABORTED", "TIMED-OUT"]:
                         logging.warning(f"⚠️ Apify Run [{run_id}] status: {status}")
                         break
 
+            if not run_succeeded:
+                logging.warning(f"⚠️ Apify Run [{run_id}] did not complete successfully. Skipping dataset fetch.")
+                continue
+
             dataset_endpoint = f"https://api.apify.com/v2/datasets/{dataset_id}/items?token={APIFY_TOKEN}"
-            items_res = requests.get(dataset_endpoint, timeout=15)
+            items_res = session.get(dataset_endpoint, timeout=15)
             if items_res.status_code == 200:
                 extracted_data = items_res.json()
                 logging.info(f"📊 Apify Dataset returned {len(extracted_data)} item(s) for Batch [{i//CHUNK_SIZE + 1}].")
@@ -195,7 +206,6 @@ def apify_bulk_skip_trace(lead_batch):
                             continue
 
                         matched_cid = None
-                        
                         sq = str(record.get("searchQuery") or record.get("query") or record.get("url") or "").upper().strip()
                         if sq:
                             for q_key, cid in lookup_query_map.items():
@@ -282,12 +292,22 @@ def parse_any_file(file_path):
     except Exception as e:
         logging.error(f"❌ Error reading file {file_path}: {e}")
         return []
-    return [normalize_lead_dict(rec) for rec in raw_records if rec]
+    return [normalize_lead_dict(rec) for rec in raw_records if isinstance(rec, dict)]
 
 def load_all_lead_datasets():
     all_leads = []
     valid_exts = (".csv", ".xlsx", ".xls", ".json")
-    root_files = [f for f in os.listdir(".") if f.lower().endswith(valid_exts) and not f.startswith("temp_")]
+    
+    # Exclude system and configuration files from lead parsing
+    ignored_files = {"package.json", "package-lock.json", "tsconfig.json", "metadata.json"}
+
+    root_files = [
+        f for f in os.listdir(".") 
+        if f.lower().endswith(valid_exts) 
+        and not f.startswith("temp_")
+        and f.lower() not in ignored_files
+    ]
+    
     for f in root_files:
         logging.info(f"📁 Processing repository dataset: {f}")
         all_leads.extend(parse_any_file(f))
@@ -298,6 +318,10 @@ def load_all_lead_datasets():
 # 5. MAIN EXECUTION LOOP (CHUNKED DISPATCH TO CLOUDFLARE KV)
 # =====================================================================
 if __name__ == "__main__":
+    if PAUSE_PIPELINE:
+        logging.info("⏸️ PAUSE_PIPELINE is set to true. Exiting execution cleanly.")
+        exit(0)
+
     logging.info("🚀 Universal Ingress Engine Active. Pipeline in PRODUCTION MODE.")
     real_leads = load_all_lead_datasets()
     logging.info(f"\n📥 Total Aggregated Feed: {len(real_leads)} record(s). Processing...\n")
@@ -371,7 +395,7 @@ if __name__ == "__main__":
                 logging.info(f"🧪 [DRY RUN] Would post chunk of {len(post_chunk)} items")
             else:
                 try:
-                    res = requests.post(endpoint, data=json.dumps(post_chunk), headers=headers, timeout=30)
+                    res = session.post(endpoint, data=json.dumps(post_chunk), headers=headers, timeout=30)
                     if res.status_code == 200:
                         successful_dispatches += len(post_chunk)
                         logging.info(f"✅ Batch [{j//POST_CHUNK_SIZE + 1}] Stored {len(post_chunk)} records in KV.")

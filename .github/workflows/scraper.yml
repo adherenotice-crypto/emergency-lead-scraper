@@ -8,6 +8,7 @@ on:
 jobs:
   scrub-and-dispatch:
     runs-on: ubuntu-latest
+    timeout-minutes: 15  # Prevents any step from hanging past 15 minutes
 
     steps:
       - name: Checkout Repository
@@ -22,7 +23,9 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements.txt ]; then 
+            pip install --default-timeout=60 --no-cache-dir -r requirements.txt
+          fi
 
       - name: Execute Scraper & Ingestion Pipeline
         env:
@@ -32,5 +35,6 @@ jobs:
           PAUSE_PIPELINE: "false"
           DRY_RUN: "false"
           STAGING_MODE: "false"
+          PYTHONUNBUFFERED: "1"
         run: |
           python main.py

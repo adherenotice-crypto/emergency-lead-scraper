@@ -24,12 +24,10 @@ PAUSE_PIPELINE = (os.getenv("PAUSE_PIPELINE") or "false").lower() == "true"
 DRY_RUN = (os.getenv("DRY_RUN") or "false").lower() in ["true", "1", "yes"]
 STAGING_MODE = (os.getenv("STAGING_MODE") or "false").lower() == "true"
 
-# Set up reusable HTTP session with exponential backoff retries
 session = requests.Session()
 retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
 session.mount("https://", HTTPAdapter(max_retries=retries))
 session.mount("http://", HTTPAdapter(max_retries=retries))
-
 
 # =====================================================================
 # 2. ENTITY DETECTOR & CASE ID GENERATOR
@@ -46,13 +44,13 @@ def classify_owner_type(owner_name):
     return "INDIVIDUAL"
 
 def generate_deterministic_case_id(apn, address):
-    clean_apn = re.sub(r"\D", "", str(apn))
-    if clean_apn and clean_apn != "PENDINGVERIFICATION" and len(clean_apn) >= 5:
-        return "AUD-APN-" + clean_apn
+    clean_apn = re.sub(r"[^\w]", "", str(apn)).upper()
+    if clean_apn and clean_apn not in ["PENDINGVERIFICATION", "NONE", "NA", ""] and len(clean_apn) >= 5:
+        return f"AUD-APN-{clean_apn}"
     clean_addr = re.sub(r"[^\w]", "", str(address)).upper()
-    if clean_addr and clean_addr != "RECORDEDPARCELLOCATION":
-        return "AUD-" + clean_addr[:12]
-    return "AUD-REF-" + str(int(time.time()))
+    if clean_addr and clean_addr not in ["RECORDEDPARCELLOCATION", "NONE", "NA", ""]:
+        return f"AUD-{clean_addr[:12]}"
+    return f"AUD-REF-{int(time.time())}"
 
 def validate_lead_record(record):
     address = str(record.get("address") or "").strip().upper()
@@ -62,7 +60,6 @@ def validate_lead_record(record):
     if address in ["N/A", "NONE", "RECORDED PARCEL LOCATION", ""] and apn in ["N/A", "NONE", "ON FILE", "PENDING VERIFICATION", ""]:
         return False, "BLOCKED: Placeholder location data"
     return True, "VALID"
-
 
 # =====================================================================
 # 3. REFINED TRUEPEOPLESEARCH APIFY UNMASKING ENGINE
@@ -91,7 +88,6 @@ def extract_phone_from_raw_row(raw_dict):
     search_obj(raw_dict)
     return found_phones[0] if found_phones else None
 
-
 def apify_bulk_skip_trace(lead_batch):
     if not APIFY_TOKEN:
         logging.warning("⚠️ APIFY_TOKEN secret not found in environment. Skipping Apify unmasking.")
@@ -103,24 +99,16 @@ def apify_bulk_skip_trace(lead_batch):
 
     for i in range(0, len(lead_batch), CHUNK_SIZE):
         chunk = lead_batch[i:i + CHUNK_SIZE]
-        search_queries = []
-        start_urls = []
-        structured_queries = []
-        chunk_order_cids = []
-        lookup_query_map = {}
+        search_queries, start_urls, structured_queries, chunk_order_cids, lookup_query_map = [], [], [], [], {}
 
         for item in chunk:
             raw_name = item.get("owner_name", "")
             owner_type = classify_owner_type(raw_name)
-            if owner_type == "TRUST":
-                target_name = re.sub(r"\b(TRUST|TRUSTEE|TTEE|FAMILY|REVOCABLE|LIVING|DATED|\d+)\b", "", raw_name, flags=re.I).strip()
-            else:
-                target_name = raw_name
+            target_name = re.sub(r"\b(TRUST|TRUSTEE|TTEE|FAMILY|REVOCABLE|LIVING|DATED|\d+)\b", "", raw_name, flags=re.I).strip() if owner_type == "TRUST" else raw_name
 
             name_parts = target_name.strip().split()
             first_name = name_parts[0] if len(name_parts) >= 1 else target_name
             last_name = " ".join(name_parts[1:]) if len(name_parts) >= 2 else ""
-
             city = item.get("city", "Los Angeles")
             state = item.get("state", "CA")
 
@@ -132,106 +120,63 @@ def apify_bulk_skip_trace(lead_batch):
                 
                 encoded_name = urllib.parse.quote(f"{first_name} {last_name}")
                 encoded_loc = urllib.parse.quote(f"{city}, {state}")
-                tps_url = f"https://www.truepeoplesearch.com/results?name={encoded_name}&citystatezip={encoded_loc}"
-                start_urls.append({"url": tps_url})
+                start_urls.append({"url": f"https://www.truepeoplesearch.com/results?name={encoded_name}&citystatezip={encoded_loc}"})
 
-                structured_queries.append({
-                    "name": f"{first_name} {last_name}",
-                    "cityStateZip": f"{city}, {state}",
-                    "location": f"{city}, {state}",
-                    "city": city,
-                    "state": state
-                })
-
+                structured_queries.append({"name": f"{first_name} {last_name}", "cityStateZip": f"{city}, {state}", "location": f"{city}, {state}", "city": city, "state": state})
                 lookup_query_map[query_str.upper()] = cid
 
         if not search_queries:
             continue
 
         start_endpoint = f"https://api.apify.com/v2/acts/memo23~truepeoplesearch-people-search-scraper/runs?token={APIFY_TOKEN}"
-        
-        payload = {
-            "startUrls": start_urls,
-            "searchQueries": search_queries,
-            "queries": structured_queries,
-            "search": search_queries,
-            "proxyConfiguration": {
-                "useApifyProxy": True
-            },
-            "maxResults": 1,
-            "maxItems": len(search_queries)
-        }
+        payload = {"startUrls": start_urls, "searchQueries": search_queries, "queries": structured_queries, "proxyConfiguration": {"useApifyProxy": True}, "maxResults": 1}
 
         try:
             run_res = session.post(start_endpoint, json=payload, timeout=25)
             if run_res.status_code not in [200, 201]:
-                logging.warning(f"⚠️ Start Run Bypassed [{run_res.status_code}]")
                 continue
 
             run_data = run_res.json().get("data", {})
-            run_id = run_data.get("id")
-            dataset_id = run_data.get("defaultDatasetId")
-
-            logging.info(f"⏳ Apify Run [{run_id}] active. Polling status...")
-
+            run_id, dataset_id = run_data.get("id"), run_data.get("defaultDatasetId")
             status_endpoint = f"https://api.apify.com/v2/actor-runs/{run_id}?token={APIFY_TOKEN}"
             run_succeeded = False
-            for _ in range(12):  # Max 48 seconds poll time per chunk
+
+            for _ in range(10):
                 time.sleep(4)
-                poll_res = session.get(status_endpoint, timeout=10)
-                if poll_res.status_code == 200:
-                    poll_data = poll_res.json().get("data", {})
-                    status = poll_data.get("status")
-                    if status == "SUCCEEDED":
-                        run_succeeded = True
-                        break
-                    elif status in ["FAILED", "ABORTED", "TIMED-OUT"]:
-                        logging.warning(f"⚠️ Apify Run [{run_id}] status: {status}")
-                        break
+                poll_res = session.get(status_endpoint, timeout=8)
+                if poll_res.status_code == 200 and poll_res.json().get("data", {}).get("status") == "SUCCEEDED":
+                    run_succeeded = True
+                    break
 
             if not run_succeeded:
-                logging.warning(f"⚠️ Apify Run [{run_id}] did not complete successfully. Skipping dataset fetch.")
                 continue
 
             dataset_endpoint = f"https://api.apify.com/v2/datasets/{dataset_id}/items?token={APIFY_TOKEN}"
             items_res = session.get(dataset_endpoint, timeout=15)
             if items_res.status_code == 200:
-                extracted_data = items_res.json()
-                logging.info(f"📊 Apify Dataset returned {len(extracted_data)} item(s) for Batch [{i//CHUNK_SIZE + 1}].")
-                
-                if isinstance(extracted_data, list) and len(extracted_data) > 0:
-                    for idx, record in enumerate(extracted_data):
-                        phone = extract_phone_from_raw_row(record)
-                        if not phone:
-                            continue
+                for idx, record in enumerate(items_res.json()):
+                    phone = extract_phone_from_raw_row(record)
+                    if not phone:
+                        continue
 
-                        matched_cid = None
-                        sq = str(record.get("searchQuery") or record.get("query") or record.get("url") or "").upper().strip()
-                        if sq:
-                            for q_key, cid in lookup_query_map.items():
-                                if q_key in sq or sq in q_key:
-                                    matched_cid = cid
-                                    break
+                    matched_cid = None
+                    sq = str(record.get("searchQuery") or record.get("query") or record.get("url") or "").upper().strip()
+                    if sq:
+                        for q_key, cid in lookup_query_map.items():
+                            if q_key in sq or sq in q_key:
+                                matched_cid = cid
+                                break
 
-                        if not matched_cid:
-                            name_str = str(record.get("name") or record.get("fullName") or "").upper()
-                            for q_key, cid in lookup_query_map.items():
-                                owner_name = q_key.split(",")[0].strip()
-                                if owner_name and owner_name in name_str:
-                                    matched_cid = cid
-                                    break
+                    if not matched_cid and idx < len(chunk_order_cids):
+                        matched_cid = chunk_order_cids[idx]
 
-                        if not matched_cid and idx < len(chunk_order_cids):
-                            matched_cid = chunk_order_cids[idx]
-
-                        if matched_cid:
-                            results_map[matched_cid] = phone
+                    if matched_cid:
+                        results_map[matched_cid] = phone
         except Exception as e:
             logging.warning(f"⚠️ Apify Engine Exception Handled: {e}")
 
     logging.info(f"✅ Unmasking complete. Extracted {len(results_map)} live number(s).")
     return results_map
-
 
 # =====================================================================
 # 4. DATA INGESTION ENGINE
@@ -297,8 +242,6 @@ def parse_any_file(file_path):
 def load_all_lead_datasets():
     all_leads = []
     valid_exts = (".csv", ".xlsx", ".xls", ".json")
-    
-    # Exclude system and configuration files from lead parsing
     ignored_files = {"package.json", "package-lock.json", "tsconfig.json", "metadata.json"}
 
     root_files = [
@@ -312,7 +255,6 @@ def load_all_lead_datasets():
         logging.info(f"📁 Processing repository dataset: {f}")
         all_leads.extend(parse_any_file(f))
     return all_leads
-
 
 # =====================================================================
 # 5. MAIN EXECUTION LOOP (CHUNKED DISPATCH TO CLOUDFLARE KV)
@@ -378,7 +320,7 @@ if __name__ == "__main__":
             "category": parcel.get("category", "PRE-FORECLOSURE / REINSTATEMENT"),
             "default_amount": parcel.get("default_amount") or "$35,420.00 Recorded",
             "property_type": parcel.get("property_type") or "Single Family / Commercial",
-            "violation": "A statutory Notice of Default (NOD) has been logged in LA County public records.",
+            "violation": "A statutory Notice of Default (NOD) has been logged in CA public records.",
             "status": "PENDING_REVIEW" if STAGING_MODE else "READY_FOR_DISPATCH"
         })
 
@@ -395,7 +337,7 @@ if __name__ == "__main__":
                 logging.info(f"🧪 [DRY RUN] Would post chunk of {len(post_chunk)} items")
             else:
                 try:
-                    res = session.post(endpoint, data=json.dumps(post_chunk), headers=headers, timeout=30)
+                    res = session.post(endpoint, json=post_chunk, headers=headers, timeout=30)
                     if res.status_code == 200:
                         successful_dispatches += len(post_chunk)
                         logging.info(f"✅ Batch [{j//POST_CHUNK_SIZE + 1}] Stored {len(post_chunk)} records in KV.")

@@ -16,7 +16,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 # 1. ENVIRONMENT CONFIGURATION & HTTP SESSION SETUP
 # =====================================================================
 WORKER_URL = os.getenv("WORKER_URL") or "https://emergencyaudit.com"
-MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY") or "EmergencyAudit_Master_Key_2027!"
+MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY") or "EmergencyAudit_Master_Key_2026!"
 APIFY_TOKEN = os.getenv("APIFY_TOKEN")
 
 MAX_TEST_LEADS = None
@@ -200,7 +200,7 @@ def normalize_lead_dict(raw_dict):
     owner_val = f"{fname} {lname}".strip() or norm.get("ownerfullname") or norm.get("ownername") or norm.get("owner1") or "RECORDED OWNER"
 
     citation = norm.get("recordid") or norm.get("caseid") or generate_deterministic_case_id(apn_val, addr_val)
-    amount = norm.get("defaultamount") or norm.get("amountlogged") or "$35,420.00 Recorded"
+    amount = norm.get("defaultamount") or norm.get("amountlogged") or "$18,450.00 Surplus Credit"
     phone_val = extract_phone_from_raw_row(raw_dict) or "PENDING UNMASK"
 
     return {
@@ -212,10 +212,10 @@ def normalize_lead_dict(raw_dict):
         "state": state_val,
         "zip": norm.get("zip") or "90012",
         "apn": apn_val,
-        "category": norm.get("category") or "PRE-FORECLOSURE / REINSTATEMENT",
+        "category": norm.get("category") or "EXCESS PROCEEDS / SURPLUS",
         "default_amount": amount,
         "property_type": norm.get("propertytype") or "Single Family / Commercial",
-        "violation": "A statutory Notice of Default (NOD) has been logged in CA public records.",
+        "violation": "Unclaimed foreclosure surplus overbid balance logged post-auction.",
         "phone": phone_val,
         "email": norm.get("email") or "N/A"
     }
@@ -317,10 +317,10 @@ if __name__ == "__main__":
             "phone": phone,
             "email": parcel.get("email", "N/A"),
             "apn": parcel.get("apn"),
-            "category": parcel.get("category", "PRE-FORECLOSURE / REINSTATEMENT"),
-            "default_amount": parcel.get("default_amount") or "$35,420.00 Recorded",
+            "category": parcel.get("category", "EXCESS PROCEEDS / SURPLUS"),
+            "default_amount": parcel.get("default_amount") or "$18,450.00 Surplus Credit",
             "property_type": parcel.get("property_type") or "Single Family / Commercial",
-            "violation": "A statutory Notice of Default (NOD) has been logged in CA public records.",
+            "violation": "Unclaimed foreclosure surplus overbid balance logged post-auction.",
             "status": "PENDING_REVIEW" if STAGING_MODE else "READY_FOR_DISPATCH"
         })
 

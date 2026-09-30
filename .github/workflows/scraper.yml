@@ -29,6 +29,8 @@ jobs:
 
       - name: Execute Main Scraper
         env:
-          WORKER_DISPATCH_URL: "https://emergencyaudit.com/api/inbound-lead-hook"
+          WORKER_URL: "https://emergencyaudit.com"
+          MASTER_ADMIN_KEY: ${{ secrets.MASTER_ADMIN_KEY || 'EmergencyAudit_Master_Key_2026!' }}
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
         run: |
           python main.py

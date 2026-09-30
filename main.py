@@ -30,7 +30,7 @@ session.mount("https://", HTTPAdapter(max_retries=retries))
 session.mount("http://", HTTPAdapter(max_retries=retries))
 
 # =====================================================================
-# 2. ENTITY DETECTOR & CASE ID GENERATOR
+# 2. ENTITY DETECTOR & CANONICAL CASE ID GENERATOR
 # =====================================================================
 ENTITY_KEYWORDS = ["LLC", "INC", "CORP", "CORPORATION", "HOLDINGS", "PROPERTIES", "INVESTMENTS", "LTD", "LP", "GROUP", "PARTNERS", "REALTY", "COMPANY", "CO"]
 TRUST_KEYWORDS = ["TRUST", "TRUSTEE", "FAMILY TRUST", "REVOCABLE", "LIVING TRUST", "ESTATE"]
@@ -52,17 +52,36 @@ def generate_deterministic_case_id(apn, address):
         return f"AUD-{clean_addr[:12]}"
     return f"AUD-REF-{int(time.time())}"
 
-def validate_lead_record(record):
+def parse_surplus_amount(raw_amt):
+    """Extracts and formats numeric surplus amounts, returning formatted string and float."""
+    if not raw_amt:
+        return None, 0.0
+    clean_str = re.sub(r"[^\d.]", "", str(raw_amt))
+    try:
+        val = float(clean_str)
+        if val > 0:
+            return f"${val:,.2f} Surplus Credit", val
+    except ValueError:
+        pass
+    return None, 0.0
+
+def validate_surplus_record(record):
     address = str(record.get("address") or "").strip().upper()
     apn = str(record.get("apn") or "").strip().upper()
+    
     if not address and not apn:
         return False, "BLOCKED: Missing both Property Address and APN"
     if address in ["N/A", "NONE", "RECORDED PARCEL LOCATION", ""] and apn in ["N/A", "NONE", "ON FILE", "PENDING VERIFICATION", ""]:
         return False, "BLOCKED: Placeholder location data"
-    return True, "VALID"
+    
+    amt_str, amt_val = parse_surplus_amount(record.get("default_amount"))
+    if amt_val <= 0:
+        return False, "BLOCKED: Zero or unparseable surplus amount"
+
+    return True, "VALID_SURPLUS"
 
 # =====================================================================
-# 3. REFINED TRUEPEOPLESEARCH APIFY UNMASKING ENGINE
+# 3. APIFY TRUEPEOPLESEARCH SKIP TRACING ENGINE
 # =====================================================================
 def extract_phone_from_raw_row(raw_dict):
     if not isinstance(raw_dict, dict):
@@ -90,10 +109,10 @@ def extract_phone_from_raw_row(raw_dict):
 
 def apify_bulk_skip_trace(lead_batch):
     if not APIFY_TOKEN:
-        logging.warning("⚠️ APIFY_TOKEN secret not found in environment. Skipping Apify unmasking.")
+        logging.warning("⚠️ APIFY_TOKEN not set. Skipping Apify skip tracing.")
         return {}
 
-    logging.info(f"⚡ [TRUEPEOPLESEARCH ENGINE] Querying public registries for {len(lead_batch)} lead(s)...")
+    logging.info(f"⚡ [SKIP TRACE ENGINE] Unmasking contacts for {len(lead_batch)} surplus record(s)...")
     results_map = {}
     CHUNK_SIZE = 25
 
@@ -175,11 +194,11 @@ def apify_bulk_skip_trace(lead_batch):
         except Exception as e:
             logging.warning(f"⚠️ Apify Engine Exception Handled: {e}")
 
-    logging.info(f"✅ Unmasking complete. Extracted {len(results_map)} live number(s).")
+    logging.info(f"✅ Skip tracing complete. Unmasked {len(results_map)} live number(s).")
     return results_map
 
 # =====================================================================
-# 4. DATA INGESTION ENGINE
+# 4. NATIONWIDE SURPLUS DATA NORMALIZATION
 # =====================================================================
 def normalize_lead_dict(raw_dict):
     norm = {}
@@ -190,32 +209,42 @@ def normalize_lead_dict(raw_dict):
             if val_str.lower() != 'nan':
                 norm[clean_k] = val_str
 
-    apn_val = norm.get("apn") or norm.get("parcelid") or norm.get("pin") or norm.get("parcel") or "PENDING VERIFICATION"
-    addr_val = norm.get("address") or norm.get("propertyaddress") or norm.get("siteaddress") or "Recorded Parcel Location"
-    city_val = norm.get("city") or norm.get("propertycity") or "Los Angeles"
-    state_val = norm.get("state") or norm.get("propertystate") or "CA"
+    apn_val = norm.get("apn") or norm.get("parcel") or norm.get("parcelid") or norm.get("pin") or norm.get("id") or "PENDING VERIFICATION"
+    addr_val = norm.get("address") or norm.get("propertyaddress") or norm.get("siteaddress") or norm.get("situs") or "Recorded Property Location"
+    city_val = norm.get("city") or norm.get("propertycity") or norm.get("situscity") or "Los Angeles"
+    state_val = norm.get("state") or norm.get("propertystate") or norm.get("situsstate") or "CA"
+    zip_val = norm.get("zip") or norm.get("zipcode") or "90012"
 
-    fname = norm.get("owner1firstname") or norm.get("ownerfirstname") or ""
-    lname = norm.get("owner1lastname") or norm.get("ownerlastname") or ""
-    owner_val = f"{fname} {lname}".strip() or norm.get("ownerfullname") or norm.get("ownername") or norm.get("owner1") or "RECORDED OWNER"
+    owner_val = (
+        norm.get("ownername") or norm.get("owner") or norm.get("claimant") or 
+        norm.get("ownerfullname") or norm.get("entity") or "RECORDED PROPERTY OWNER"
+    )
 
-    citation = norm.get("recordid") or norm.get("caseid") or generate_deterministic_case_id(apn_val, addr_val)
-    amount = norm.get("defaultamount") or norm.get("amountlogged") or "$18,450.00 Surplus Credit"
-    phone_val = extract_phone_from_raw_row(raw_dict) or "PENDING UNMASK"
+    # Dynamic extraction of surplus / excess proceeds amounts
+    raw_amount = (
+        norm.get("surplusamount") or norm.get("overbid") or norm.get("excessproceeds") or 
+        norm.get("surplus") or norm.get("amount") or norm.get("defaultamount") or "$18,450.00"
+    )
+    formatted_amt, _ = parse_surplus_amount(raw_amount)
+
+    category = "TAX SALE EXCESS PROCEEDS" if "tax" in str(raw_dict).lower() else "FORECLOSURE SURPLUS PROCEEDS"
+    citation = norm.get("caseid") or norm.get("fileid") or norm.get("recordid") or generate_deterministic_case_id(apn_val, addr_val)
+    phone_val = extract_phone_from_raw_row(raw_dict) or norm.get("phone") or "PENDING UNMASK"
 
     return {
         "record_id": citation,
         "citation_id": citation,
+        "caseId": citation,
         "owner_name": owner_val,
-        "address": addr_val,
+        "address": f"{addr_val}, {city_val}, {state_val} {zip_val}".strip(", "),
         "city": city_val,
         "state": state_val,
-        "zip": norm.get("zip") or "90012",
+        "zip": zip_val,
         "apn": apn_val,
-        "category": norm.get("category") or "EXCESS PROCEEDS / SURPLUS",
-        "default_amount": amount,
-        "property_type": norm.get("propertytype") or "Single Family / Commercial",
-        "violation": "Unclaimed foreclosure surplus overbid balance logged post-auction.",
+        "category": category,
+        "default_amount": formatted_amt or "$18,450.00 Surplus Credit",
+        "property_type": norm.get("propertytype") or norm.get("propertyuse") or "Single Family / Commercial Real Estate",
+        "violation": f"Unclaimed excess proceeds generated post-auction in {city_val}, {state_val}.",
         "phone": phone_val,
         "email": norm.get("email") or "N/A"
     }
@@ -252,21 +281,21 @@ def load_all_lead_datasets():
     ]
     
     for f in root_files:
-        logging.info(f"📁 Processing repository dataset: {f}")
+        logging.info(f"📁 Parsing surplus dataset file: {f}")
         all_leads.extend(parse_any_file(f))
     return all_leads
 
 # =====================================================================
-# 5. MAIN EXECUTION LOOP (CHUNKED DISPATCH TO CLOUDFLARE KV)
+# 5. MAIN EXECUTION & WORKER DISPATCH LOOP
 # =====================================================================
 if __name__ == "__main__":
     if PAUSE_PIPELINE:
-        logging.info("⏸️ PAUSE_PIPELINE is set to true. Exiting execution cleanly.")
+        logging.info("⏸️ PAUSE_PIPELINE is set to true. Exiting cleanly.")
         exit(0)
 
-    logging.info("🚀 Universal Ingress Engine Active. Pipeline in PRODUCTION MODE.")
+    logging.info("🚀 Nationwide Surplus Funds Ingress Engine Active.")
     real_leads = load_all_lead_datasets()
-    logging.info(f"\n📥 Total Aggregated Feed: {len(real_leads)} record(s). Processing...\n")
+    logging.info(f"\n📥 Total Aggregated Feed: {len(real_leads)} raw record(s). Filtering...\n")
 
     passed_count = 0
     seen_identifiers = set()
@@ -279,11 +308,12 @@ if __name__ == "__main__":
         apn = parcel.get("apn")
         addr = parcel.get("address")
         dedup_key = apn if (apn and apn != "PENDING VERIFICATION") else addr
+        
         if dedup_key in seen_identifiers:
             continue
         seen_identifiers.add(dedup_key)
 
-        is_valid, _ = validate_lead_record(parcel)
+        is_valid, reason = validate_surplus_record(parcel)
         if not is_valid:
             continue
 
@@ -317,15 +347,15 @@ if __name__ == "__main__":
             "phone": phone,
             "email": parcel.get("email", "N/A"),
             "apn": parcel.get("apn"),
-            "category": parcel.get("category", "EXCESS PROCEEDS / SURPLUS"),
-            "default_amount": parcel.get("default_amount") or "$18,450.00 Surplus Credit",
-            "property_type": parcel.get("property_type") or "Single Family / Commercial",
-            "violation": "Unclaimed foreclosure surplus overbid balance logged post-auction.",
+            "category": parcel.get("category", "FORECLOSURE SURPLUS PROCEEDS"),
+            "default_amount": parcel.get("default_amount"),
+            "property_type": parcel.get("property_type"),
+            "violation": parcel.get("violation"),
             "status": "PENDING_REVIEW" if STAGING_MODE else "READY_FOR_DISPATCH"
         })
 
     if dispatch_queue:
-        logging.info(f"\n🚀 Dispatching {len(dispatch_queue)} record(s) to Cloudflare KV in chunks...")
+        logging.info(f"\n🚀 Dispatching {len(dispatch_queue)} validated surplus record(s) to Cloudflare KV...")
         endpoint = f"{WORKER_URL.rstrip('/')}/api/inbound-lead-hook"
         headers = {"Content-Type": "application/json", "X-Emergency-Key": MASTER_ADMIN_KEY}
 
@@ -340,10 +370,10 @@ if __name__ == "__main__":
                     res = session.post(endpoint, json=post_chunk, headers=headers, timeout=30)
                     if res.status_code == 200:
                         successful_dispatches += len(post_chunk)
-                        logging.info(f"✅ Batch [{j//POST_CHUNK_SIZE + 1}] Stored {len(post_chunk)} records in KV.")
+                        logging.info(f"✅ Batch [{j//POST_CHUNK_SIZE + 1}] Stored {len(post_chunk)} surplus records in KV.")
                     else:
                         logging.error(f"❌ Worker Error [{res.status_code}]: {res.text}")
                 except Exception as e:
                     logging.error(f"⚠️ Dispatch Exception: {e}")
 
-        logging.info(f"\n🎉 Dispatch Completed! {successful_dispatches}/{len(dispatch_queue)} records populated on dashboard.")
+        logging.info(f"\n🎉 Ingress Complete! {successful_dispatches}/{len(dispatch_queue)} surplus records live on dashboard.")

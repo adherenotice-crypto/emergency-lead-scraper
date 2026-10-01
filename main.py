@@ -11,6 +11,7 @@ import pandas as pd
 import logging
 import urllib.parse
 from datetime import datetime, timedelta
+from bs4 import BeautifulSoup
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -37,6 +38,11 @@ PAUSE_PIPELINE = (os.getenv("PAUSE_PIPELINE") or "false").lower() == "true"
 DRY_RUN = (os.getenv("DRY_RUN") or "false").lower() in ["true", "1", "yes"]
 STAGING_MODE = (os.getenv("STAGING_MODE") or "false").lower() == "true"
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "X-Emergency-Key": MASTER_ADMIN_KEY
+}
+
 session = requests.Session()
 retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
 session.mount("https://", HTTPAdapter(max_retries=retries))
@@ -50,11 +56,9 @@ def fetch_existing_kv_record_ids():
     Queries Cloudflare Worker for currently stored case IDs to avoid duplicate writes.
     """
     endpoint = f"{WORKER_URL.rstrip('/')}/api/inbound-lead-hook"
-    headers = {"X-Emergency-Key": MASTER_ADMIN_KEY}
-    
     try:
         logging.info("🔍 Checking Cloudflare KV for existing ledger records...")
-        res = session.get(endpoint, headers=headers, timeout=12)
+        res = session.get(endpoint, headers=HEADERS, timeout=12)
         if res.status_code == 200:
             data = res.json()
             if isinstance(data, list):
@@ -134,20 +138,20 @@ def fetch_fresh_ca_sco_leads():
     """
     logging.info("🌐 Fetching fresh State Controller (SCO) unclaimed records...")
     sco_leads = []
-    ca_open_data_url = "https://data.ca.gov/api/3/action/datastore_search?resource_id=unclaimed-property&limit=100"
+    ca_open_data_url = "https://data.ca.gov/resource/unclaimed-property.json?$where=amount>=25000&$limit=100"
     
     try:
-        res = session.get(ca_open_data_url, timeout=10)
+        res = session.get(ca_open_data_url, headers=HEADERS, timeout=12)
         if res.status_code == 200:
-            data = res.json()
-            records = data.get("result", {}).get("records", [])
-            for r in records:
+            records = res.json()
+            for r in records if isinstance(records, list) else []:
                 amt = float(r.get("amount", 0) or 0)
                 if amt >= MIN_STATE_SURPLUS:
                     owner = r.get("owner_name") or r.get("holder_name") or "RECORDED OWNER"
                     addr = r.get("address") or "RECORDED PROPERTY LOCATION"
                     city = r.get("city") or "Los Angeles"
                     zip_code = r.get("zip") or "90012"
+                    apn_val = str(r.get("property_id") or r.get("case_id") or int(time.time())).replace("-", "")
                     
                     sco_leads.append({
                         "owner_name": owner,
@@ -155,12 +159,13 @@ def fetch_fresh_ca_sco_leads():
                         "city": city,
                         "state": "CA",
                         "zip": zip_code,
-                        "apn": r.get("property_id") or f"SCO-{r.get('case_id', int(time.time()))}",
+                        "apn": f"SCO-{apn_val[:10]}",
                         "default_amount": f"${amt:,.2f} Surplus Credit",
                         "category": "STATE UNCLAIMED FINANCIAL ASSET",
                         "phone": "PENDING UNMASK",
                         "violation": "Unclaimed financial property held in trust by CA State Controller."
                     })
+            logging.info(f"✅ Extracted {len(sco_leads)} live State Controller records.")
     except Exception as e:
         logging.warning(f"⚠️ Live SCO API query bypassed: {e}")
         
@@ -174,7 +179,42 @@ def fetch_fresh_socal_county_leads():
     logging.info("🌐 Fetching fresh SoCal County Excess Proceeds lists...")
     county_leads = []
 
-    # Production Public Tax Sale Excess Proceeds Records (LA, OC, SB, Riverside Counties)
+    # 1. Live LA County TTC Scraper Attempt
+    try:
+        la_ttc_url = "https://ttc.lacounty.gov/excess-proceeds-from-sale-of-tax-defaulted-property/"
+        res = session.get(la_ttc_url, headers=HEADERS, timeout=10)
+        if res.status_code == 200:
+            soup = BeautifulSoup(res.text, "html.parser")
+            rows = soup.find_all("tr")
+            for row in rows:
+                cols = [ele.text.strip() for ele in row.find_all(["td", "th"])]
+                if len(cols) >= 4:
+                    raw_apn = re.sub(r"[^\d]", "", cols[0])
+                    if len(raw_apn) == 10:
+                        amt_clean = re.sub(r"[^\d.]", "", cols[-1])
+                        amt_val = float(amt_clean) if amt_clean else 15000.0
+                        if amt_val >= MIN_COUNTY_SURPLUS:
+                            cid = generate_deterministic_case_id(raw_apn, cols[2] if len(cols) > 2 else "")
+                            county_leads.append({
+                                "record_id": cid,
+                                "citation_id": cid,
+                                "caseId": cid,
+                                "owner_name": cols[1] if len(cols) > 1 else "RECORDED PROPERTY OWNER",
+                                "leadName": cols[1] if len(cols) > 1 else "RECORDED PROPERTY OWNER",
+                                "address": cols[2] if len(cols) > 2 else f"Parcel {raw_apn}, Los Angeles, CA",
+                                "city": "Los Angeles", "state": "CA", "zip": "90012",
+                                "apn": raw_apn,
+                                "category": "TAX SALE EXCESS PROCEEDS",
+                                "default_amount": f"${amt_val:,.2f} Surplus Credit",
+                                "property_type": "Single Family / Commercial Real Estate",
+                                "violation": "Excess proceeds logged by LA County Treasurer.",
+                                "phone": "PENDING UNMASK",
+                                "email": "N/A"
+                            })
+    except Exception as e:
+        logging.warning(f"⚠️ Live HTML parsing fallback: {e}")
+
+    # 2. Production Public Tax Sale Excess Proceeds Feed Backup
     socal_public_feed = [
         {
             "apn": "2277018016",
@@ -197,7 +237,7 @@ def fetch_fresh_socal_county_leads():
         {
             "apn": "5082012015",
             "owner_name": "GREGORY VANCE ESTATE",
-            "address": "1422 S CRENSSHAW BLVD, LOS ANGELES, CA 90019",
+            "address": "1422 S CRENSHAW BLVD, LOS ANGELES, CA 90019",
             "city": "Los Angeles", "state": "CA", "zip": "90019",
             "default_amount": "$68,450.00 Surplus Credit",
             "category": "TAX SALE EXCESS PROCEEDS",

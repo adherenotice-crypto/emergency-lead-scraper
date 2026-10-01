@@ -6,6 +6,7 @@ from urllib3.util.retry import Retry
 import time
 import json
 import csv
+import io
 import pandas as pd
 import logging
 import urllib.parse
@@ -53,7 +54,6 @@ def generate_deterministic_case_id(apn, address):
     return f"AUD-REF-{int(time.time())}"
 
 def parse_surplus_amount(raw_amt):
-    """Extracts and formats numeric surplus amounts, returning formatted string and float."""
     if not raw_amt:
         return None, 0.0
     clean_str = re.sub(r"[^\d.]", "", str(raw_amt))
@@ -220,7 +220,6 @@ def normalize_lead_dict(raw_dict):
         norm.get("ownerfullname") or norm.get("entity") or "RECORDED PROPERTY OWNER"
     )
 
-    # Dynamic extraction of surplus / excess proceeds amounts
     raw_amount = (
         norm.get("surplusamount") or norm.get("overbid") or norm.get("excessproceeds") or 
         norm.get("surplus") or norm.get("amount") or norm.get("defaultamount") or "$18,450.00"
@@ -236,6 +235,7 @@ def normalize_lead_dict(raw_dict):
         "citation_id": citation,
         "caseId": citation,
         "owner_name": owner_val,
+        "leadName": owner_val,
         "address": f"{addr_val}, {city_val}, {state_val} {zip_val}".strip(", "),
         "city": city_val,
         "state": state_val,
@@ -344,6 +344,7 @@ if __name__ == "__main__":
             "caseId": cid,
             "address": parcel.get("address"),
             "owner_name": parcel.get("owner_name"),
+            "leadName": parcel.get("owner_name"),
             "phone": phone,
             "email": parcel.get("email", "N/A"),
             "apn": parcel.get("apn"),

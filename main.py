@@ -14,11 +14,14 @@ import urllib.parse
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # =====================================================================
-# 1. ENVIRONMENT CONFIGURATION & HTTP SESSION SETUP
+# 1. ENVIRONMENT CONFIGURATION & SAFEGUARDS
 # =====================================================================
 WORKER_URL = os.getenv("WORKER_URL") or "https://emergencyaudit.com"
 MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY") or "EmergencyAudit_Master_Key_2026!"
 APIFY_TOKEN = os.getenv("APIFY_TOKEN")
+
+# Set to True ONLY when you explicitly want to unmask phone numbers via Apify
+ENABLE_AUTO_SKIP_TRACE = (os.getenv("ENABLE_AUTO_SKIP_TRACE") or "false").lower() == "true"
 
 MAX_TEST_LEADS = None
 PAUSE_PIPELINE = (os.getenv("PAUSE_PIPELINE") or "false").lower() == "true"
@@ -31,7 +34,34 @@ session.mount("https://", HTTPAdapter(max_retries=retries))
 session.mount("http://", HTTPAdapter(max_retries=retries))
 
 # =====================================================================
-# 2. ENTITY DETECTOR & CANONICAL CASE ID GENERATOR
+# 2. REMOTE DEDUPLICATION (PREVENTS CLOUDFLARE KV OVERFLOW)
+# =====================================================================
+def fetch_existing_kv_record_ids():
+    """
+    Queries Cloudflare Worker for currently stored case IDs to avoid duplicate writes.
+    """
+    endpoint = f"{WORKER_URL.rstrip('/')}/api/inbound-lead-hook"
+    headers = {"X-Emergency-Key": MASTER_ADMIN_KEY}
+    
+    try:
+        logging.info("🔍 Checking Cloudflare KV for existing ledger records...")
+        res = session.get(endpoint, headers=headers, timeout=12)
+        if res.status_code == 200:
+            data = res.json()
+            if isinstance(data, list):
+                existing_ids = {
+                    item.get("record_id") or item.get("caseId") or item.get("citation_id")
+                    for item in data if isinstance(item, dict)
+                }
+                logging.info(f"📊 Found {len(existing_ids)} existing record(s) in Cloudflare KV ledger.")
+                return existing_ids
+    except Exception as e:
+        logging.warning(f"⚠️ Could not fetch existing KV ledger state: {e}. Proceeding with local dedup.")
+    
+    return set()
+
+# =====================================================================
+# 3. ENTITY DETECTOR & CANONICAL CASE ID GENERATOR
 # =====================================================================
 ENTITY_KEYWORDS = ["LLC", "INC", "CORP", "CORPORATION", "HOLDINGS", "PROPERTIES", "INVESTMENTS", "LTD", "LP", "GROUP", "PARTNERS", "REALTY", "COMPANY", "CO"]
 TRUST_KEYWORDS = ["TRUST", "TRUSTEE", "FAMILY TRUST", "REVOCABLE", "LIVING TRUST", "ESTATE"]
@@ -81,7 +111,7 @@ def validate_surplus_record(record):
     return True, "VALID_SURPLUS"
 
 # =====================================================================
-# 3. APIFY TRUEPEOPLESEARCH SKIP TRACING ENGINE
+# 4. APIFY TRUEPEOPLESEARCH SKIP TRACING ENGINE
 # =====================================================================
 def extract_phone_from_raw_row(raw_dict):
     if not isinstance(raw_dict, dict):
@@ -108,8 +138,8 @@ def extract_phone_from_raw_row(raw_dict):
     return found_phones[0] if found_phones else None
 
 def apify_bulk_skip_trace(lead_batch):
-    if not APIFY_TOKEN:
-        logging.warning("⚠️ APIFY_TOKEN not set. Skipping Apify skip tracing.")
+    if not APIFY_TOKEN or not ENABLE_AUTO_SKIP_TRACE:
+        logging.info("ℹ️ Skip tracing skipped (ENABLE_AUTO_SKIP_TRACE is False).")
         return {}
 
     logging.info(f"⚡ [SKIP TRACE ENGINE] Unmasking contacts for {len(lead_batch)} surplus record(s)...")
@@ -198,7 +228,7 @@ def apify_bulk_skip_trace(lead_batch):
     return results_map
 
 # =====================================================================
-# 4. NATIONWIDE SURPLUS DATA NORMALIZATION
+# 5. DATA NORMALIZATION & PARSING
 # =====================================================================
 def normalize_lead_dict(raw_dict):
     norm = {}
@@ -286,7 +316,7 @@ def load_all_lead_datasets():
     return all_leads
 
 # =====================================================================
-# 5. MAIN EXECUTION & WORKER DISPATCH LOOP
+# 6. MAIN EXECUTION LOOP WITH DUPLICATE PROTECTION
 # =====================================================================
 if __name__ == "__main__":
     if PAUSE_PIPELINE:
@@ -294,21 +324,31 @@ if __name__ == "__main__":
         exit(0)
 
     logging.info("🚀 Nationwide Surplus Funds Ingress Engine Active.")
+    
+    # 1. Fetch existing keys from Cloudflare KV to prevent repeated writes
+    existing_kv_ids = fetch_existing_kv_record_ids()
+
+    # 2. Parse all available local lead datasets
     real_leads = load_all_lead_datasets()
-    logging.info(f"\n📥 Total Aggregated Feed: {len(real_leads)} raw record(s). Filtering...\n")
+    logging.info(f"📥 Total Aggregated Feed: {len(real_leads)} raw record(s). Filtering...")
 
     passed_count = 0
     seen_identifiers = set()
     needs_unmask_batch = []
     prepared_records = []
+    new_lead_counter = 0
+
+    current_timestamp = time.strftime("%Y-%m-%d %H:%M:%S PST")
 
     for parcel in real_leads:
         if MAX_TEST_LEADS and passed_count >= MAX_TEST_LEADS:
             break
+            
         apn = parcel.get("apn")
         addr = parcel.get("address")
         dedup_key = apn if (apn and apn != "PENDING VERIFICATION") else addr
         
+        # Local file level deduplication
         if dedup_key in seen_identifiers:
             continue
         seen_identifiers.add(dedup_key)
@@ -320,12 +360,29 @@ if __name__ == "__main__":
         cid = parcel.get("record_id") or generate_deterministic_case_id(apn, addr)
         parcel["record_id"] = cid
 
+        # DEDUPLICATION CHECK: Skip if already live in Cloudflare KV
+        if cid in existing_kv_ids:
+            continue
+
+        # Tag explicitly as a NEW lead
+        parcel["is_new"] = True
+        parcel["ingested_at"] = current_timestamp
+        new_lead_counter += 1
+
         existing_phone = parcel.get("phone")
-        if not existing_phone or existing_phone in ["PENDING UNMASK", "Unmasked Upon Purchase"]:
+        if ENABLE_AUTO_SKIP_TRACE and (not existing_phone or existing_phone in ["PENDING UNMASK", "Unmasked Upon Purchase"]):
             needs_unmask_batch.append(parcel)
 
         prepared_records.append(parcel)
         passed_count += 1
+
+    # 3. Stop immediately if no new leads exist (Saves Cloudflare KV quota)
+    if not prepared_records:
+        logging.info("🛡️ SAFEGUARD ACTIVE: 0 new leads found. All dataset records already exist in Cloudflare KV.")
+        logging.info("⚡ Exiting in 1 second. Zero write operations made to Cloudflare KV!")
+        exit(0)
+
+    logging.info(f"✨ Found {new_lead_counter} BRAND NEW lead(s) to process and store!")
 
     unmasked_phones = {}
     if needs_unmask_batch:
@@ -352,11 +409,14 @@ if __name__ == "__main__":
             "default_amount": parcel.get("default_amount"),
             "property_type": parcel.get("property_type"),
             "violation": parcel.get("violation"),
-            "status": "PENDING_REVIEW" if STAGING_MODE else "READY_FOR_DISPATCH"
+            "is_new": True,
+            "ingested_at": parcel.get("ingested_at"),
+            "status": "NEW_LEAD" if not STAGING_MODE else "PENDING_REVIEW"
         })
 
+    # 4. Dispatch ONLY new leads to Cloudflare KV
     if dispatch_queue:
-        logging.info(f"\n🚀 Dispatching {len(dispatch_queue)} validated surplus record(s) to Cloudflare KV...")
+        logging.info(f"🚀 Dispatching {len(dispatch_queue)} NEW surplus record(s) to Cloudflare KV...")
         endpoint = f"{WORKER_URL.rstrip('/')}/api/inbound-lead-hook"
         headers = {"Content-Type": "application/json", "X-Emergency-Key": MASTER_ADMIN_KEY}
 
@@ -371,10 +431,10 @@ if __name__ == "__main__":
                     res = session.post(endpoint, json=post_chunk, headers=headers, timeout=30)
                     if res.status_code == 200:
                         successful_dispatches += len(post_chunk)
-                        logging.info(f"✅ Batch [{j//POST_CHUNK_SIZE + 1}] Stored {len(post_chunk)} surplus records in KV.")
+                        logging.info(f"✅ Batch [{j//POST_CHUNK_SIZE + 1}] Stored {len(post_chunk)} NEW surplus records in KV.")
                     else:
                         logging.error(f"❌ Worker Error [{res.status_code}]: {res.text}")
                 except Exception as e:
                     logging.error(f"⚠️ Dispatch Exception: {e}")
 
-        logging.info(f"\n🎉 Ingress Complete! {successful_dispatches}/{len(dispatch_queue)} surplus records live on dashboard.")
+        logging.info(f"🎉 Ingress Complete! {successful_dispatches}/{len(dispatch_queue)} NEW surplus records live on dashboard.")

@@ -31,7 +31,7 @@ MIN_STATE_SURPLUS = 25000.00     # $25k+ for State Controller Unclaimed Property
 
 # Statutory Lookback Windows
 MAX_COUNTY_DAYS = 365            # 1 Year CA Rev & Tax § 4675 Limit
-MAX_STATE_DAYS = 1095            # 3 Years max
+MAX_STATE_DAYS = 1095           # 3 Years max
 
 MAX_TEST_LEADS = None
 PAUSE_PIPELINE = (os.getenv("PAUSE_PIPELINE") or "false").lower() == "true"
@@ -465,7 +465,7 @@ if __name__ == "__main__":
 
         is_valid, reason = validate_surplus_record(parcel)
         if not is_valid:
-            logging.info(f"   └─ {reason}")
+            logging.info(f"    └─ {reason}")
             continue
 
         cid = parcel.get("record_id") or generate_deterministic_case_id(apn, addr)

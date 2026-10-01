@@ -10,11 +10,12 @@ import io
 import pandas as pd
 import logging
 import urllib.parse
+from datetime import datetime, timedelta
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # =====================================================================
-# 1. ENVIRONMENT CONFIGURATION & SAFEGUARDS
+# 1. ENVIRONMENT CONFIGURATION, SAFEGUARDS & FILTERS
 # =====================================================================
 WORKER_URL = os.getenv("WORKER_URL") or "https://emergencyaudit.com"
 MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY") or "EmergencyAudit_Master_Key_2026!"
@@ -22,6 +23,14 @@ APIFY_TOKEN = os.getenv("APIFY_TOKEN")
 
 # Set to True ONLY when you explicitly want to unmask phone numbers via Apify
 ENABLE_AUTO_SKIP_TRACE = (os.getenv("ENABLE_AUTO_SKIP_TRACE") or "false").lower() == "true"
+
+# Minimum Surplus Thresholds (Filter out junk data)
+MIN_COUNTY_SURPLUS = 10000.00   # $10k+ for County Foreclosures / Tax Overbids
+MIN_STATE_SURPLUS = 50000.00    # $50k+ for State Controller Unclaimed Property
+
+# Statutory Lookback Windows
+MAX_COUNTY_DAYS = 365           # 1 Year CA Rev & Tax § 4675 Limit (Target: 30-90 days)
+MAX_STATE_DAYS = 1095           # 3 Years max for optimal contactability
 
 MAX_TEST_LEADS = None
 PAUSE_PIPELINE = (os.getenv("PAUSE_PIPELINE") or "false").lower() == "true"
@@ -61,7 +70,66 @@ def fetch_existing_kv_record_ids():
     return set()
 
 # =====================================================================
-# 3. ENTITY DETECTOR & CANONICAL CASE ID GENERATOR
+# 3. DATE & THRESHOLD VALIDATION ENGINE
+# =====================================================================
+def parse_surplus_amount(raw_amt):
+    if not raw_amt:
+        return None, 0.0
+    clean_str = re.sub(r"[^\d.]", "", str(raw_amt))
+    try:
+        val = float(clean_str)
+        if val > 0:
+            return f"${val:,.2f} Surplus Credit", val
+    except ValueError:
+        pass
+    return None, 0.0
+
+def is_within_target_window(record_date_str, source_type):
+    """
+    Filters out records outside statutory recovery deadlines.
+    """
+    if not record_date_str or str(record_date_str).upper() in ["N/A", "NONE", "UNKNOWN", ""]:
+        return True
+        
+    try:
+        record_date = datetime.strptime(str(record_date_str).strip(), "%Y-%m-%d")
+        age_in_days = (datetime.now() - record_date).days
+        
+        if source_type == "STATE_SCO":
+            return age_in_days <= MAX_STATE_DAYS
+        else:  # County Overbids
+            return 30 <= age_in_days <= MAX_COUNTY_DAYS
+    except Exception:
+        return True
+
+def validate_surplus_record(record):
+    address = str(record.get("address") or "").strip().upper()
+    apn = str(record.get("apn") or "").strip().upper()
+    category = str(record.get("category") or "").upper()
+    
+    if not address and not apn:
+        return False, "BLOCKED: Missing both Property Address and APN"
+    if address in ["N/A", "NONE", "RECORDED PARCEL LOCATION", ""] and apn in ["N/A", "NONE", "ON FILE", "PENDING VERIFICATION", ""]:
+        return False, "BLOCKED: Placeholder location data"
+    
+    amt_str, amt_val = parse_surplus_amount(record.get("default_amount"))
+    source_type = "STATE_SCO" if "STATE" in category or "UNCLAIMED" in category else "COUNTY_OVERBID"
+    
+    # Enforce Dollar Minimums
+    if source_type == "STATE_SCO" and amt_val < MIN_STATE_SURPLUS:
+        return False, f"BLOCKED: State asset below ${MIN_STATE_SURPLUS:,.2f} threshold (${amt_val:,.2f})"
+    elif source_type == "COUNTY_OVERBID" and amt_val < MIN_COUNTY_SURPLUS:
+        return False, f"BLOCKED: County overbid below ${MIN_COUNTY_SURPLUS:,.2f} threshold (${amt_val:,.2f})"
+
+    # Enforce Statutory Date Window
+    record_date = record.get("sale_date") or record.get("record_date")
+    if not is_within_target_window(record_date, source_type):
+        return False, f"BLOCKED: Outside statutory lookback window ({record_date})"
+
+    return True, "VALID_SURPLUS"
+
+# =====================================================================
+# 4. ENTITY DETECTOR & CANONICAL CASE ID GENERATOR
 # =====================================================================
 ENTITY_KEYWORDS = ["LLC", "INC", "CORP", "CORPORATION", "HOLDINGS", "PROPERTIES", "INVESTMENTS", "LTD", "LP", "GROUP", "PARTNERS", "REALTY", "COMPANY", "CO"]
 TRUST_KEYWORDS = ["TRUST", "TRUSTEE", "FAMILY TRUST", "REVOCABLE", "LIVING TRUST", "ESTATE"]
@@ -83,35 +151,58 @@ def generate_deterministic_case_id(apn, address):
         return f"AUD-{clean_addr[:12]}"
     return f"AUD-REF-{int(time.time())}"
 
-def parse_surplus_amount(raw_amt):
-    if not raw_amt:
-        return None, 0.0
-    clean_str = re.sub(r"[^\d.]", "", str(raw_amt))
+# =====================================================================
+# 5. LIVE AUTOMATED SCRAPER FEEDS (SCO & SOCAL COUNTIES)
+# =====================================================================
+def fetch_fresh_ca_sco_leads():
+    """
+    Fetches fresh unclaimed property records from public State Controller Open Data feeds.
+    """
+    logging.info("🌐 Fetching fresh State Controller (SCO) unclaimed records...")
+    sco_leads = []
+    ca_open_data_url = "https://data.ca.gov/resource/unclaimed-property.json?$where=amount>=50000&$limit=200"
+    
     try:
-        val = float(clean_str)
-        if val > 0:
-            return f"${val:,.2f} Surplus Credit", val
-    except ValueError:
-        pass
-    return None, 0.0
+        res = session.get(ca_open_data_url, timeout=15)
+        if res.status_code == 200:
+            records = res.json()
+            for r in records if isinstance(records, list) else []:
+                amt = float(r.get("amount", 0))
+                if amt >= MIN_STATE_SURPLUS:
+                    owner = r.get("owner_name") or r.get("holder_name") or "RECORDED OWNER"
+                    addr = r.get("address") or "RECORDED PROPERTY LOCATION"
+                    city = r.get("city") or "Los Angeles"
+                    zip_code = r.get("zip") or "90012"
+                    
+                    sco_leads.append({
+                        "owner_name": owner,
+                        "address": f"{addr}, {city}, CA {zip_code}".strip(", "),
+                        "city": city,
+                        "state": "CA",
+                        "zip": zip_code,
+                        "apn": r.get("property_id") or f"SCO-{r.get('case_id', int(time.time()))}",
+                        "default_amount": f"${amt:,.2f} Surplus Credit",
+                        "category": "STATE UNCLAIMED FINANCIAL ASSET",
+                        "phone": "PENDING UNMASK",
+                        "violation": "Unclaimed financial property held in trust by CA State Controller."
+                    })
+            logging.info(f"✅ Extracted {len(sco_leads)} fresh State Controller leads >= $50k.")
+    except Exception as e:
+        logging.warning(f"⚠️ Live SCO endpoint scan bypassed: {e}")
+        
+    return sco_leads
 
-def validate_surplus_record(record):
-    address = str(record.get("address") or "").strip().upper()
-    apn = str(record.get("apn") or "").strip().upper()
-    
-    if not address and not apn:
-        return False, "BLOCKED: Missing both Property Address and APN"
-    if address in ["N/A", "NONE", "RECORDED PARCEL LOCATION", ""] and apn in ["N/A", "NONE", "ON FILE", "PENDING VERIFICATION", ""]:
-        return False, "BLOCKED: Placeholder location data"
-    
-    amt_str, amt_val = parse_surplus_amount(record.get("default_amount"))
-    if amt_val <= 0:
-        return False, "BLOCKED: Zero or unparseable surplus amount"
-
-    return True, "VALID_SURPLUS"
+def fetch_fresh_socal_county_leads():
+    """
+    Scrapes fresh excess proceeds from Southern California public portals.
+    """
+    logging.info("🌐 Fetching fresh SoCal County Excess Proceeds lists...")
+    county_leads = []
+    # Placeholder for live county scrapers (LA, OC, Riverside, San Bernardino, San Diego)
+    return county_leads
 
 # =====================================================================
-# 4. APIFY TRUEPEOPLESEARCH SKIP TRACING ENGINE
+# 6. APIFY TRUEPEOPLESEARCH SKIP TRACING ENGINE
 # =====================================================================
 def extract_phone_from_raw_row(raw_dict):
     if not isinstance(raw_dict, dict):
@@ -228,7 +319,7 @@ def apify_bulk_skip_trace(lead_batch):
     return results_map
 
 # =====================================================================
-# 5. DATA NORMALIZATION & PARSING
+# 7. DATA NORMALIZATION & LOCAL FILE PARSING
 # =====================================================================
 def normalize_lead_dict(raw_dict):
     norm = {}
@@ -276,7 +367,8 @@ def normalize_lead_dict(raw_dict):
         "property_type": norm.get("propertytype") or norm.get("propertyuse") or "Single Family / Commercial Real Estate",
         "violation": f"Unclaimed excess proceeds generated post-auction in {city_val}, {state_val}.",
         "phone": phone_val,
-        "email": norm.get("email") or "N/A"
+        "email": norm.get("email") or "N/A",
+        "sale_date": norm.get("saledate") or norm.get("recorddate") or norm.get("date")
     }
 
 def parse_any_file(file_path):
@@ -300,6 +392,12 @@ def parse_any_file(file_path):
 
 def load_all_lead_datasets():
     all_leads = []
+    
+    # 1. Pull Live Scraped Leads
+    all_leads.extend(fetch_fresh_ca_sco_leads())
+    all_leads.extend(fetch_fresh_socal_county_leads())
+    
+    # 2. Parse Repository CSV/Excel Datasets
     valid_exts = (".csv", ".xlsx", ".xls", ".json")
     ignored_files = {"package.json", "package-lock.json", "tsconfig.json", "metadata.json"}
 
@@ -313,10 +411,11 @@ def load_all_lead_datasets():
     for f in root_files:
         logging.info(f"📁 Parsing surplus dataset file: {f}")
         all_leads.extend(parse_any_file(f))
+        
     return all_leads
 
 # =====================================================================
-# 6. MAIN EXECUTION LOOP WITH DUPLICATE PROTECTION
+# 8. MAIN EXECUTION LOOP WITH DEDUPLICATION & DISPATCH
 # =====================================================================
 if __name__ == "__main__":
     if PAUSE_PIPELINE:
@@ -325,10 +424,10 @@ if __name__ == "__main__":
 
     logging.info("🚀 Nationwide Surplus Funds Ingress Engine Active.")
     
-    # 1. Fetch existing keys from Cloudflare KV to prevent repeated writes
+    # 1. Fetch existing keys from Cloudflare KV to prevent duplicate writes
     existing_kv_ids = fetch_existing_kv_record_ids()
 
-    # 2. Parse all available local lead datasets
+    # 2. Load and aggregate all feeds (Live Scrapers + Local Files)
     real_leads = load_all_lead_datasets()
     logging.info(f"📥 Total Aggregated Feed: {len(real_leads)} raw record(s). Filtering...")
 
@@ -348,11 +447,12 @@ if __name__ == "__main__":
         addr = parcel.get("address")
         dedup_key = apn if (apn and apn != "PENDING VERIFICATION") else addr
         
-        # Local file level deduplication
+        # Local deduplication
         if dedup_key in seen_identifiers:
             continue
         seen_identifiers.add(dedup_key)
 
+        # Enforce Dollar & Date Statutory Safeguards
         is_valid, reason = validate_surplus_record(parcel)
         if not is_valid:
             continue
@@ -376,13 +476,13 @@ if __name__ == "__main__":
         prepared_records.append(parcel)
         passed_count += 1
 
-    # 3. Stop immediately if no new leads exist (Saves Cloudflare KV quota)
+    # 3. Exit immediately if no new leads exist (Saves Cloudflare KV quota)
     if not prepared_records:
-        logging.info("🛡️ SAFEGUARD ACTIVE: 0 new leads found. All dataset records already exist in Cloudflare KV.")
+        logging.info("🛡️ SAFEGUARD ACTIVE: 0 new leads found. All records already exist in Cloudflare KV.")
         logging.info("⚡ Exiting in 1 second. Zero write operations made to Cloudflare KV!")
         exit(0)
 
-    logging.info(f"✨ Found {new_lead_counter} BRAND NEW lead(s) to process and store!")
+    logging.info(f"✨ Found {new_lead_counter} BRAND NEW lead(s) meeting all dollar/date thresholds!")
 
     unmasked_phones = {}
     if needs_unmask_batch:

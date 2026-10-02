@@ -315,18 +315,19 @@ if __name__ == "__main__":
         cid = parcel.get("record_id") or generate_deterministic_case_id(apn, addr)
         parcel["record_id"] = cid
 
-        if cid in existing_kv_ids:
-            continue
+        # BYPASS DEDUPLICATION TO UNMASK MASKED LEADS IN KV:
+        # if cid in existing_kv_ids:
+        #     continue
 
         parcel["is_new"] = True
         parcel["ingested_at"] = current_timestamp
         prepared_records.append(parcel)
 
     if not prepared_records:
-        logging.info("🛡️️ SAFEGUARD ACTIVE: 0 new leads found. All records already exist in Cloudflare KV.")
+        logging.info("🛡 SAFEGUARD ACTIVE: 0 new leads found. All records already exist in Cloudflare KV.")
         exit(0)
 
-    logging.info(f"✨ Found {len(prepared_records)} BRAND NEW lead(s) meeting all thresholds!")
+    logging.info(f"✨ Found {len(prepared_records)} lead(s) for skip-tracing and KV update!")
 
     # Step 1: Run Tracerfy Skip Tracing
     enriched_records = run_tracerfy_skip_trace(prepared_records)
@@ -362,7 +363,7 @@ if __name__ == "__main__":
 
     # Step 3: Dispatch Payload to Cloudflare Worker
     if dispatch_queue:
-        logging.info(f"🚀 Dispatching {len(dispatch_queue)} NEW dissected surplus record(s) to Cloudflare KV...")
+        logging.info(f"🚀 Dispatching {len(dispatch_queue)} dissected surplus record(s) to Cloudflare KV...")
         endpoint = f"{WORKER_URL.rstrip('/')}/api/inbound-lead-hook"
         headers = {"Content-Type": "application/json", "X-Emergency-Key": MASTER_ADMIN_KEY}
 
@@ -377,7 +378,7 @@ if __name__ == "__main__":
                     res = session.post(endpoint, json=post_chunk, headers=headers, timeout=30)
                     if res.status_code == 200:
                         successful_dispatches += len(post_chunk)
-                        logging.info(f"✅ Batch [{j//POST_CHUNK_SIZE + 1}] Stored {len(post_chunk)} NEW dissected records in KV.")
+                        logging.info(f"✅ Batch [{j//POST_CHUNK_SIZE + 1}] Stored {len(post_chunk)} records in KV.")
                     else:
                         logging.error(f"❌ Worker Error [{res.status_code}]: {res.text}")
                 except Exception as e:

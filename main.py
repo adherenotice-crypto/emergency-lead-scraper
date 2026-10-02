@@ -1,40 +1,37 @@
 import os
 import re
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 import time
 import json
-import csv
-import io
-import pandas as pd
 import logging
-import urllib.parse
+import requests
 from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # =====================================================================
-# 1. ENVIRONMENT CONFIGURATION & KEYS
+# 1. ENVIRONMENT CONFIGURATION & ROTATION SETTINGS
 # =====================================================================
 WORKER_URL = os.getenv("WORKER_URL") or "https://emergencyaudit.com"
 MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY") or "EmergencyAudit_Master_Key_2026!"
 TRACERFY_API_KEY = os.getenv("TRACERFY_API_KEY") or os.getenv("TRACEFY_API_KEY")
-APIFY_TOKEN = os.getenv("APIFY_TOKEN")
 
 ENABLE_AUTO_SKIP_TRACE = (os.getenv("ENABLE_AUTO_SKIP_TRACE") or "true").lower() == "true"
 
-# Optimized Surplus Thresholds
-MIN_COUNTY_SURPLUS = float(os.getenv("MIN_COUNTY_SURPLUS") or 5000.00)   # $5k+ for County Overbids
-MIN_STATE_SURPLUS = float(os.getenv("MIN_STATE_SURPLUS") or 10000.00)   # $10k+ for CA SCO Unclaimed Assets
+# AUTO-ROTATION RETENTION PERIOD (DAYS)
+MAX_LEAD_AGE_DAYS = int(os.getenv("MAX_LEAD_AGE_DAYS") or 30)  # Default: Purge unsold leads > 30 days old
+
+MIN_COUNTY_SURPLUS = float(os.getenv("MIN_COUNTY_SURPLUS") or 5000.00)
+MIN_STATE_SURPLUS = float(os.getenv("MIN_STATE_SURPLUS") or 10000.00)
 
 PAUSE_PIPELINE = (os.getenv("PAUSE_PIPELINE") or "false").lower() == "true"
 DRY_RUN = (os.getenv("DRY_RUN") or "false").lower() in ["true", "1", "yes"]
 STAGING_MODE = (os.getenv("STAGING_MODE") or "false").lower() == "true"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36",
     "X-Emergency-Key": MASTER_ADMIN_KEY
 }
 
@@ -44,31 +41,95 @@ session.mount("https://", HTTPAdapter(max_retries=retries))
 session.mount("http://", HTTPAdapter(max_retries=retries))
 
 # =====================================================================
-# 2. REMOTE DEDUPLICATION (PREVENTS DUPLICATE WRITES TO KV)
+# 2. AUTO-ROTATION & DEAD LEAD PURGE ENGINE
+# =====================================================================
+def auto_rotate_old_leads():
+    """Queries KV, calculates lead age, and purges unsold records older than MAX_LEAD_AGE_DAYS."""
+    endpoint = f"{WORKER_URL.rstrip('/')}/api/inbound-lead-hook"
+    delete_endpoint = f"{WORKER_URL.rstrip('/')}/api/admin/delete-batch"
+    
+    logging.info(f"🔄 [ROTATION ENGINE] Scanning KV for leads older than {MAX_LEAD_AGE_DAYS} days...")
+    
+    try:
+        res = session.get(endpoint, headers=HEADERS, timeout=15)
+        if res.status_code != 200:
+            logging.warning("⚠️ Could not retrieve lead list for rotation check.")
+            return
+
+        all_records = res.json()
+        if not isinstance(all_records, list):
+            return
+
+        expired_ids = []
+        now = datetime.now()
+
+        for record in all_records:
+            if not isinstance(record, dict):
+                continue
+
+            case_id = record.get("record_id") or record.get("caseId")
+            status = str(record.get("status") or "").upper()
+            ingested_str = record.get("ingested_at") or record.get("timestamp")
+
+            # 🛡 PROTECT SOLD LEADS: Never purge revenue-generating / sold deals
+            if "SOLD" in status or record.get("saleDetails"):
+                continue
+
+            # Auto-purge blacklisted / wrong number leads immediately
+            if "BLACKLISTED" in status or "WRONG_NUMBER" in status:
+                if case_id:
+                    expired_ids.append(case_id)
+                continue
+
+            # Check lead age
+            if ingested_str:
+                try:
+                    # Parse timestamp (e.g., '2026-09-01 12:00:00 PST')
+                    clean_time_str = ingested_str.replace(" PST", "").strip()
+                    ingested_dt = datetime.strptime(clean_time_str, "%Y-%m-%d %H:%M:%S")
+                    age_days = (now - ingested_dt).days
+
+                    if age_days >= MAX_LEAD_AGE_DAYS:
+                        if case_id:
+                            expired_ids.append(case_id)
+                            logging.info(f"  └─ 🗑 Flagged for rotation: #{case_id} (Age: {age_days} days)")
+                except Exception:
+                    pass
+
+        if expired_ids:
+            logging.info(f"🧹 Rotated out {len(expired_ids)} stale/dead lead(s). Executing purge...")
+            if not DRY_RUN:
+                del_res = session.post(delete_endpoint, json={"dropIds": expired_ids}, headers=HEADERS, timeout=20)
+                if del_res.status_code == 200:
+                    logging.info(f"✅ Successfully purged {len(expired_ids)} stale record(s) from KV.")
+                else:
+                    logging.error(f"❌ Rotation purge error [{del_res.status_code}]: {del_res.text}")
+            else:
+                logging.info(f"🧪 [DRY RUN] Would purge: {expired_ids}")
+        else:
+            logging.info("✨ Pipeline is clean. No stale leads require rotation.")
+
+    except Exception as e:
+        logging.error(f"⚠️ Rotation engine exception: {e}")
+
+# =====================================================================
+# 3. HELPER FUNCTIONS
 # =====================================================================
 def fetch_existing_kv_record_ids():
-    """Queries Cloudflare Worker for currently stored case IDs."""
     endpoint = f"{WORKER_URL.rstrip('/')}/api/inbound-lead-hook"
     try:
-        logging.info("🔍 Checking Cloudflare KV for existing ledger records...")
         res = session.get(endpoint, headers=HEADERS, timeout=12)
         if res.status_code == 200:
             data = res.json()
             if isinstance(data, list):
-                existing_ids = {
+                return {
                     item.get("record_id") or item.get("caseId") or item.get("citation_id")
                     for item in data if isinstance(item, dict)
                 }
-                logging.info(f"📊 Found {len(existing_ids)} existing record(s) in Cloudflare KV.")
-                return existing_ids
     except Exception as e:
-        logging.warning(f"⚠️ Could not fetch existing KV ledger state: {e}. Proceeding with clean dedup.")
-    
+        logging.warning(f"⚠️ Could not fetch existing KV ledger state: {e}")
     return set()
 
-# =====================================================================
-# 3. HELPER FUNCTIONS: PARSING & DISSECTION ENGINES
-# =====================================================================
 def parse_surplus_amount(raw_amt):
     if not raw_amt:
         return None, 0.0
@@ -117,13 +178,10 @@ def validate_surplus_record(record):
     return True, "VALID_SURPLUS"
 
 # =====================================================================
-# 4. DISSECTED LIVE FEEDS (STATE SCO + SOCAL COUNTIES)
+# 4. DISSECTED LIVE FEEDS
 # =====================================================================
 def fetch_fresh_ca_sco_leads():
-    """Live feed for CA State Controller (SCO) Unclaimed Property Data."""
-    logging.info("🌐 Dissecting live CA State Controller (SCO) unclaimed directory...")
     sco_leads = []
-    
     socal_state_assets = [
         {"owner": "OLEG ROZENFELD", "addr": "5340 LAS VIRGENES RD", "city": "Calabasas", "apn": "2052015044", "amt": 42500.00, "county": "Los Angeles"},
         {"owner": "FADDE MIKHAIL", "addr": "29935 RAINBOW CREST DR", "city": "Agoura Hills", "apn": "2053018054", "amt": 28900.00, "county": "Los Angeles"},
@@ -139,35 +197,23 @@ def fetch_fresh_ca_sco_leads():
         if amt >= MIN_STATE_SURPLUS:
             cid = generate_deterministic_case_id(item["apn"], item["addr"])
             sco_leads.append({
-                "record_id": cid,
-                "citation_id": cid,
-                "caseId": cid,
-                "owner_name": item["owner"],
-                "leadName": item["owner"],
+                "record_id": cid, "citation_id": cid, "caseId": cid,
+                "owner_name": item["owner"], "leadName": item["owner"],
                 "address": f"{item['addr']}, {item['city']}, CA 91302",
-                "city": item["city"],
-                "state": "CA",
-                "zip": "91302",
-                "apn": f"SCO-{item['apn']}",
-                "default_amount": f"${amt:,.2f} Surplus Credit",
+                "city": item["city"], "state": "CA", "zip": "91302",
+                "apn": f"SCO-{item['apn']}", "default_amount": f"${amt:,.2f} Surplus Credit",
                 "source_origin": "CA State Controller (SCO) Unclaimed Property",
                 "county": item["county"],
                 "asset_type": "Unclaimed Financial Property held by State Controller",
                 "category": "STATE UNCLAIMED FINANCIAL ASSET",
                 "value_tier": classify_value_tier(amt),
                 "script_pitch": f"State-held unclaimed surplus financial asset from {item['city']}, CA.",
-                "phone": "PENDING UNMASK",
-                "email": "N/A"
+                "phone": "PENDING UNMASK", "email": "N/A"
             })
-
-    logging.info(f"✅ Dissected {len(sco_leads)} live State Controller records.")
     return sco_leads
 
 def fetch_fresh_socal_county_leads():
-    """Live scrapers for SoCal County Excess Proceeds lists (LA TTC & regional)."""
-    logging.info("🌐 Dissecting live SoCal County Tax Sale Excess Proceeds listings...")
     county_leads = []
-
     try:
         la_ttc_urls = [
             "https://ttc.lacounty.gov/notice-of-excess-proceeds/",
@@ -188,52 +234,34 @@ def fetch_fresh_socal_county_leads():
                             if amt_val >= MIN_COUNTY_SURPLUS:
                                 cid = generate_deterministic_case_id(raw_apn, cols[2] if len(cols) > 2 else "")
                                 county_leads.append({
-                                    "record_id": cid,
-                                    "citation_id": cid,
-                                    "caseId": cid,
+                                    "record_id": cid, "citation_id": cid, "caseId": cid,
                                     "owner_name": cols[1] if len(cols) > 1 else "RECORDED PROPERTY OWNER",
                                     "leadName": cols[1] if len(cols) > 1 else "RECORDED PROPERTY OWNER",
                                     "address": cols[2] if len(cols) > 2 else f"Parcel {raw_apn}, Los Angeles, CA",
-                                    "city": "Los Angeles",
-                                    "state": "CA",
-                                    "zip": "90012",
-                                    "apn": raw_apn,
-                                    "default_amount": f"${amt_val:,.2f} Surplus Credit",
+                                    "city": "Los Angeles", "state": "CA", "zip": "90012",
+                                    "apn": raw_apn, "default_amount": f"${amt_val:,.2f} Surplus Credit",
                                     "source_origin": "LA County Treasurer-Collector (TTC)",
                                     "county": "Los Angeles",
                                     "asset_type": "Tax-Defaulted Auction Excess Proceeds (CA Rev & Tax § 4675)",
                                     "category": "TAX SALE EXCESS PROCEEDS",
                                     "value_tier": classify_value_tier(amt_val),
                                     "script_pitch": f"Unclaimed excess overbid funds from LA County tax auction for APN {raw_apn}.",
-                                    "phone": "PENDING UNMASK",
-                                    "email": "N/A"
+                                    "phone": "PENDING UNMASK", "email": "N/A"
                                 })
     except Exception as e:
         logging.warning(f"⚠️ LA County scraper warning: {e}")
-
-    logging.info(f"✅ Dissected {len(county_leads)} verified SoCal County Excess Proceeds record(s).")
     return county_leads
 
 # =====================================================================
-# 5. TRACERFY SKIP TRACING ENGINE
+# 5. TRACERFY SKIP TRACING
 # =====================================================================
 def run_tracerfy_skip_trace(leads_batch):
-    """Passes dissected leads to Tracerfy API to unmask owner phones & emails."""
-    if not TRACERFY_API_KEY:
-        logging.info("ℹ️ TRACERFY_API_KEY not configured. Skipping live Tracerfy lookup.")
-        return leads_batch
-
-    if not ENABLE_AUTO_SKIP_TRACE:
-        logging.info("ℹ️ Skip tracing disabled (ENABLE_AUTO_SKIP_TRACE is False).")
+    if not TRACERFY_API_KEY or not ENABLE_AUTO_SKIP_TRACE:
         return leads_batch
 
     logging.info(f"⚡ [TRACERFY ENGINE] Unmasking contact information for {len(leads_batch)} lead(s)...")
-    
     tracerfy_endpoint = "https://tracerfy.com/v1/api/trace/lookup/"
-    headers = {
-        "Authorization": f"Bearer {TRACERFY_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {TRACERFY_API_KEY}", "Content-Type": "application/json"}
 
     for lead in leads_batch:
         if lead.get("phone") and lead["phone"] != "PENDING UNMASK":
@@ -253,45 +281,34 @@ def run_tracerfy_skip_trace(leads_batch):
                 data = res.json()
                 phone = data.get("phone") or data.get("primary_phone") or data.get("phone_1")
                 email = data.get("email") or data.get("primary_email")
-                
                 if phone:
                     clean_phone = re.sub(r"\D", "", str(phone))
-                    if len(clean_phone) == 10:
-                        lead["phone"] = f"+1{clean_phone}"
-                    elif len(clean_phone) == 11 and clean_phone.startswith("1"):
-                        lead["phone"] = f"+{clean_phone}"
-                    else:
-                        lead["phone"] = str(phone)
-                    logging.info(f"  └─ 🎯 Tracerfy Match: {lead['owner_name']} -> {lead['phone']}")
-                
+                    lead["phone"] = f"+1{clean_phone}" if len(clean_phone) == 10 else str(phone)
                 if email:
                     lead["email"] = email
-            else:
-                logging.warning(f"⚠️ Tracerfy API response [{res.status_code}]: {res.text}")
         except Exception as e:
             logging.error(f"⚠️ Tracerfy lookup exception for {lead.get('owner_name')}: {e}")
 
     return leads_batch
 
 # =====================================================================
-# 6. DATASET AGGREGATION & PIPELINE DISPATCH
+# 6. EXECUTION PIPELINE
 # =====================================================================
-def load_all_lead_datasets():
-    all_leads = []
-    all_leads.extend(fetch_fresh_ca_sco_leads())
-    all_leads.extend(fetch_fresh_socal_county_leads())
-    return all_leads
-
 if __name__ == "__main__":
     if PAUSE_PIPELINE:
-        logging.info("⏸️ PAUSE_PIPELINE is set to true. Exiting cleanly.")
+        logging.info("⏸️ PAUSE_PIPELINE is true. Exiting cleanly.")
         exit(0)
 
-    logging.info("🚀 Dissected Surplus Lead Ingress Engine Active.")
-    
+    logging.info("🚀 Surplus Lead Ingress & Auto-Rotation Engine Active.")
+
+    # STEP 1: EXECUTE AUTO-ROTATION (PURGE STALE/DEAD LEADS FIRST)
+    auto_rotate_old_leads()
+
+    # STEP 2: LOAD & FILTER FRESH LEADS
     existing_kv_ids = fetch_existing_kv_record_ids()
-    real_leads = load_all_lead_datasets()
-    logging.info(f"📥 Total Aggregated Feed: {len(real_leads)} raw record(s). Filtering...")
+    real_leads = []
+    real_leads.extend(fetch_fresh_ca_sco_leads())
+    real_leads.extend(fetch_fresh_socal_county_leads())
 
     seen_identifiers = set()
     prepared_records = []
@@ -301,19 +318,18 @@ if __name__ == "__main__":
         apn = parcel.get("apn")
         addr = parcel.get("address")
         dedup_key = apn if (apn and apn != "PENDING VERIFICATION") else addr
-        
+
         if dedup_key in seen_identifiers:
             continue
         seen_identifiers.add(dedup_key)
 
-        is_valid, reason = validate_surplus_record(parcel)
+        is_valid, _ = validate_surplus_record(parcel)
         if not is_valid:
             continue
 
         cid = parcel.get("record_id") or generate_deterministic_case_id(apn, addr)
         parcel["record_id"] = cid
 
-        # DEDUPLICATION RE-ENABLED:
         if cid in existing_kv_ids:
             continue
 
@@ -322,30 +338,25 @@ if __name__ == "__main__":
         prepared_records.append(parcel)
 
     if not prepared_records:
-        logging.info("🛡 SAFEGUARD ACTIVE: 0 new leads found. All records already exist in Cloudflare KV.")
+        logging.info("🛡 SAFEGUARD ACTIVE: 0 new leads found after rotation.")
         exit(0)
 
     logging.info(f"✨ Found {len(prepared_records)} NEW lead(s) for skip-tracing and KV dispatch!")
 
-    # Step 1: Run Tracerfy Skip Tracing
+    # STEP 3: SKIP TRACE & DISPATCH
     enriched_records = run_tracerfy_skip_trace(prepared_records)
 
-    # Step 2: Format Dissected Payload for Cloudflare KV
     dispatch_queue = []
     for parcel in enriched_records:
         cid = parcel["record_id"]
         dispatch_queue.append({
-            "record_id": cid,
-            "citation_id": cid,
-            "caseId": cid,
+            "record_id": cid, "citation_id": cid, "caseId": cid,
             "address": parcel.get("address"),
             "owner_name": parcel.get("owner_name"),
             "leadName": parcel.get("owner_name"),
             "phone": parcel.get("phone", "PENDING UNMASK"),
             "email": parcel.get("email", "N/A"),
             "apn": parcel.get("apn"),
-            
-            # Dissected Metadata
             "source_origin": parcel.get("source_origin"),
             "county": parcel.get("county"),
             "asset_type": parcel.get("asset_type"),
@@ -353,33 +364,26 @@ if __name__ == "__main__":
             "value_tier": parcel.get("value_tier"),
             "script_pitch": parcel.get("script_pitch"),
             "default_amount": parcel.get("default_amount"),
-            
             "is_new": True,
             "ingested_at": parcel.get("ingested_at"),
             "status": "NEW_LEAD" if not STAGING_MODE else "PENDING_REVIEW"
         })
 
-    # Step 3: Dispatch Payload to Cloudflare Worker
     if dispatch_queue:
-        logging.info(f"🚀 Dispatching {len(dispatch_queue)} dissected surplus record(s) to Cloudflare KV...")
         endpoint = f"{WORKER_URL.rstrip('/')}/api/inbound-lead-hook"
         headers = {"Content-Type": "application/json", "X-Emergency-Key": MASTER_ADMIN_KEY}
-
         POST_CHUNK_SIZE = 25
         successful_dispatches = 0
+
         for j in range(0, len(dispatch_queue), POST_CHUNK_SIZE):
             post_chunk = dispatch_queue[j:j + POST_CHUNK_SIZE]
-            if DRY_RUN:
-                logging.info(f"🧪 [DRY RUN] Would post chunk of {len(post_chunk)} items")
-            else:
+            if not DRY_RUN:
                 try:
                     res = session.post(endpoint, json=post_chunk, headers=headers, timeout=30)
                     if res.status_code == 200:
                         successful_dispatches += len(post_chunk)
-                        logging.info(f"✅ Batch [{j//POST_CHUNK_SIZE + 1}] Stored {len(post_chunk)} records in KV.")
-                    else:
-                        logging.error(f"❌ Worker Error [{res.status_code}]: {res.text}")
+                        logging.info(f"✅ Stored batch [{j//POST_CHUNK_SIZE + 1}] in KV.")
                 except Exception as e:
                     logging.error(f"⚠️ Dispatch Exception: {e}")
 
-        logging.info(f"🎉 Ingress Complete! {successful_dispatches}/{len(dispatch_queue)} dissected surplus records live on dashboard.")
+        logging.info(f"🎉 Pipeline Run Complete! {successful_dispatches}/{len(dispatch_queue)} fresh lead(s) live on dashboard.")

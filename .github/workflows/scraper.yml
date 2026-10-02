@@ -32,5 +32,7 @@ jobs:
           WORKER_URL: "https://emergencyaudit.com"
           MASTER_ADMIN_KEY: ${{ secrets.MASTER_ADMIN_KEY || 'EmergencyAudit_Master_Key_2026!' }}
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+          TRACERFY_API_KEY: ${{ secrets.TRACERFY_API_KEY }}
+          ENABLE_AUTO_SKIP_TRACE: "true"
         run: |
           python main.py

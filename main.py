@@ -25,8 +25,8 @@ APIFY_TOKEN = os.getenv("APIFY_TOKEN")
 
 ENABLE_AUTO_SKIP_TRACE = (os.getenv("ENABLE_AUTO_SKIP_TRACE") or "true").lower() == "true"
 
-# Optimized Surplus Thresholds (Expanded Net)
-MIN_COUNTY_SURPLUS = float(os.getenv("MIN_COUNTY_SURPLUS") or 5000.00)   # $5k+ for County Overbids (1-Yr Statutory Limit)
+# Optimized Surplus Thresholds
+MIN_COUNTY_SURPLUS = float(os.getenv("MIN_COUNTY_SURPLUS") or 5000.00)   # $5k+ for County Overbids
 MIN_STATE_SURPLUS = float(os.getenv("MIN_STATE_SURPLUS") or 10000.00)   # $10k+ for CA SCO Unclaimed Assets
 
 PAUSE_PIPELINE = (os.getenv("PAUSE_PIPELINE") or "false").lower() == "true"
@@ -124,7 +124,6 @@ def fetch_fresh_ca_sco_leads():
     logging.info("🌐 Dissecting live CA State Controller (SCO) unclaimed directory...")
     sco_leads = []
     
-    # Active SoCal Unclaimed Assets (Within 1-3 Year Claim Window)
     socal_state_assets = [
         {"owner": "OLEG ROZENFELD", "addr": "5340 LAS VIRGENES RD", "city": "Calabasas", "apn": "2052015044", "amt": 42500.00, "county": "Los Angeles"},
         {"owner": "FADDE MIKHAIL", "addr": "29935 RAINBOW CREST DR", "city": "Agoura Hills", "apn": "2053018054", "amt": 28900.00, "county": "Los Angeles"},
@@ -169,7 +168,6 @@ def fetch_fresh_socal_county_leads():
     logging.info("🌐 Dissecting live SoCal County Tax Sale Excess Proceeds listings...")
     county_leads = []
 
-    # LA County TTC Web Scraper
     try:
         la_ttc_urls = [
             "https://ttc.lacounty.gov/notice-of-excess-proceeds/",
@@ -315,9 +313,9 @@ if __name__ == "__main__":
         cid = parcel.get("record_id") or generate_deterministic_case_id(apn, addr)
         parcel["record_id"] = cid
 
-        # BYPASS DEDUPLICATION TO UNMASK MASKED LEADS IN KV:
-        # if cid in existing_kv_ids:
-        #     continue
+        # DEDUPLICATION RE-ENABLED:
+        if cid in existing_kv_ids:
+            continue
 
         parcel["is_new"] = True
         parcel["ingested_at"] = current_timestamp
@@ -327,7 +325,7 @@ if __name__ == "__main__":
         logging.info("🛡 SAFEGUARD ACTIVE: 0 new leads found. All records already exist in Cloudflare KV.")
         exit(0)
 
-    logging.info(f"✨ Found {len(prepared_records)} lead(s) for skip-tracing and KV update!")
+    logging.info(f"✨ Found {len(prepared_records)} NEW lead(s) for skip-tracing and KV dispatch!")
 
     # Step 1: Run Tracerfy Skip Tracing
     enriched_records = run_tracerfy_skip_trace(prepared_records)
@@ -347,7 +345,7 @@ if __name__ == "__main__":
             "email": parcel.get("email", "N/A"),
             "apn": parcel.get("apn"),
             
-            # Dissected Metadata Passed to Cloudflare & Dashboard
+            # Dissected Metadata
             "source_origin": parcel.get("source_origin"),
             "county": parcel.get("county"),
             "asset_type": parcel.get("asset_type"),

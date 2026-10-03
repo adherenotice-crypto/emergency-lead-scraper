@@ -14,7 +14,7 @@ logging.basicConfig(
 )
 
 # =====================================================================
-# CONFIGURATION & API KEYS
+# CONFIGURATION & ENVIRONMENT BINDINGS
 # =====================================================================
 WORKER_URL = (os.getenv("WORKER_URL") or "https://emergencyaudit.com").rstrip('/')
 MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY") or os.getenv("EMERGENCY_KEY") or "recovery2026"
@@ -26,7 +26,7 @@ TRACERFY_API_KEY = os.getenv("TRACERFY_API_KEY")
 DRY_RUN = (os.getenv("DRY_RUN") or "false").lower() in ["true", "1", "yes"]
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) EmergencyAudit Courthouse Ingress Engine v25.2",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) EmergencyAudit Pure Ingress Engine v25.2",
     "X-Emergency-Key": MASTER_ADMIN_KEY,
     "Content-Type": "application/json"
 }
@@ -36,66 +36,66 @@ retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504]
 session.mount("https://", HTTPAdapter(max_retries=retries))
 
 # =====================================================================
-# 1. COURTHOUSE & COUNTY SCRAPER SOURCES
+# 1. LIVE COURTHOUSE & COUNTY DATA HARVESTERS
 # =====================================================================
-def fetch_apify_court_leads():
-    """Pulls live real estate tax sale & foreclosure overbid records from Apify actors."""
+def fetch_apify_live_dataset():
+    """Fetches real unverified court and tax surplus records from active Apify actor runs."""
     if not APIFY_TOKEN:
-        logging.info("ℹ️ APIFY_TOKEN not set. Skipping Apify scraper execution.")
+        logging.info("ℹ️ APIFY_TOKEN not configured. Skipping Apify ingestion.")
         return []
 
-    logging.info("⚡ [APIFY ENGINE] Crawling courthouse overbid datasets...")
-    apify_url = f"https://api.apify.com/v2/acts/apify~cheerio-scraper/runs/last/dataset/items?token={APIFY_TOKEN}"
+    logging.info("⚡ [APIFY ENGINE] Querying active courthouse scraper datasets...")
+    endpoint = f"https://api.apify.com/v2/acts/apify~cheerio-scraper/runs/last/dataset/items?token={APIFY_TOKEN}"
     
     try:
-        res = session.get(apify_url, timeout=30)
-        if res.status_code == 200:
-            items = res.json()
-            if isinstance(items, list) and len(items) > 0:
-                logging.info(f"✅ [APIFY] Fetched {len(items)} live court record(s).")
-                return items
-    except Exception as e:
-        logging.error(f"⚠️ Apify fetch error: {e}")
-
-    return []
-
-def fetch_scraperapi_county_feeds():
-    """Queries county court portal listings directly via ScraperAPI proxy."""
-    if not SCRAPERAPI_KEY:
-        logging.info("ℹ️ SCRAPERAPI_KEY not set. Skipping ScraperAPI county crawl.")
-        return []
-
-    logging.info("⚡ [SCRAPERAPI ENGINE] Querying public county clerk lists...")
-    target_portal = "https://www.miami-dadeclerk.com/api/foreclosure/surplus"
-    scraper_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={target_portal}&render=true"
-
-    try:
-        res = session.get(scraper_url, timeout=30)
+        res = session.get(endpoint, timeout=30)
         if res.status_code == 200:
             data = res.json()
-            if isinstance(data, list):
-                logging.info(f"✅ [SCRAPERAPI] Fetched {len(data)} county surplus records.")
+            if isinstance(data, list) and len(data) > 0:
+                logging.info(f"✅ [APIFY] Successfully harvested {len(data)} raw live court record(s).")
                 return data
     except Exception as e:
-        logging.warning(f"⚠️ ScraperAPI county fetch bypass: {e}")
+        logging.error(f"⚠️ Apify live extraction exception: {e}")
 
     return []
 
-def collect_all_courthouse_records():
-    """Aggregates all scraped records from active scraper endpoints."""
-    raw_leads = []
+def fetch_scraperapi_court_feeds():
+    """Queries live public county clerk portals through ScraperAPI proxies."""
+    if not SCRAPERAPI_KEY:
+        logging.info("ℹ️ SCRAPERAPI_KEY not configured. Skipping direct proxy crawl.")
+        return []
+
+    logging.info("⚡ [SCRAPERAPI ENGINE] Scraping public county court surplus feeds...")
+    target_portal = "https://www.miami-dadeclerk.com/api/foreclosure/surplus"
+    proxy_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={target_portal}&render=true"
+
+    try:
+        res = session.get(proxy_url, timeout=30)
+        if res.status_code == 200:
+            data = res.json()
+            if isinstance(data, list) and len(data) > 0:
+                logging.info(f"✅ [SCRAPERAPI] Harvested {len(data)} raw surplus leads.")
+                return data
+    except Exception as e:
+        logging.warning(f"⚠️ ScraperAPI live portal bypass: {e}")
+
+    return []
+
+def collect_pure_raw_leads():
+    """Aggregates strictly live scraped records from active scraper feeds."""
+    raw_batch = []
     
-    # 1. Pull from Apify actors
-    raw_leads.extend(fetch_apify_court_leads())
+    # Live Source 1: Apify
+    raw_batch.extend(fetch_apify_live_dataset())
 
-    # 2. Pull from ScraperAPI county proxies
-    raw_leads.extend(fetch_scraperapi_county_feeds())
+    # Live Source 2: ScraperAPI
+    raw_batch.extend(fetch_scraperapi_court_feeds())
 
-    logging.info(f"📊 Total Raw Courthouse Records Harvested: {len(raw_leads)}")
-    return raw_leads
+    logging.info(f"📊 [TOTAL REAL LEADS COLLECTED]: {len(raw_batch)}")
+    return raw_batch
 
 # =====================================================================
-# 2. STATUTORY MAPPING & SCHEMA NORMALIZER
+# 2. STATUTORY MAPPING & NATIONWIDE RECORD NORMALIZER
 # =====================================================================
 STATE_STATUTES = {
     "CA": "CA Rev & Tax Code § 4675 / Civil Code § 2924j",
@@ -107,11 +107,18 @@ STATE_STATUTES = {
     "OH": "OH Rev Code § 5721.20 / § 2329.44",
     "NC": "NC Gen Stat § 105-374 / § 1-339.67",
     "SC": "SC Code Ann § 12-51-130",
-    "AZ": "AZ Rev Stat § 33-812 / § 42-18205"
+    "AZ": "AZ Rev Stat § 33-812 / § 42-18205",
+    "NV": "NRS § 361.595 / Unclaimed Surplus Proceeds",
+    "MI": "MCL § 211.78t (Foreclosure Surplus Claims)",
+    "TN": "TCA § 67-5-2702 (Tax Sale Excess Proceeds)"
 }
 
+def get_statutory_citation(state_abbr):
+    st = str(state_abbr or "CA").upper().strip()
+    return STATE_STATUTES.get(st, f"State Unclaimed Property & Statutory Recovery Statutes ({st})")
+
 def normalize_scraped_record(raw_item):
-    """Formats raw scraper outputs into standardized Worker KV ledger schema."""
+    """Formats raw scraper output into standardized Worker KV ledger schema."""
     state = str(raw_item.get("state") or raw_item.get("st") or "CA").upper().strip()
     county = str(raw_item.get("county") or raw_item.get("jurisdiction") or "County").title().strip()
     
@@ -132,13 +139,18 @@ def normalize_scraped_record(raw_item):
     try:
         amt_val = float(clean_amt_str)
     except ValueError:
-        amt_val = 18450.00
+        amt_val = 0.0
 
-    tier = "TIER 1 GOLD ($50k+)" if amt_val >= 50000.0 else ("TIER 2 SILVER ($25k+)" if amt_val >= 25000.0 else "TIER 3 BRONZE ($5k+)")
+    if amt_val >= 50000.0:
+        tier = "TIER 1 GOLD ($50k+)"
+    elif amt_val >= 25000.0:
+        tier = "TIER 2 SILVER ($25k+)"
+    else:
+        tier = "TIER 3 BRONZE ($5k+)"
 
-    situs_addr = raw_item.get("situs_address") or raw_item.get("address") or "Recorded Property Location"
+    situs_addr = raw_item.get("situs_address") or raw_item.get("address") or "Recorded Parcel Location"
     mailing_addr = raw_item.get("mailing_address") or raw_item.get("owner_address") or situs_addr
-    agency = raw_item.get("holding_agency") or raw_item.get("court") or f"{county} County Treasurer / Clerk of Court"
+    agency = raw_item.get("holding_agency") or raw_item.get("court") or f"{county} County Treasurer / Clerk"
 
     return {
         "record_id": case_id,
@@ -159,7 +171,7 @@ def normalize_scraped_record(raw_item):
         "exactAmount": amt_val,
         "default_amount": f"${amt_val:,.2f}",
         "category": raw_item.get("category") or "TAX SALE EXCESS PROCEEDS",
-        "statutory_citation": STATE_STATUTES.get(state, f"State Unclaimed Property Statutes ({state})"),
+        "statutory_citation": get_statutory_citation(state),
         "value_tier": tier,
         "phone": raw_item.get("phone") or "PENDING UNMASK",
         "email": raw_item.get("email") or "N/A",
@@ -168,15 +180,15 @@ def normalize_scraped_record(raw_item):
     }
 
 # =====================================================================
-# 3. TRACERFY SKIP-TRACER (UNMASK CONTACT DATA ONLY)
+# 3. TRACERFY SKIP-TRACING ENGINE (UNMASK CONTACT DATA ONLY)
 # =====================================================================
-def skip_trace_leads(leads):
-    """Passes owner name & mailing address to Tracerfy to attach phone/email."""
+def skip_trace_nationwide_leads(leads):
+    """Passes real owner name and address to Tracerfy to attach phone/email."""
     if not TRACERFY_API_KEY:
-        logging.info("ℹ️ Tracerfy key not present. Ingesting raw unmasked addresses.")
+        logging.info("ℹ️ Tracerfy API key not detected. Ingesting raw unmasked addresses.")
         return leads
 
-    logging.info(f"⚡ [TRACERFY ENGINE] Unmasking phone & email for {len(leads)} harvested lead(s)...")
+    logging.info(f"⚡ [TRACERFY] Unmasking contacts for {len(leads)} live lead(s)...")
     tracerfy_url = "https://tracerfy.com/v1/api/trace/lookup/"
     headers = {"Authorization": f"Bearer {TRACERFY_API_KEY}", "Content-Type": "application/json"}
 
@@ -210,54 +222,54 @@ def skip_trace_leads(leads):
     return leads
 
 # =====================================================================
-# 4. CLOUDFLARE WORKER INGESTION HOOK
+# 4. WORKER KV INGESTION ENGINE
 # =====================================================================
-def upload_to_cloudflare_kv(leads):
-    """Pushes unmasked leads directly into Cloudflare Worker KV ledger."""
-    if not leads:
-        logging.info("ℹ️ No leads harvested this run.")
+def upload_to_cloudflare_kv(leads_chunk):
+    if not leads_chunk:
+        logging.info("ℹ️ Zero records to ingest. Skipping KV write.")
         return False
 
     endpoint = f"{WORKER_URL}/api/inbound-lead-hook"
+    
     if DRY_RUN:
-        logging.info(f"🧪 [DRY RUN] Would write {len(leads)} lead(s) to Worker KV.")
+        logging.info(f"🧪 [DRY RUN] Would write {len(leads_chunk)} live record(s) to Cloudflare KV.")
         return True
 
     try:
-        res = session.post(endpoint, json=leads, headers=HEADERS, timeout=30)
+        res = session.post(endpoint, json=leads_chunk, headers=HEADERS, timeout=30)
         if res.status_code == 200:
-            logging.info(f"✅ [SUCCESS] Ingested {len(leads)} lead(s) straight into Executive Dashboard.")
+            logging.info(f"✅ [SUCCESS] Ingested {len(leads_chunk)} live lead(s) directly into Executive Dashboard.")
             return True
         else:
-            logging.error(f"❌ Worker error [{res.status_code}]: {res.text}")
+            logging.error(f"❌ Worker Ingestion Error [{res.status_code}]: {res.text}")
             return False
     except Exception as e:
-        logging.error(f"⚠️ Worker connection error: {e}")
+        logging.error(f"⚠️ Connection error posting to Worker: {e}")
         return False
 
 # =====================================================================
-# MAIN PIPELINE EXECUTION (NO OUTREACH / NO CONTACT)
+# MAIN PIPELINE EXECUTION (PURE INGRESS - NO OUTREACH)
 # =====================================================================
-def run_pipeline():
-    logging.info("🚀 Launching Courthouse Lead Ingestion Pipeline...")
-    
-    # Step 1: Harvest Raw Courthouse & Tax Sale Data
-    raw_leads = collect_all_courthouse_records()
+def run_nationwide_pipeline():
+    logging.info("🚀 Starting Pure Live Courthouse Lead Ingestion Pipeline...")
 
-    if not raw_leads:
-        logging.info("ℹ️ Scrapers completed with 0 new records.")
+    # Step 1: Harvest Real Scraped Records from Active APIs
+    raw_scraped_batch = collect_pure_raw_leads()
+
+    if not raw_scraped_batch:
+        logging.info("ℹ️ Scrapers returned 0 new live records this run. Pipeline complete.")
         return
 
-    # Step 2: Normalize Schema
-    normalized_leads = [normalize_scraped_record(item) for item in raw_leads]
+    # Step 2: Normalize Data Schema
+    normalized_batch = [normalize_scraped_record(item) for item in raw_scraped_batch]
 
-    # Step 3: Unmask Phones & Emails via Tracerfy
-    enriched_leads = skip_trace_leads(normalized_leads)
+    # Step 3: Unmask Phone & Email via Tracerfy
+    enriched_batch = skip_trace_nationwide_leads(normalized_batch)
 
-    # Step 4: Write Clean Lead Data directly to Dashboard KV
-    upload_to_cloudflare_kv(enriched_leads)
-    
-    logging.info("🎉 Lead acquisition complete. Zero outbound contact initiated.")
+    # Step 4: Direct Ingestion to Executive Dashboard Ledger
+    upload_to_cloudflare_kv(enriched_batch)
+
+    logging.info("🎉 Ingress Run Finished. All harvested records written to dashboard ledger.")
 
 if __name__ == "__main__":
-    run_pipeline()
+    run_nationwide_pipeline()

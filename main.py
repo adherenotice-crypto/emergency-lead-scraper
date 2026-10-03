@@ -14,7 +14,7 @@ logging.basicConfig(
 )
 
 # =====================================================================
-# CONFIGURATION & PRODUCTION SECRETS
+# CONFIGURATION & API KEYS
 # =====================================================================
 WORKER_URL = (os.getenv("WORKER_URL") or "https://emergencyaudit.com").rstrip('/')
 MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY") or os.getenv("EMERGENCY_KEY") or "recovery2026"
@@ -23,11 +23,10 @@ APIFY_TOKEN = os.getenv("APIFY_TOKEN")
 SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY")
 TRACERFY_API_KEY = os.getenv("TRACERFY_API_KEY")
 
-SMS_BATCH_LIMIT = int(os.getenv("SMS_BATCH_LIMIT") or 50)
 DRY_RUN = (os.getenv("DRY_RUN") or "false").lower() in ["true", "1", "yes"]
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) EmergencyAudit Live Pipeline Engine v25.2",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) EmergencyAudit Courthouse Ingress Engine v25.2",
     "X-Emergency-Key": MASTER_ADMIN_KEY,
     "Content-Type": "application/json"
 }
@@ -37,17 +36,15 @@ retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504]
 session.mount("https://", HTTPAdapter(max_retries=retries))
 
 # =====================================================================
-# 1. LIVE DATA SCRAPER ENGINES (APIFY & SCRAPERAPI INTEGRATION)
+# 1. COURTHOUSE & COUNTY SCRAPER SOURCES
 # =====================================================================
-def fetch_apify_surplus_leads():
-    """Pulls live real estate tax sale & foreclosure overbid records using Apify Actor API."""
+def fetch_apify_court_leads():
+    """Pulls live real estate tax sale & foreclosure overbid records from Apify actors."""
     if not APIFY_TOKEN:
-        logging.warning("⚠️ APIFY_TOKEN not set. Skipping Apify scraper run.")
+        logging.info("ℹ️ APIFY_TOKEN not set. Skipping Apify scraper execution.")
         return []
 
-    logging.info("⚡ [APIFY ENGINE] Fetching live scraped surplus & auction leads...")
-    
-    # Query Apify dataset / actor runs for active scraped leads
+    logging.info("⚡ [APIFY ENGINE] Crawling courthouse overbid datasets...")
     apify_url = f"https://api.apify.com/v2/acts/apify~cheerio-scraper/runs/last/dataset/items?token={APIFY_TOKEN}"
     
     try:
@@ -55,23 +52,20 @@ def fetch_apify_surplus_leads():
         if res.status_code == 200:
             items = res.json()
             if isinstance(items, list) and len(items) > 0:
-                logging.info(f"✅ [APIFY] Retrieved {len(items)} live lead(s) from Apify.")
+                logging.info(f"✅ [APIFY] Fetched {len(items)} live court record(s).")
                 return items
-        logging.info("ℹ️ Apify dataset empty or actor idle. Falling back to ScraperAPI endpoint...")
     except Exception as e:
-        logging.error(f"⚠️ Apify fetch exception: {e}")
+        logging.error(f"⚠️ Apify fetch error: {e}")
 
     return []
 
 def fetch_scraperapi_county_feeds():
-    """Pulls public court overbid listings via ScraperAPI directly."""
+    """Queries county court portal listings directly via ScraperAPI proxy."""
     if not SCRAPERAPI_KEY:
-        logging.warning("⚠️ SCRAPERAPI_KEY not set. Skipping ScraperAPI public portal crawl.")
+        logging.info("ℹ️ SCRAPERAPI_KEY not set. Skipping ScraperAPI county crawl.")
         return []
 
-    logging.info("⚡ [SCRAPERAPI ENGINE] Querying public county overbid lists...")
-    
-    # Example target endpoint routing through ScraperAPI proxy
+    logging.info("⚡ [SCRAPERAPI ENGINE] Querying public county clerk lists...")
     target_portal = "https://www.miami-dadeclerk.com/api/foreclosure/surplus"
     scraper_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={target_portal}&render=true"
 
@@ -80,30 +74,28 @@ def fetch_scraperapi_county_feeds():
         if res.status_code == 200:
             data = res.json()
             if isinstance(data, list):
-                logging.info(f"✅ [SCRAPERAPI] Pulled {len(data)} live county surplus records.")
+                logging.info(f"✅ [SCRAPERAPI] Fetched {len(data)} county surplus records.")
                 return data
     except Exception as e:
-        logging.warning(f"⚠️ ScraperAPI live fetch bypass: {e}")
+        logging.warning(f"⚠️ ScraperAPI county fetch bypass: {e}")
 
     return []
 
-def collect_all_live_scraped_records():
-    """Aggregates all live data sources into a unified pipeline batch."""
-    records = []
+def collect_all_courthouse_records():
+    """Aggregates all scraped records from active scraper endpoints."""
+    raw_leads = []
     
-    # Source 1: Apify Scrapers
-    apify_data = fetch_apify_surplus_leads()
-    records.extend(apify_data)
+    # 1. Pull from Apify actors
+    raw_leads.extend(fetch_apify_court_leads())
 
-    # Source 2: ScraperAPI Public Portals
-    scraperapi_data = fetch_scraperapi_county_feeds()
-    records.extend(scraperapi_data)
+    # 2. Pull from ScraperAPI county proxies
+    raw_leads.extend(fetch_scraperapi_county_feeds())
 
-    logging.info(f"📊 [TOTAL LIVE COLLECTED]: {len(records)} raw record(s) ready for normalization.")
-    return records
+    logging.info(f"📊 Total Raw Courthouse Records Harvested: {len(raw_leads)}")
+    return raw_leads
 
 # =====================================================================
-# 2. STATUTORY CODE CLASSIFIER & NORMALIZER
+# 2. STATUTORY MAPPING & SCHEMA NORMALIZER
 # =====================================================================
 STATE_STATUTES = {
     "CA": "CA Rev & Tax Code § 4675 / Civil Code § 2924j",
@@ -119,7 +111,7 @@ STATE_STATUTES = {
 }
 
 def normalize_scraped_record(raw_item):
-    """Standardizes raw scraper dicts into Worker v25.2.3 canonical schema."""
+    """Formats raw scraper outputs into standardized Worker KV ledger schema."""
     state = str(raw_item.get("state") or raw_item.get("st") or "CA").upper().strip()
     county = str(raw_item.get("county") or raw_item.get("jurisdiction") or "County").title().strip()
     
@@ -167,24 +159,24 @@ def normalize_scraped_record(raw_item):
         "exactAmount": amt_val,
         "default_amount": f"${amt_val:,.2f}",
         "category": raw_item.get("category") or "TAX SALE EXCESS PROCEEDS",
-        "statutory_citation": STATE_STATUTES.get(state, f"State Surplus Statutes ({state})"),
+        "statutory_citation": STATE_STATUTES.get(state, f"State Unclaimed Property Statutes ({state})"),
         "value_tier": tier,
         "phone": raw_item.get("phone") or "PENDING UNMASK",
         "email": raw_item.get("email") or "N/A",
-        "status": "READY_FOR_DISPATCH",
+        "status": "UNSOLD_LEAD",
         "ingested_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S PST")
     }
 
 # =====================================================================
-# 3. TRACERFY SKIP-TRACING ENGINE
+# 3. TRACERFY SKIP-TRACER (UNMASK CONTACT DATA ONLY)
 # =====================================================================
 def skip_trace_leads(leads):
-    """Passes owner name & mailing address to Tracerfy to unmask mobile phone lines."""
+    """Passes owner name & mailing address to Tracerfy to attach phone/email."""
     if not TRACERFY_API_KEY:
-        logging.info("ℹ️ Tracerfy API key not active. Skipping skip-trace step.")
+        logging.info("ℹ️ Tracerfy key not present. Ingesting raw unmasked addresses.")
         return leads
 
-    logging.info(f"⚡ [TRACERFY ENGINE] Unmasking contacts for {len(leads)} lead(s)...")
+    logging.info(f"⚡ [TRACERFY ENGINE] Unmasking phone & email for {len(leads)} harvested lead(s)...")
     tracerfy_url = "https://tracerfy.com/v1/api/trace/lookup/"
     headers = {"Authorization": f"Bearer {TRACERFY_API_KEY}", "Content-Type": "application/json"}
 
@@ -218,106 +210,54 @@ def skip_trace_leads(leads):
     return leads
 
 # =====================================================================
-# 4. CLOUDFLARE WORKER INGESTION
+# 4. CLOUDFLARE WORKER INGESTION HOOK
 # =====================================================================
 def upload_to_cloudflare_kv(leads):
+    """Pushes unmasked leads directly into Cloudflare Worker KV ledger."""
     if not leads:
-        logging.info("ℹ️ No leads to upload to Worker.")
+        logging.info("ℹ️ No leads harvested this run.")
         return False
 
     endpoint = f"{WORKER_URL}/api/inbound-lead-hook"
     if DRY_RUN:
-        logging.info(f"🧪 [DRY RUN] Would upload {len(leads)} lead(s) to Cloudflare KV.")
+        logging.info(f"🧪 [DRY RUN] Would write {len(leads)} lead(s) to Worker KV.")
         return True
 
     try:
         res = session.post(endpoint, json=leads, headers=HEADERS, timeout=30)
         if res.status_code == 200:
-            logging.info(f"✅ [WORKER KV INGESTION SUCCESS]: {len(leads)} lead(s) pushed to live dashboard.")
+            logging.info(f"✅ [SUCCESS] Ingested {len(leads)} lead(s) straight into Executive Dashboard.")
             return True
         else:
-            logging.error(f"❌ Worker Ingestion Error [{res.status_code}]: {res.text}")
+            logging.error(f"❌ Worker error [{res.status_code}]: {res.text}")
             return False
     except Exception as e:
-        logging.error(f"⚠️ Worker post error: {e}")
+        logging.error(f"⚠️ Worker connection error: {e}")
         return False
 
 # =====================================================================
-# 5. DIRECT SMS OUTREACH DISPATCH
-# =====================================================================
-def execute_sms_outreach(leads, limit=SMS_BATCH_LIMIT):
-    sms_endpoint = f"{WORKER_URL}/api/send-sms-direct"
-    sent_count = 0
-
-    logging.info(f"📲 Executing SMS Outreach Sequence (Limit: {limit})...")
-
-    for lead in leads:
-        if sent_count >= limit:
-            break
-
-        phone = lead.get("phone", "")
-        clean_phone = re.sub(r"[^\d]", "", phone)
-
-        if not clean_phone or len(clean_phone) < 10 or phone == "PENDING UNMASK":
-            continue
-
-        case_id = lead["record_id"]
-        owner_first = lead["owner_name"].split()[0].title() if lead.get("owner_name") else "Property Owner"
-        amt = lead.get("default_amount")
-        agency = lead.get("holding_agency")
-        county = lead.get("county")
-        state = lead.get("state")
-        notice_url = f"{WORKER_URL}/c/{case_id}"
-
-        message_body = (
-            f"Emergency Audit Notice for {owner_first}: An uncollected surplus balance of {amt} "
-            f"is held by the {agency} ({county} County, {state}) under File #{lead.get('real_case_number')}. "
-            f"Review your verified audit file here: {notice_url}"
-        )
-
-        payload = {
-            "phone": clean_phone,
-            "caseId": case_id,
-            "message": message_body
-        }
-
-        if not DRY_RUN:
-            try:
-                res = session.post(f"{sms_endpoint}?key={MASTER_ADMIN_KEY}", json=payload, headers=HEADERS, timeout=10)
-                if res.status_code == 200 and res.json().get("success"):
-                    sent_count += 1
-                    logging.info(f"🚀 [{sent_count}/{limit}] SMS Delivered -> {clean_phone} ({county} Co, {state})")
-            except Exception as e:
-                logging.error(f"⚠️ SMS Exception for {clean_phone}: {e}")
-            time.sleep(0.5)
-
-    logging.info(f"🎉 Pipeline Execution Complete. Delivered {sent_count} outreach message(s).")
-
-# =====================================================================
-# MAIN PIPELINE EXECUTION
+# MAIN PIPELINE EXECUTION (NO OUTREACH / NO CONTACT)
 # =====================================================================
 def run_pipeline():
-    logging.info("🚀 Launching EmergencyAudit Live Ingress Pipeline...")
+    logging.info("🚀 Launching Courthouse Lead Ingestion Pipeline...")
     
-    # Step 1: Collect Live Scraped Records via Apify / ScraperAPI
-    raw_leads = collect_all_live_scraped_records()
+    # Step 1: Harvest Raw Courthouse & Tax Sale Data
+    raw_leads = collect_all_courthouse_records()
 
     if not raw_leads:
-        logging.info("ℹ️ No new live scraper feeds returned this cycle.")
+        logging.info("ℹ️ Scrapers completed with 0 new records.")
         return
 
     # Step 2: Normalize Schema
-    normalized = [normalize_scraped_record(item) for item in raw_leads]
+    normalized_leads = [normalize_scraped_record(item) for item in raw_leads]
 
-    # Step 3: Skip-Trace Contacts via Tracerfy
-    enriched = skip_trace_leads(normalized)
+    # Step 3: Unmask Phones & Emails via Tracerfy
+    enriched_leads = skip_trace_leads(normalized_leads)
 
-    # Step 4: Push Records to Cloudflare Worker KV
-    upload_to_cloudflare_kv(enriched)
-
-    # Step 5: Dispatch SMS Outreach
-    execute_sms_outreach(enriched, limit=SMS_BATCH_LIMIT)
+    # Step 4: Write Clean Lead Data directly to Dashboard KV
+    upload_to_cloudflare_kv(enriched_leads)
+    
+    logging.info("🎉 Lead acquisition complete. Zero outbound contact initiated.")
 
 if __name__ == "__main__":
     run_pipeline()
-    run_nationwide_pipeline(sample_github_scraped_leads)

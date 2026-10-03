@@ -8,20 +8,23 @@ from datetime import datetime
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+    level=logging.INFO, 
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
 # =====================================================================
-# CONFIGURATION
+# CONFIGURATION & ENVIRONMENT BINDINGS
 # =====================================================================
-WORKER_URL = os.getenv("WORKER_URL") or "https://emergencyaudit.com"
-MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY") or "EmergencyAudit_Master_Key_2026!"
+WORKER_URL = (os.getenv("WORKER_URL") or "https://emergencyaudit.com").rstrip('/')
+MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY") or os.getenv("EMERGENCY_KEY") or "recovery2026"
 TRACERFY_API_KEY = os.getenv("TRACERFY_API_KEY")
 
 SMS_BATCH_LIMIT = int(os.getenv("SMS_BATCH_LIMIT") or 50)
 DRY_RUN = (os.getenv("DRY_RUN") or "false").lower() in ["true", "1", "yes"]
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 Nationwide Scraper Engine",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) EmergencyAudit Ingress Engine v25.2",
     "X-Emergency-Key": MASTER_ADMIN_KEY,
     "Content-Type": "application/json"
 }
@@ -43,12 +46,15 @@ STATE_STATUTES = {
     "OH": "OH Rev Code § 5721.20 / § 2329.44",
     "NC": "NC Gen Stat § 105-374 / § 1-339.67",
     "SC": "SC Code Ann § 12-51-130",
-    "AZ": "AZ Rev Stat § 33-812 / § 42-18205"
+    "AZ": "AZ Rev Stat § 33-812 / § 42-18205",
+    "NV": "NRS § 361.595 / Unclaimed Surplus Proceeds",
+    "MI": "MCL § 211.78t (Foreclosure Surplus Claims)",
+    "TN": "TCA § 67-5-2702 (Tax Sale Excess Proceeds)"
 }
 
 def get_statutory_citation(state_abbr):
     """Returns exact legal statute governing unclaimed excess proceeds for the given state."""
-    st = str(state_abbr or "").upper().strip()
+    st = str(state_abbr or "CA").upper().strip()
     return STATE_STATUTES.get(st, f"State Unclaimed Property & Judicial Surplus Recovery Statutes ({st})")
 
 # =====================================================================
@@ -57,12 +63,11 @@ def get_statutory_citation(state_abbr):
 def normalize_scraped_record(raw_item):
     """Normalizes raw scraper dicts from any state/county into Worker v25.2.3 schema."""
     state = str(raw_item.get("state") or raw_item.get("st") or "CA").upper().strip()
-    county = str(raw_item.get("county") or raw_item.get("jurisdiction") or "General County").title().strip()
+    county = str(raw_item.get("county") or raw_item.get("jurisdiction") or "County").title().strip()
     
-    real_case = str(raw_item.get("real_case_number") or raw_item.get("docket_no") or raw_item.get("case_no") or "").strip()
+    real_case = str(raw_item.get("docket_no") or raw_item.get("case_no") or raw_item.get("real_case_number") or "").strip()
     apn = str(raw_item.get("apn") or raw_item.get("parcel_id") or "").strip()
     
-    # Generate canonical Case ID
     clean_apn_digits = re.sub(r"[^\d]", "", apn)
     if real_case and real_case.upper() != "NONE":
         clean_case = re.sub(r"[^\w]", "", real_case).upper()
@@ -72,15 +77,13 @@ def normalize_scraped_record(raw_item):
     else:
         case_id = f"AUD-{state}-{int(time.time())}"
 
-    # Parse financial balance
     raw_amt = raw_item.get("amount") or raw_item.get("exactAmount") or raw_item.get("default_amount") or 0.0
     clean_amt_str = re.sub(r"[^\d.]", "", str(raw_amt))
     try:
         amt_val = float(clean_amt_str)
     except ValueError:
-        amt_val = 15000.00
+        amt_val = 18450.00
 
-    # Categorize value tier
     if amt_val >= 50000.0:
         tier = "TIER 1 GOLD ($50k+)"
     elif amt_val >= 25000.0:
@@ -129,6 +132,7 @@ def normalize_scraped_record(raw_item):
 def skip_trace_nationwide_leads(leads):
     """Passes owner name and mailing address to Tracerfy to unmask target phone/email."""
     if not TRACERFY_API_KEY:
+        logging.info("ℹ️ Tracerfy API key not configured. Skipping automated skip-trace step.")
         return leads
 
     logging.info(f"⚡ [TRACERFY ENGINE] Unmasking contact information for {len(leads)} lead(s)...")
@@ -139,7 +143,6 @@ def skip_trace_nationwide_leads(leads):
         if item.get("phone") and item["phone"] != "PENDING UNMASK":
             continue
 
-        # Skip-trace against mailing address first (where owner moved), fallback to situs
         trace_addr = item.get("mailing_address") or item.get("situs_address")
         payload = {
             "address": trace_addr,
@@ -170,16 +173,16 @@ def skip_trace_nationwide_leads(leads):
 # =====================================================================
 def upload_to_cloudflare_kv(leads_chunk):
     """Pushes normalized records into Cloudflare Worker KV."""
-    endpoint = f"{WORKER_URL.rstrip('/')}/api/inbound-lead-hook"
+    endpoint = f"{WORKER_URL}/api/inbound-lead-hook"
     
     if DRY_RUN:
-        logging.info(f"🧪 [DRY RUN] Would upload {len(leads_chunk)} leads to Cloudflare.")
+        logging.info(f"🧪 [DRY RUN] Would upload {len(leads_chunk)} lead(s) to Cloudflare Worker KV.")
         return True
 
     try:
         res = session.post(endpoint, json=leads_chunk, headers=HEADERS, timeout=30)
         if res.status_code == 200:
-            logging.info(f"✅ KV Ingestion Successful: {len(leads_chunk)} record(s) active on dashboard.")
+            logging.info(f"✅ Worker Ingestion Success: {len(leads_chunk)} record(s) active on dashboard.")
             return True
         else:
             logging.error(f"❌ Worker Ingestion Error [{res.status_code}]: {res.text}")
@@ -193,7 +196,7 @@ def upload_to_cloudflare_kv(leads_chunk):
 # =====================================================================
 def execute_sms_outreach(leads, limit=SMS_BATCH_LIMIT):
     """Fires targeted SMS messages to claimants containing precise court and holding details."""
-    sms_endpoint = f"{WORKER_URL.rstrip('/')}/api/send-sms-direct"
+    sms_endpoint = f"{WORKER_URL}/api/send-sms-direct"
     sent_count = 0
 
     logging.info(f"📲 Executing SMS Outreach Sequence (Target: up to {limit} claimants)...")
@@ -214,7 +217,7 @@ def execute_sms_outreach(leads, limit=SMS_BATCH_LIMIT):
         agency = lead.get("holding_agency")
         county = lead.get("county")
         state = lead.get("state")
-        notice_url = f"{WORKER_URL.rstrip('/')}/c/{case_id}"
+        notice_url = f"{WORKER_URL}/c/{case_id}"
 
         message_body = (
             f"Emergency Audit Notice for {owner_first}: An uncollected surplus balance of {amt} "
@@ -243,7 +246,7 @@ def execute_sms_outreach(leads, limit=SMS_BATCH_LIMIT):
             sent_count += 1
             logging.info(f"🧪 [DRY RUN SMS] To: {clean_phone} | Msg: {message_body}")
 
-    logging.info(f"🎉 SMS Outreach Campaign Completed. Total Processed: {sent_count}")
+    logging.info(f"🎉 Pipeline Ingress & Outreach Completed. Total Processed: {sent_count}")
 
 # =====================================================================
 # MAIN PIPELINE EXECUTION
@@ -252,20 +255,12 @@ def run_nationwide_pipeline(raw_scraped_batch):
     """Entry point for processing GitHub scraper outputs."""
     logging.info(f"🚀 Starting Nationwide Processing for {len(raw_scraped_batch)} raw record(s)...")
 
-    # Step 1: Normalize Schema Across All States & Counties
     normalized_batch = [normalize_scraped_record(item) for item in raw_scraped_batch]
-
-    # Step 2: Skip-Trace Contacts (Mailing Address Priority)
     enriched_batch = skip_trace_nationwide_leads(normalized_batch)
-
-    # Step 3: Push Batch to Cloudflare Worker KV Ledger
     upload_to_cloudflare_kv(enriched_batch)
-
-    # Step 4: Fire Direct Text Outreach to Unmasked Claimants
     execute_sms_outreach(enriched_batch, limit=SMS_BATCH_LIMIT)
 
 if __name__ == "__main__":
-    # Test batch simulating nationwide GitHub scrapers pulling from FL, TX, GA, and CA
     sample_github_scraped_leads = [
         {
             "owner_name": "ROBERTO M ARMAS",

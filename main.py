@@ -84,7 +84,6 @@ def auto_rotate_old_leads():
             # Check lead age
             if ingested_str:
                 try:
-                    # Parse timestamp (e.g., '2026-09-01 12:00:00 PST')
                     clean_time_str = ingested_str.replace(" PST", "").strip()
                     ingested_dt = datetime.strptime(clean_time_str, "%Y-%m-%d %H:%M:%S")
                     age_days = (now - ingested_dt).days

@@ -1,7 +1,8 @@
 requests
+urllib3
 pandas
 openpyxl
 xlrd
 pdfplumber
-playwright
 beautifulsoup4
+playwright

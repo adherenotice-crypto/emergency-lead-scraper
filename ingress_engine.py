@@ -39,26 +39,21 @@ STATE_STATUTES = {
     "FL": "FL Statutes § 197.582 & § 45.032",
     "TX": "TX Tax Code § 34.04 & Property Code § 51.002",
     "GA": "O.C.G.A. § 48-4-5 (Tax Sale Excess Funds)",
-    "NY": "NY CPLR § 5236 / Real Property Tax Law § 1136",
-    "PA": "72 P.S. § 5860.205 (Real Estate Tax Sale Law)",
     "OH": "OH Rev Code § 5721.20 / § 2329.44"
 }
 
-# =====================================================================
-# PUBLIC SURPLUS DATASETS (PDF, CSV & HTML TARGET FEEDS)
-# =====================================================================
 PUBLIC_SURPLUS_FEEDS = [
     {
         "state": "FL",
-        "county": "Hillsborough",
+        "county": "Orange",
         "type": "pdf",
-        "url": "https://www.hillsclerk.com/-/media/files/hillsclerk/court-records/foreclosure/surplus-list.pdf"
+        "url": "https://www.myorangeclerk.com/Portals/0/Foreclosure/Surplus_List.pdf"
     },
     {
         "state": "TX",
-        "county": "Harris",
-        "type": "csv",
-        "url": "https://www.hctx.net/Tax-Assessor/ExcessProceeds/DownloadCSV"
+        "county": "Bexar",
+        "type": "pdf",
+        "url": "https://www.bexar.org/DocumentCenter/View/28221/Excess-Proceeds-List-PDF"
     },
     {
         "state": "GA",
@@ -67,118 +62,78 @@ PUBLIC_SURPLUS_FEEDS = [
         "url": "https://www.fultonclerk.org/DocumentCenter/View/1245/Unclaimed-Funds-List-PDF"
     },
     {
-        "state": "CA",
-        "county": "Los Angeles",
-        "type": "html",
-        "url": "https://ttc.lacounty.gov/excess-proceeds-from-tax-defaulted-property-sales/"
+        "state": "OH",
+        "county": "Franklin",
+        "type": "csv",
+        "url": "https://treasurer.franklincountyohio.gov/FranklinCounty/media/Documents/Unclaimed-Funds.csv"
     }
 ]
 
+def get_proxied_url(target_url):
+    if SCRAPERAPI_KEY:
+        return f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={target_url}"
+    return target_url
+
 # =====================================================================
-# 1. FORMAT-SPECIFIC HARVESTERS (PDF, CSV & HTML)
+# 1. MULTI-FORMAT HARVESTERS
 # =====================================================================
 def harvest_pdf_feed(feed):
-    """Downloads PDF report, reads tables and raw text lines for $10k+ surplus."""
     logging.info(f"📄 Harvesting {feed['state']} - {feed['county']} County Surplus PDF...")
     records = []
+    fetch_url = get_proxied_url(feed["url"])
     try:
-        res = session.get(feed["url"], headers={"User-Agent": "Mozilla/5.0"}, timeout=25)
+        res = session.get(fetch_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+        logging.info(f"   [HTTP {res.status_code}] Response received for {feed['county']}")
         if res.status_code == 200:
             with pdfplumber.open(io.BytesIO(res.content)) as pdf:
                 for page in pdf.pages:
-                    # Try structured table extraction first
-                    tables = page.extract_tables()
-                    for table in tables:
-                        for row in table:
-                            row_str = " ".join([str(cell) for cell in row if cell])
-                            amounts = re.findall(r"\$\s*[\d,]+\.\d{2}", row_str)
-                            if amounts:
-                                clean_amt = float(re.sub(r"[^\d.]", "", amounts[-1]))
-                                if clean_amt >= MIN_SURPLUS_THRESHOLD:
-                                    records.append({
-                                        "owner_name": str(row[0]).strip().upper() if row else "RECORDED CLAIMANT",
-                                        "situs_address": str(row[1]).strip().upper() if len(row) > 1 else "RECORDED PROPERTY LOCATION",
-                                        "amount": clean_amt,
-                                        "county": feed["county"],
-                                        "state": feed["state"]
-                                    })
-                    
-                    # Fallback to line-by-line regex parsing if table structure is irregular
-                    if not tables:
-                        text = page.extract_text() or ""
-                        for line in text.split("\n"):
-                            amounts = re.findall(r"\$\s*[\d,]+\.\d{2}", line)
-                            if amounts:
-                                clean_amt = float(re.sub(r"[^\d.]", "", amounts[-1]))
-                                if clean_amt >= MIN_SURPLUS_THRESHOLD:
-                                    clean_line = re.sub(r"\$\s*[\d,]+\.\d{2}", "", line).strip()
-                                    parts = clean_line.split("  ")
-                                    records.append({
-                                        "owner_name": parts[0].strip().upper() if parts else "RECORDED CLAIMANT",
-                                        "situs_address": parts[-1].strip().upper() if len(parts) > 1 else "RECORDED PROPERTY LOCATION",
-                                        "amount": clean_amt,
-                                        "county": feed["county"],
-                                        "state": feed["state"]
-                                    })
-            logging.info(f"✅ Extracted {len(records)} candidate record(s) from {feed['county']} PDF.")
+                    text = page.extract_text() or ""
+                    for line in text.split("\n"):
+                        # Match amounts with or without dollar signs ($10,000.00 or 10000.00)
+                        amounts = re.findall(r"\$?\b[\d,]{4,}\.\d{2}\b", line)
+                        if amounts:
+                            clean_amt = float(re.sub(r"[^\d.]", "", amounts[-1]))
+                            if clean_amt >= MIN_SURPLUS_THRESHOLD:
+                                clean_line = re.sub(r"\$?\b[\d,]{4,}\.\d{2}\b", "", line).strip()
+                                parts = [p.strip() for p in clean_line.split("  ") if p.strip()]
+                                records.append({
+                                    "owner_name": parts[0].upper() if parts else "RECORDED CLAIMANT",
+                                    "situs_address": parts[-1].upper() if len(parts) > 1 else "RECORDED PROPERTY LOCATION",
+                                    "amount": clean_amt,
+                                    "county": feed["county"],
+                                    "state": feed["state"]
+                                })
+            logging.info(f"✅ Extracted {len(records)} record(s) from {feed['county']} PDF.")
     except Exception as e:
         logging.warning(f"⚠️ PDF feed bypass ({feed['county']}): {e}")
     return records
 
 def harvest_csv_feed(feed):
-    """Downloads and parses structured county CSV excess proceed files."""
     logging.info(f"📊 Harvesting {feed['state']} - {feed['county']} County Surplus CSV...")
     records = []
+    fetch_url = get_proxied_url(feed["url"])
     try:
-        res = session.get(feed["url"], headers={"User-Agent": "Mozilla/5.0"}, timeout=25)
+        res = session.get(fetch_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+        logging.info(f"   [HTTP {res.status_code}] Response received for {feed['county']}")
         if res.status_code == 200:
             df = pd.read_csv(io.StringIO(res.text), errors="ignore")
             for _, row in df.iterrows():
                 row_str = " ".join([str(val) for val in row.values])
-                amounts = re.findall(r"\b[\d,]+\.\d{2}\b", row_str)
+                amounts = re.findall(r"\$?\b[\d,]{4,}\.\d{2}\b", row_str)
                 for amt_str in amounts:
                     clean_amt = float(re.sub(r"[^\d.]", "", amt_str))
                     if clean_amt >= MIN_SURPLUS_THRESHOLD:
                         records.append({
-                            "owner_name": str(row.get("Owner") or row.get("Defendant") or row.iloc[0]).strip().upper(),
-                            "situs_address": str(row.get("Address") or row.get("Property Address") or row.iloc[1]).strip().upper(),
+                            "owner_name": str(row.iloc[0]).strip().upper(),
+                            "situs_address": str(row.iloc[1]).strip().upper() if len(row) > 1 else "RECORDED PROPERTY LOCATION",
                             "amount": clean_amt,
                             "county": feed["county"],
                             "state": feed["state"]
                         })
                         break
-            logging.info(f"✅ Extracted {len(records)} candidate record(s) from {feed['county']} CSV.")
+            logging.info(f"✅ Extracted {len(records)} record(s) from {feed['county']} CSV.")
     except Exception as e:
         logging.warning(f"⚠️ CSV feed bypass ({feed['county']}): {e}")
-    return records
-
-def harvest_html_feed(feed):
-    """Scrapes public HTML pages or proxy routes."""
-    logging.info(f"🌐 Harvesting {feed['state']} - {feed['county']} County HTML Portal...")
-    records = []
-    req_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={feed['url']}&render=true" if SCRAPERAPI_KEY else feed["url"]
-    try:
-        res = session.get(req_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
-        if res.status_code == 200:
-            soup = BeautifulSoup(res.text, "html.parser")
-            for row in soup.find_all("tr"):
-                cols = [td.get_text(strip=True) for td in row.find_all("td")]
-                if len(cols) >= 3:
-                    row_str = " ".join(cols)
-                    amounts = re.findall(r"\$\s*[\d,]+\.\d{2}", row_str)
-                    if amounts:
-                        clean_amt = float(re.sub(r"[^\d.]", "", amounts[-1]))
-                        if clean_amt >= MIN_SURPLUS_THRESHOLD:
-                            records.append({
-                                "owner_name": cols[0].strip().upper(),
-                                "situs_address": cols[1].strip().upper() if len(cols) > 1 else "RECORDED PROPERTY LOCATION",
-                                "amount": clean_amt,
-                                "county": feed["county"],
-                                "state": feed["state"]
-                            })
-            logging.info(f"✅ Extracted {len(records)} candidate record(s) from {feed['county']} HTML.")
-    except Exception as e:
-        logging.warning(f"⚠️ HTML feed bypass ({feed['county']}): {e}")
     return records
 
 def collect_all_sources():
@@ -188,12 +143,10 @@ def collect_all_sources():
             raw_harvest.extend(harvest_pdf_feed(feed))
         elif feed["type"] == "csv":
             raw_harvest.extend(harvest_csv_feed(feed))
-        elif feed["type"] == "html":
-            raw_harvest.extend(harvest_html_feed(feed))
     return raw_harvest
 
 # =====================================================================
-# 2. NORMALIZER & $10k STRICT GARBAGE FILTER
+# 2. NORMALIZER & $10k GARBAGE FILTER
 # =====================================================================
 def clean_and_normalize(raw_items):
     logging.info(f"🧹 Enforcing strict ${MIN_SURPLUS_THRESHOLD:,.2f} minimum floor...")
@@ -202,8 +155,6 @@ def clean_and_normalize(raw_items):
 
     for item in raw_items:
         amt_val = float(item.get("amount") or 0.0)
-
-        # REJECT anything under $10,000.00
         if amt_val < MIN_SURPLUS_THRESHOLD:
             continue
 

@@ -6,6 +6,7 @@ import logging
 import requests
 import pdfplumber
 import pandas as pd
+from bs4 import BeautifulSoup
 from datetime import datetime
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -30,7 +31,7 @@ BROWSER_HEADERS = {
 }
 
 WORKER_HEADERS = {
-    "User-Agent": "EmergencyAudit Engine v25.2",
+    "User-Agent": "EmergencyAudit Ingress Engine v25.2",
     "X-Emergency-Key": MASTER_ADMIN_KEY,
     "Content-Type": "application/json"
 }
@@ -39,97 +40,96 @@ session = requests.Session()
 retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
 session.mount("https://", HTTPAdapter(max_retries=retries))
 
+# =====================================================================
+# NATIONWIDE STATUTORY CITATION MAPPING
+# =====================================================================
 STATE_STATUTES = {
     "CA": "CA Rev & Tax Code § 4675 / Civil Code § 2924j",
     "FL": "FL Statutes § 197.582 & § 45.032",
     "TX": "TX Tax Code § 34.04 & Property Code § 51.002",
     "GA": "O.C.G.A. § 48-4-5 (Tax Sale Excess Funds)",
-    "OH": "OH Rev Code § 5721.20 / § 2329.44"
+    "NY": "NY CPLR § 5236 / Real Property Tax Law § 1136",
+    "PA": "72 P.S. § 5860.205 (Real Estate Tax Sale Law)",
+    "OH": "OH Rev Code § 5721.20 / § 2329.44",
+    "NC": "NC Gen Stat § 105-374 / § 1-339.67",
+    "SC": "SC Code Ann § 12-51-130",
+    "AZ": "AZ Rev Stat § 33-812 / § 42-18205",
+    "NV": "NRS § 361.595 / Unclaimed Surplus Proceeds",
+    "MI": "MCL § 211.78t (Foreclosure Surplus Claims)",
+    "TN": "TCA § 67-5-2702 (Tax Sale Excess Proceeds)"
 }
 
+# =====================================================================
+# EXPANDED NATIONWIDE PUBLIC SURPLUS FEEDS
+# =====================================================================
 PUBLIC_SURPLUS_FEEDS = [
-    {
-        "state": "GA",
-        "county": "Fulton",
-        "type": "pdf",
-        "url": "https://www.fultonclerk.org/DocumentCenter/View/1245/Unclaimed-Funds-List-PDF"
-    },
-    {
-        "state": "FL",
-        "county": "Orange",
-        "type": "pdf",
-        "url": "https://www.myorangeclerk.com/Portals/0/Foreclosure/Surplus_List.pdf"
-    },
-    {
-        "state": "TX",
-        "county": "Bexar",
-        "type": "pdf",
-        "url": "https://www.bexar.org/DocumentCenter/View/28221/Excess-Proceeds-List-PDF"
-    },
-    {
-        "state": "OH",
-        "county": "Franklin",
-        "type": "csv",
-        "url": "https://treasurer.franklincountyohio.gov/FranklinCounty/media/Documents/Unclaimed-Funds.csv"
-    }
+    # FLORIDA
+    {"state": "FL", "county": "Orange", "type": "pdf", "url": "https://www.myorangeclerk.com/Portals/0/Foreclosure/Surplus_List.pdf"},
+    {"state": "FL", "county": "Hillsborough", "type": "pdf", "url": "https://www.hillsclerk.com/-/media/files/hillsclerk/court-records/foreclosure/surplus-list.pdf"},
+    {"state": "FL", "county": "Palm Beach", "type": "pdf", "url": "https://www.mypalmbeachclerk.com/home/showpublisheddocument/1230"},
+    # TEXAS
+    {"state": "TX", "county": "Harris", "type": "csv", "url": "https://www.hctx.net/Tax-Assessor/ExcessProceeds/DownloadCSV"},
+    {"state": "TX", "county": "Bexar", "type": "pdf", "url": "https://www.bexar.org/DocumentCenter/View/28221/Excess-Proceeds-List-PDF"},
+    {"state": "TX", "county": "Tarrant", "type": "pdf", "url": "https://www.tarrantcountytx.gov/content/dam/main/tax-assessor-collector/Excess_Proceeds.pdf"},
+    # GEORGIA
+    {"state": "GA", "county": "Fulton", "type": "pdf", "url": "https://www.fultonclerk.org/DocumentCenter/View/1245/Unclaimed-Funds-List-PDF"},
+    {"state": "GA", "county": "DeKalb", "type": "pdf", "url": "https://www.dekalbcountyga.gov/sites/default/files/tax_execs_funds_list.pdf"},
+    # OHIO
+    {"state": "OH", "county": "Franklin", "type": "csv", "url": "https://treasurer.franklincountyohio.gov/FranklinCounty/media/Documents/Unclaimed-Funds.csv"},
+    {"state": "OH", "county": "Cuyahoga", "type": "pdf", "url": "https://treasurer.cuyahogacounty.us/pdf_treasurer/en-US/UnclaimedFundsList.pdf"},
+    # NORTH CAROLINA
+    {"state": "NC", "county": "Mecklenburg", "type": "pdf", "url": "https://www.mecknc.gov/TaxCollector/Documents/Surplus-Funds-List.pdf"}
 ]
 
 def fetch_feed_data(url, name):
-    """Attempts direct fetch first, then tries ScraperAPI with diagnostic logging."""
+    """Direct HTTP fetch with fallback to ScraperAPI proxy."""
     try:
         res = session.get(url, headers=BROWSER_HEADERS, timeout=20)
         if res.status_code == 200 and len(res.content) > 200:
-            logging.info(f"   [Direct HTTP 200] {len(res.content)} bytes retrieved for {name}")
+            logging.info(f"   [Direct HTTP 200] {len(res.content)} bytes for {name}")
             return res.content
-        logging.info(f"   [Direct HTTP {res.status_code}] Direct fetch restricted for {name}")
     except Exception as e:
-        logging.warning(f"   [Direct HTTP Error] {name}: {e}")
+        logging.warning(f"   [Direct HTTP Bypass] {name}: {e}")
 
     if SCRAPERAPI_KEY:
         proxy_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={url}"
         try:
             res = session.get(proxy_url, timeout=30)
-            logging.info(f"   [ScraperAPI HTTP {res.status_code}] Response for {name}")
             if res.status_code == 200 and len(res.content) > 200:
+                logging.info(f"   [ScraperAPI HTTP 200] {len(res.content)} bytes for {name}")
                 return res.content
         except Exception as e:
             logging.warning(f"   [ScraperAPI Error] {name}: {e}")
-    else:
-        logging.info(f"   ℹ️ SCRAPERAPI_KEY not set. Cannot proxy restricted URL for {name}")
 
     return None
 
 def parse_amount(text):
-    """Extracts floating point value from various currency string formats ($10,000, 10000.00, $15,450.50)."""
+    """Cleans currency text into float balance."""
     clean_str = re.sub(r"[^\d.]", "", str(text))
     try:
-        val = float(clean_str)
-        return val
+        return float(clean_str)
     except ValueError:
         return 0.0
 
 # =====================================================================
-# MULTI-FORMAT HARVESTERS
+# 1. HARVESTERS (PDF & CSV)
 # =====================================================================
 def harvest_pdf_feed(feed):
     logging.info(f"📄 Harvesting {feed['state']} - {feed['county']} County Surplus PDF...")
     records = []
     content = fetch_feed_data(feed["url"], feed["county"])
-
     if not content:
         return records
 
     try:
         with pdfplumber.open(io.BytesIO(content)) as pdf:
             for page in pdf.pages:
-                # Primary Strategy: Table Grid Extraction
                 tables = page.extract_tables() or []
                 for table in tables:
                     for row in table:
                         if not row:
                             continue
                         row_str = " ".join([str(c) for c in row if c])
-                        # Regex matches $10,000, $10,000.00, 10000.00
                         amounts = re.findall(r"\$?\b[\d,]{5,}(?:\.\d{2})?\b", row_str)
                         for amt_text in amounts:
                             amt_val = parse_amount(amt_text)
@@ -143,7 +143,6 @@ def harvest_pdf_feed(feed):
                                 })
                                 break
 
-                # Secondary Strategy: Line-by-Line Regex Fallback
                 if not records:
                     text = page.extract_text() or ""
                     for line in text.split("\n"):
@@ -172,7 +171,6 @@ def harvest_csv_feed(feed):
     logging.info(f"📊 Harvesting {feed['state']} - {feed['county']} County Surplus CSV...")
     records = []
     content = fetch_feed_data(feed["url"], feed["county"])
-
     if not content:
         return records
 
@@ -209,7 +207,7 @@ def collect_all_sources():
     return raw_harvest
 
 # =====================================================================
-# NORMALIZER & $10k GARBAGE FILTER
+# 2. NORMALIZER & $10k GARBAGE FILTER
 # =====================================================================
 def clean_and_normalize(raw_items):
     logging.info(f"🧹 Enforcing strict ${MIN_SURPLUS_THRESHOLD:,.2f} minimum floor...")
@@ -267,7 +265,7 @@ def clean_and_normalize(raw_items):
     return clean
 
 # =====================================================================
-# TRACERFY SKIP-TRACING ENGINE
+# 3. TRACERFY SKIP-TRACING ENGINE
 # =====================================================================
 def skip_trace(leads):
     if not TRACERFY_API_KEY or not leads:
@@ -296,7 +294,7 @@ def skip_trace(leads):
     return leads
 
 # =====================================================================
-# WORKER KV INGESTION ENGINE
+# 4. WORKER KV INGESTION ENGINE
 # =====================================================================
 def upload(leads):
     if not leads:
@@ -321,7 +319,7 @@ def upload(leads):
 # MAIN EXECUTION
 # =====================================================================
 if __name__ == "__main__":
-    logging.info("🚀 Launching Universal Multi-Format $10k+ Surplus Scraper...")
+    logging.info("🚀 Launching Nationwide Multi-State $10k+ Ingress Engine...")
     raw_data = collect_all_sources()
     clean_data = clean_and_normalize(raw_data)
     enriched_data = skip_trace(clean_data)

@@ -1,47 +1,40 @@
 name: Surplus Lead Ingress & Skip-Trace Automation
 
 on:
-  schedule:
-    # Runs automatically every 6 hours (00:00, 06:00, 12:00, 18:00 UTC)
-    - cron: "0 */6 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Run in Dry Run Mode (No KV Writes)"
+        description: 'Run in Dry Run Mode (No KV Writes)'
         required: false
-        default: "false"
         type: boolean
+        default: false
+  schedule:
+    - cron: '0 */6 * * *'  # Runs automatically every 6 hours
 
 jobs:
   run-ingress-engine:
     runs-on: ubuntu-latest
-
     steps:
-      - name: 📥 Checkout Repository Code
+      - name: Checkout Repository Code
         uses: actions/checkout@v4
 
-      - name: 🐍 Set up Python 3.11
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
-      - name: 📦 Install Dependencies
+      - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          playwright install chromium
 
-      - name: 🚀 Execute Surplus Lead Ingress Engine
+      - name: Execute Surplus Lead Ingress Engine
         env:
-          WORKER_URL: ${{ secrets.WORKER_URL || 'https://emergencyaudit.com' }}
-          MASTER_ADMIN_KEY: ${{ secrets.MASTER_ADMIN_KEY || secrets.EMERGENCY_KEY }}
-          TRACERFY_API_KEY: ${{ secrets.TRACERFY_API_KEY }}
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          MASTER_ADMIN_KEY: ${{ secrets.MASTER_ADMIN_KEY }}
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
-          APOLLO_API_KEY: ${{ secrets.APOLLO_API_KEY }}
           SCRAPERAPI_KEY: ${{ secrets.SCRAPERAPI_KEY }}
-          TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
-          TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
-          TWILIO_PHONE_NUMBER: ${{ secrets.TWILIO_PHONE_NUMBER }}
-          DRY_RUN: ${{ inputs.dry_run || secrets.DRY_RUN || 'false' }}
-        run: |
-          python ingress_engine.py
+          TRACERFY_API_KEY: ${{ secrets.TRACERFY_API_KEY }}
+          MIN_SURPLUS_THRESHOLD: 1000
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: python ingress_engine.py

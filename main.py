@@ -24,11 +24,11 @@ APIFY_TOKEN = os.getenv("APIFY_TOKEN")
 SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY")
 TRACERFY_API_KEY = os.getenv("TRACERFY_API_KEY")
 
-MIN_SURPLUS_THRESHOLD = float(os.getenv("MIN_SURPLUS_THRESHOLD") or 1000.00)  # Throws away trash under $1k
+MIN_SURPLUS_THRESHOLD = float(os.getenv("MIN_SURPLUS_THRESHOLD") or 1000.00)  # Filters out trash under $1k
 DRY_RUN = (os.getenv("DRY_RUN") or "false").lower() in ["true", "1", "yes"]
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) EmergencyAudit Omni-Ingress Engine v25.2",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) EmergencyAudit Universal Ingress Engine v25.2",
     "X-Emergency-Key": MASTER_ADMIN_KEY,
     "Content-Type": "application/json"
 }
@@ -38,7 +38,44 @@ retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504]
 session.mount("https://", HTTPAdapter(max_retries=retries))
 
 # =====================================================================
-# 1. MULTI-SOURCE SCRAPER SUITE (APIFY, SCRAPERAPI, DIRECT COURTS)
+# 1. DUAL STATUTORY & ASSET CLASSIFIER
+# =====================================================================
+STATE_STATUTES = {
+    "CA": {
+        "UNCLAIMED": "CA Code of Civil Procedure § 1500 et seq. (Unclaimed Property Law)",
+        "TAX": "CA Rev & Tax Code § 4675 (Tax Collector Excess Proceeds)",
+        "MORTGAGE": "CA Civil Code § 2924j (Trustee Foreclosure Surplus)"
+    },
+    "FL": {
+        "UNCLAIMED": "FL Statutes Chapter 717 (Disposition of Unclaimed Property)",
+        "TAX": "FL Statutes § 197.582 (Tax Deed Surplus)",
+        "MORTGAGE": "FL Statutes § 45.032 (Judicial Foreclosure Surplus)"
+    },
+    "TX": {
+        "UNCLAIMED": "TX Property Code Title 6, Chapter 72-74",
+        "TAX": "TX Tax Code § 34.04 (Tax Sale Excess Proceeds)",
+        "MORTGAGE": "TX Property Code § 51.002 (Foreclosure Surplus)"
+    },
+    "GA": {
+        "UNCLAIMED": "O.C.G.A. Title 44, Chapter 12, Article 5",
+        "TAX": "O.C.G.A. § 48-4-5 (Tax Sale Excess Funds)",
+        "MORTGAGE": "O.C.G.A. § 44-14-190 (Mortgage Foreclosure Surplus)"
+    },
+    "NY": {
+        "UNCLAIMED": "NY Abandoned Property Law (APL)",
+        "TAX": "NY Real Property Tax Law § 1136",
+        "MORTGAGE": "NY RPAPL § 1354 / CPLR § 5236"
+    }
+}
+
+def get_statute(state, asset_category):
+    state_dict = STATE_STATUTES.get(state, {})
+    if isinstance(state_dict, dict):
+        return state_dict.get(asset_category, f"State Statutory Recovery Laws ({state})")
+    return f"State Statutory Recovery Laws ({state})"
+
+# =====================================================================
+# 2. MULTI-SOURCE SCRAPER SUITE (APIFY, SCRAPERAPI, DIRECT COURTS)
 # =====================================================================
 def fetch_apify_all_actors():
     """Source 1: Pulls datasets from active Apify web scrapers."""
@@ -67,8 +104,6 @@ def fetch_scraperapi_multi_portals():
 
     logging.info("⚡ [SCRAPERAPI ENGINE] Crawling public clerk portals across FL, TX, GA, CA...")
     harvested = []
-    
-    # Target County Endpoints
     target_urls = [
         ("FL", "Hillsborough", "https://www.flclerks.com/"),
         ("GA", "Fulton", "https://www.fultonclerk.org/"),
@@ -82,7 +117,7 @@ def fetch_scraperapi_multi_portals():
             if res.status_code == 200:
                 soup = BeautifulSoup(res.text, "html.parser")
                 rows = soup.find_all("tr")
-                for row in rows[:15]: # Process top table entries
+                for row in rows[:15]:
                     cols = [td.get_text(strip=True) for td in row.find_all("td")]
                     if len(cols) >= 3:
                         harvested.append({
@@ -99,7 +134,6 @@ def fetch_scraperapi_multi_portals():
     return harvested
 
 def collect_all_sources():
-    """Combines all enabled scraper pipelines into one stream."""
     all_raw = []
     all_raw.extend(fetch_apify_all_actors())
     all_raw.extend(fetch_scraperapi_multi_portals())
@@ -107,101 +141,158 @@ def collect_all_sources():
     return all_raw
 
 # =====================================================================
-# 2. GARBAGE DISPOSAL FILTER & SCHEMA NORMALIZER
+# 3. UNIVERSAL RECORD NORMALIZER (MAPS CSV HEADERS & LIVE SCRAPERS)
 # =====================================================================
-STATE_STATUTES = {
-    "CA": "CA Rev & Tax Code § 4675 / Civil Code § 2924j",
-    "FL": "FL Statutes § 197.582 & § 45.032",
-    "TX": "TX Tax Code § 34.04 & Property Code § 51.002",
-    "GA": "O.C.G.A. § 48-4-5 (Tax Sale Excess Funds)",
-    "NY": "NY CPLR § 5236 / Real Property Tax Law § 1136",
-    "PA": "72 P.S. § 5860.205 (Real Estate Tax Sale Law)",
-    "OH": "OH Rev Code § 5721.20 / § 2329.44",
-    "NC": "NC Gen Stat § 105-374 / § 1-339.67",
-    "SC": "SC Code Ann § 12-51-130",
-    "AZ": "AZ Rev Stat § 33-812 / § 42-18205"
-}
+def normalize_scraped_record(raw_item):
+    """Maps 100% of headers from State Unclaimed Funds, Tax Surplus, and Mortgage Files."""
+    
+    owner_name = str(
+        raw_item.get("Holder Name") or 
+        raw_item.get("owner_name") or 
+        raw_item.get("leadName") or 
+        "RECORDED CLAIMANT"
+    ).strip().upper()
 
+    raw_amt = (
+        raw_item.get("Surplus Amount") or 
+        raw_item.get("Cash Reported") or 
+        raw_item.get("amount") or 
+        raw_item.get("exactAmount") or 
+        0.0
+    )
+    clean_amt_str = re.sub(r"[^\d.]", "", str(raw_amt))
+    try:
+        amt_val = float(clean_amt_str)
+    except ValueError:
+        amt_val = 0.0
+
+    real_case = str(
+        raw_item.get("Case Number") or 
+        raw_item.get("docket_no") or 
+        raw_item.get("case_no") or 
+        raw_item.get("real_case_number") or 
+        ""
+    ).strip()
+
+    situs_addr = str(
+        raw_item.get("Property Address") or 
+        raw_item.get("situs_address") or 
+        raw_item.get("address") or 
+        "Recorded Property Location"
+    ).strip().upper()
+
+    city_state_zip = str(raw_item.get("City State Zip") or "").strip().upper()
+    city, state, zip_code = "LOCAL MUNICIPALITY", "CA", "00000"
+
+    if city_state_zip:
+        match = re.search(r"^(.*?),\s*([A-Z]{2})\s*(\d{5})?", city_state_zip)
+        if match:
+            city = match.group(1).title()
+            state = match.group(2).upper()
+            zip_code = match.group(3) or "00000"
+
+    state = str(raw_item.get("state") or state).upper().strip()
+    county_source = str(
+        raw_item.get("County Source") or 
+        raw_item.get("county") or 
+        raw_item.get("jurisdiction") or 
+        "CALIFORNIA STATE CONTROLLER"
+    ).strip().upper()
+
+    holder_type = str(raw_item.get("Holder Type") or raw_item.get("category") or "").strip().upper()
+    sec_name = str(raw_item.get("Securities Name") or "").strip().upper()
+    shares = str(raw_item.get("Shares Reported") or "0").strip()
+
+    if "IRA" in holder_type or "SECURITIES" in holder_type or sec_name:
+        category_code = "UNCLAIMED"
+        category_label = f"SECURITIES / STOCKS ({sec_name})" if sec_name else "UNCLAIMED SECURITIES / IRA"
+    elif "SAVINGS" in holder_type or "ACCOUNTS" in holder_type or "BANK" in county_source:
+        category_code = "UNCLAIMED"
+        category_label = f"UNCLAIMED BANK FUNDS ({holder_type or 'BANK ACCOUNT'})"
+    elif "TAX" in holder_type or "TAX" in county_source:
+        category_code = "TAX"
+        category_label = "TAX SALE EXCESS PROCEEDS"
+    elif "MORTGAGE" in holder_type or "FORECLOSURE" in holder_type or "TRUSTEE" in holder_type:
+        category_code = "MORTGAGE"
+        category_label = "MORTGAGE FORECLOSURE SURPLUS"
+    else:
+        category_code = "UNCLAIMED"
+        category_label = f"STATE UNCLAIMED FUNDS ({holder_type or 'UNCOLLECTED BALANCE'})"
+
+    clean_apn_digits = re.sub(r"[^\d]", "", str(raw_item.get("apn") or raw_item.get("parcel_id") or ""))
+    if real_case and real_case.upper() != "NONE":
+        clean_case = re.sub(r"[^\w]", "", real_case).upper()
+        case_id = f"AUD-{state}-{clean_case[:16]}"
+    elif len(clean_apn_digits) >= 5:
+        case_id = f"AUD-{state}-{county_source[:4].upper()}-{clean_apn_digits}"
+    else:
+        case_id = f"AUD-{state}-{int(time.time())}"
+
+    tier = "TIER 1 GOLD ($50k+)" if amt_val >= 50000.0 else ("TIER 2 SILVER ($25k+)" if amt_val >= 25000.0 else "TIER 3 BRONZE ($5k+)")
+
+    return {
+        "record_id": case_id,
+        "caseId": case_id,
+        "citation_id": case_id,
+        "real_case_number": real_case or case_id,
+        "owner_name": owner_name,
+        "leadName": owner_name,
+        "situs_address": situs_addr,
+        "address": situs_addr,
+        "mailing_address": raw_item.get("mailing_address") or situs_addr,
+        "city": city,
+        "county": county_source,
+        "state": state,
+        "zip": zip_code,
+        "apn": str(raw_item.get("apn") or raw_item.get("parcel_id") or "PENDING VERIFICATION"),
+        "holding_agency": county_source,
+        "county_source": county_source,
+        "holder_type": holder_type or "STATE UNCLAIMED FUNDS",
+        "category": category_label,
+        "statutory_citation": get_statute(state, category_code),
+        "num_owners": str(raw_item.get("Num Owners") or "1"),
+        "pending_claims": str(raw_item.get("Pending Claims") or "0"),
+        "paid_claims": str(raw_item.get("Paid Claims") or "0"),
+        "shares_reported": shares,
+        "securities_name": sec_name or "N/A",
+        "cash_reported": f"${amt_val:,.2f}",
+        "exactAmount": amt_val,
+        "default_amount": f"${amt_val:,.2f}",
+        "value_tier": tier,
+        "phone": str(raw_item.get("phone") or "PENDING UNMASK"),
+        "email": str(raw_item.get("email") or "N/A"),
+        "status": "UNSOLD_LEAD",
+        "ingested_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S PST")
+    }
+
+# =====================================================================
+# 4. GARBAGE DISPOSAL FILTER
+# =====================================================================
 def clean_and_filter_records(raw_list):
-    """Purges zero balances, duplicate APNs/Cases, and incomplete trash records."""
     logging.info("🧹 [GARBAGE DISPOSAL] Filtering out junk data, low balances, and duplicates...")
     clean_records = []
     seen_case_ids = set()
 
     for item in raw_list:
-        # Extract financial amount
-        raw_amt = item.get("amount") or item.get("exactAmount") or item.get("default_amount") or 0.0
-        clean_amt_str = re.sub(r"[^\d.]", "", str(raw_amt))
-        try:
-            amt_val = float(clean_amt_str)
-        except ValueError:
-            amt_val = 0.0
+        norm = normalize_scraped_record(item)
 
-        # TRASH FILTER 1: Throw away zero or low-value leads below threshold
-        if amt_val < MIN_SURPLUS_THRESHOLD:
+        if norm["exactAmount"] < MIN_SURPLUS_THRESHOLD:
             continue
 
-        owner_name = str(item.get("owner_name") or item.get("leadName") or "").strip()
-        situs_addr = str(item.get("situs_address") or item.get("address") or "").strip()
-
-        # TRASH FILTER 2: Reject empty names or empty property locations
-        if not owner_name or owner_name.upper() in ["N/A", "UNKNOWN", "NONE", "NULL"] and not situs_addr:
+        if not norm["owner_name"] or norm["owner_name"] in ["N/A", "UNKNOWN", "NONE", "NULL"]:
             continue
 
-        state = str(item.get("state") or item.get("st") or "CA").upper().strip()
-        county = str(item.get("county") or item.get("jurisdiction") or "County").title().strip()
-        real_case = str(item.get("docket_no") or item.get("case_no") or item.get("real_case_number") or "").strip()
-        apn = str(item.get("apn") or item.get("parcel_id") or "").strip()
-
-        # Generate canonical ID
-        clean_apn_digits = re.sub(r"[^\d]", "", apn)
-        if real_case and real_case.upper() != "NONE":
-            clean_case = re.sub(r"[^\w]", "", real_case).upper()
-            case_id = f"AUD-{state}-{clean_case[:16]}"
-        elif len(clean_apn_digits) >= 5:
-            case_id = f"AUD-{state}-{county[:4].upper()}-{clean_apn_digits}"
-        else:
-            case_id = f"AUD-{state}-{int(time.time())}"
-
-        # TRASH FILTER 3: Deduplicate in-memory to prevent system clogging
-        if case_id in seen_case_ids:
+        if norm["record_id"] in seen_case_ids:
             continue
-        seen_case_ids.add(case_id)
+        seen_case_ids.add(norm["record_id"])
 
-        tier = "TIER 1 GOLD ($50k+)" if amt_val >= 50000.0 else ("TIER 2 SILVER ($25k+)" if amt_val >= 25000.0 else "TIER 3 BRONZE ($5k+)")
-
-        clean_records.append({
-            "record_id": case_id,
-            "caseId": case_id,
-            "citation_id": case_id,
-            "real_case_number": real_case or case_id,
-            "owner_name": owner_name or "RECORDED CLAIMANT",
-            "leadName": owner_name or "RECORDED CLAIMANT",
-            "situs_address": situs_addr or "Recorded Parcel Location",
-            "address": situs_addr or "Recorded Parcel Location",
-            "mailing_address": item.get("mailing_address") or situs_addr or "Recorded Parcel Location",
-            "city": item.get("city") or "Local Municipality",
-            "county": county,
-            "state": state,
-            "zip": str(item.get("zip") or "00000"),
-            "apn": apn or "PENDING VERIFICATION",
-            "holding_agency": item.get("holding_agency") or f"{county} County Clerk of Court",
-            "exactAmount": amt_val,
-            "default_amount": f"${amt_val:,.2f}",
-            "category": "TAX SALE EXCESS PROCEEDS",
-            "statutory_citation": STATE_STATUTES.get(state, f"State Unclaimed Property Statutes ({state})"),
-            "value_tier": tier,
-            "phone": item.get("phone") or "PENDING UNMASK",
-            "email": item.get("email") or "N/A",
-            "status": "UNSOLD_LEAD",
-            "ingested_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S PST")
-        })
+        clean_records.append(norm)
 
     logging.info(f"✨ [DISPOSAL COMPLETE] Kept {len(clean_records)} pristine record(s). Discarded {len(raw_list) - len(clean_records)} trash entries.")
     return clean_records
 
 # =====================================================================
-# 3. TRACERFY SKIP-TRACING ENGINE (UNMASK CONTACTS ONLY)
+# 5. TRACERFY SKIP-TRACING ENGINE (UNMASK CONTACTS ONLY)
 # =====================================================================
 def skip_trace_clean_leads(leads):
     if not TRACERFY_API_KEY or not leads:
@@ -240,7 +331,7 @@ def skip_trace_clean_leads(leads):
     return leads
 
 # =====================================================================
-# 4. CLOUDFLARE WORKER INGESTION
+# 6. CLOUDFLARE WORKER INGESTION
 # =====================================================================
 def upload_to_cloudflare_kv(leads):
     if not leads:
@@ -268,22 +359,16 @@ def upload_to_cloudflare_kv(leads):
 # MAIN CONTROL ENGINE (ZERO OUTBOUND CONTACT)
 # =====================================================================
 def run_nationwide_pipeline():
-    logging.info("🚀 Launching Omni-Scraper Ingress & Trash Disposal Engine...")
+    logging.info("🚀 Launching Universal Ingress & Trash Disposal Engine...")
     
-    # Step 1: Collect from ALL scraper sources
     raw_harvest = collect_all_sources()
 
     if not raw_harvest:
         logging.info("ℹ️ Scrapers completed with 0 new records.")
         return
 
-    # Step 2: Filter out trash, low balances, incomplete entries, and duplicates
     clean_batch = clean_and_filter_records(raw_harvest)
-
-    # Step 3: Unmask phone/email for clean records
     enriched_batch = skip_trace_clean_leads(clean_batch)
-
-    # Step 4: Write pristine leads to Executive Dashboard (NO TEXTS / NO CALLS)
     upload_to_cloudflare_kv(enriched_batch)
 
     logging.info("🎉 Ingress Run Completed. Leads are active on your dashboard for review!")

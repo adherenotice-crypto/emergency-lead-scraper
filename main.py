@@ -1,6 +1,5 @@
 import os
 import re
-import csv
 import time
 import json
 import logging
@@ -16,7 +15,7 @@ logging.basicConfig(
 )
 
 # =====================================================================
-# CONFIGURATION & ENVIRONMENT BINDINGS
+# CONFIGURATION & ENVIRONMENT BINDINGS ($10k STRICT MINIMUM)
 # =====================================================================
 WORKER_URL = (os.getenv("WORKER_URL") or "https://emergencyaudit.com").rstrip('/')
 MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY") or os.getenv("EMERGENCY_KEY") or "recovery2026"
@@ -25,11 +24,12 @@ APIFY_TOKEN = os.getenv("APIFY_TOKEN")
 SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY")
 TRACERFY_API_KEY = os.getenv("TRACERFY_API_KEY")
 
-MIN_SURPLUS_THRESHOLD = float(os.getenv("MIN_SURPLUS_THRESHOLD") or 1000.00)  # Filters out trash under $1k
+# MANDATED BUYER FEE THRESHOLD: Discards any record below $10,000.00
+MIN_SURPLUS_THRESHOLD = float(os.getenv("MIN_SURPLUS_THRESHOLD") or 10000.00)  
 DRY_RUN = (os.getenv("DRY_RUN") or "false").lower() in ["true", "1", "yes"]
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) EmergencyAudit Universal Ingress Engine v25.2",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) EmergencyAudit Pure Scraper Engine v25.2",
     "X-Emergency-Key": MASTER_ADMIN_KEY,
     "Content-Type": "application/json"
 }
@@ -76,56 +76,30 @@ def get_statute(state, asset_category):
     return f"State Statutory Recovery Laws ({state})"
 
 # =====================================================================
-# 2. LOCAL CSV AUTO-HARVESTER
-# =====================================================================
-def fetch_local_csv_files():
-    """Scans repository folder for any local CSV lead files and reads all rows."""
-    harvested = []
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    
-    for file_name in os.listdir(current_dir):
-        if file_name.lower().endswith(".csv"):
-            file_path = os.path.join(current_dir, file_name)
-            logging.info(f"📄 [LOCAL CSV HARVEST] Found local dataset: {file_name}")
-            try:
-                with open(file_path, mode="r", encoding="utf-8-sig", errors="ignore") as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        harvested.append(row)
-                logging.info(f"✅ [LOCAL CSV] Extracted {len(harvested)} record(s) from {file_name}.")
-            except Exception as e:
-                logging.warning(f"⚠️ Error reading local CSV {file_name}: {e}")
-                
-    return harvested
-
-# =====================================================================
-# 3. MULTI-SOURCE SCRAPER SUITE (APIFY, SCRAPERAPI, DIRECT COURTS)
+# 2. PURE LIVE SCRAPER FEEDS
 # =====================================================================
 def fetch_apify_all_actors():
-    """Source 1: Pulls datasets from active Apify web scrapers."""
     if not APIFY_TOKEN:
         logging.info("ℹ️ [APIFY] Token not set. Bypassing Apify feed.")
         return []
 
-    logging.info("⚡ [APIFY ENGINE] Harvesting multi-state datasets...")
+    logging.info("⚡ [APIFY ENGINE] Harvesting live multi-state court datasets...")
     endpoint = f"https://api.apify.com/v2/acts/apify~cheerio-scraper/runs/last/dataset/items?token={APIFY_TOKEN}"
     try:
         res = session.get(endpoint, timeout=20)
         if res.status_code == 200:
             data = res.json()
             if isinstance(data, list) and len(data) > 0:
-                logging.info(f"✅ [APIFY] Pulled {len(data)} raw record(s).")
+                logging.info(f"✅ [APIFY] Pulled {len(data)} raw live record(s).")
                 return data
     except Exception as e:
-        logging.warning(f"⚠️ Apify multi-feed bypass: {e}")
+        logging.warning(f"⚠️ Apify live feed bypass: {e}")
     return []
 
 def fetch_scraperapi_multi_portals():
-    """Source 2: Queries direct public court surplus portals via ScraperAPI or direct HTTP."""
-    logging.info("⚡ [SCRAPERAPI / DIRECT ENGINE] Crawling public clerk surplus feeds...")
+    logging.info("⚡ [SCRAPERAPI / DIRECT ENGINE] Crawling live public clerk surplus feeds...")
     harvested = []
     
-    # Direct Public Surplus Ledger Targets
     target_urls = [
         ("FL", "Hillsborough", "https://www.hillsclerk.com/Court-Records/Foreclosure-Sales/Surplus-List"),
         ("GA", "Fulton", "https://www.fultonclerk.org/302/Unclaimed-Funds-Surplus"),
@@ -150,32 +124,22 @@ def fetch_scraperapi_multi_portals():
                             "amount": cols[-1]
                         })
         except Exception as e:
-            logging.warning(f"⚠️ Portal fetch skip ({state}/{county}): {e}")
+            logging.warning(f"⚠️ Live portal fetch skip ({state}/{county}): {e}")
 
-    logging.info(f"✅ [PORTALS] Harvested {len(harvested)} raw portal record(s).")
+    logging.info(f"✅ [PORTALS] Harvested {len(harvested)} raw live portal record(s).")
     return harvested
 
 def collect_all_sources():
     all_raw = []
-    
-    # Priority 1: Local CSV Files in repository
-    all_raw.extend(fetch_local_csv_files())
-    
-    # Priority 2: Apify Datasets
     all_raw.extend(fetch_apify_all_actors())
-    
-    # Priority 3: ScraperAPI & Public Court Portals
     all_raw.extend(fetch_scraperapi_multi_portals())
-    
-    logging.info(f"📥 [TOTAL RAW HARVEST]: {len(all_raw)} record(s) collected across all sources.")
+    logging.info(f"📥 [TOTAL LIVE HARVEST]: {len(all_raw)} record(s) scraped across all endpoints.")
     return all_raw
 
 # =====================================================================
-# 4. UNIVERSAL RECORD NORMALIZER
+# 3. UNIVERSAL RECORD NORMALIZER
 # =====================================================================
 def normalize_scraped_record(raw_item):
-    """Maps 100% of headers from State Unclaimed Funds, Tax Surplus, and Mortgage Files."""
-    
     owner_name = str(
         raw_item.get("Holder Name") or 
         raw_item.get("owner_name") or 
@@ -226,12 +190,11 @@ def normalize_scraped_record(raw_item):
         raw_item.get("County Source") or 
         raw_item.get("county") or 
         raw_item.get("jurisdiction") or 
-        "CALIFORNIA STATE CONTROLLER"
+        "COUNTY CLERK / HOLDING AUTHORITY"
     ).strip().upper()
 
     holder_type = str(raw_item.get("Holder Type") or raw_item.get("category") or "").strip().upper()
     sec_name = str(raw_item.get("Securities Name") or "").strip().upper()
-    shares = str(raw_item.get("Shares Reported") or "0").strip()
 
     if "IRA" in holder_type or "SECURITIES" in holder_type or sec_name:
         category_code = "UNCLAIMED"
@@ -246,8 +209,8 @@ def normalize_scraped_record(raw_item):
         category_code = "MORTGAGE"
         category_label = "MORTGAGE FORECLOSURE SURPLUS"
     else:
-        category_code = "UNCLAIMED"
-        category_label = f"STATE UNCLAIMED FUNDS ({holder_type or 'UNCOLLECTED BALANCE'})"
+        category_code = "TAX"
+        category_label = "TAX SALE EXCESS PROCEEDS"
 
     clean_apn_digits = re.sub(r"[^\d]", "", str(raw_item.get("apn") or raw_item.get("parcel_id") or ""))
     if real_case and real_case.upper() != "NONE":
@@ -258,7 +221,7 @@ def normalize_scraped_record(raw_item):
     else:
         case_id = f"AUD-{state}-{int(time.time())}"
 
-    tier = "TIER 1 GOLD ($50k+)" if amt_val >= 50000.0 else ("TIER 2 SILVER ($25k+)" if amt_val >= 25000.0 else "TIER 3 BRONZE ($5k+)")
+    tier = "TIER 1 GOLD ($50k+)" if amt_val >= 50000.0 else ("TIER 2 SILVER ($25k+)" if amt_val >= 25000.0 else "TIER 3 BRONZE ($10k+)")
 
     return {
         "record_id": case_id,
@@ -277,14 +240,9 @@ def normalize_scraped_record(raw_item):
         "apn": str(raw_item.get("apn") or raw_item.get("parcel_id") or "PENDING VERIFICATION"),
         "holding_agency": county_source,
         "county_source": county_source,
-        "holder_type": holder_type or "STATE UNCLAIMED FUNDS",
+        "holder_type": holder_type or "PUBLIC SURPLUS LEDGER",
         "category": category_label,
         "statutory_citation": get_statute(state, category_code),
-        "num_owners": str(raw_item.get("Num Owners") or "1"),
-        "pending_claims": str(raw_item.get("Pending Claims") or "0"),
-        "paid_claims": str(raw_item.get("Paid Claims") or "0"),
-        "shares_reported": shares,
-        "securities_name": sec_name or "N/A",
         "cash_reported": f"${amt_val:,.2f}",
         "exactAmount": amt_val,
         "default_amount": f"${amt_val:,.2f}",
@@ -296,16 +254,17 @@ def normalize_scraped_record(raw_item):
     }
 
 # =====================================================================
-# 5. GARBAGE DISPOSAL FILTER
+# 4. STRICT $10k+ GARBAGE DISPOSAL FILTER
 # =====================================================================
 def clean_and_filter_records(raw_list):
-    logging.info("🧹 [GARBAGE DISPOSAL] Filtering out junk data, low balances, and duplicates...")
+    logging.info(f"🧹 [GARBAGE DISPOSAL] Filtering records below strict ${MIN_SURPLUS_THRESHOLD:,.2f} threshold...")
     clean_records = []
     seen_case_ids = set()
 
     for item in raw_list:
         norm = normalize_scraped_record(item)
 
+        # REJECT anything below $10,000.00
         if norm["exactAmount"] < MIN_SURPLUS_THRESHOLD:
             continue
 
@@ -318,17 +277,17 @@ def clean_and_filter_records(raw_list):
 
         clean_records.append(norm)
 
-    logging.info(f"✨ [DISPOSAL COMPLETE] Kept {len(clean_records)} pristine record(s). Discarded {len(raw_list) - len(clean_records)} trash entries.")
+    logging.info(f"✨ [DISPOSAL COMPLETE] Kept {len(clean_records)} high-value record(s) ($10k+). Discarded {len(raw_list) - len(clean_records)} low-value/junk entries.")
     return clean_records
 
 # =====================================================================
-# 6. TRACERFY SKIP-TRACING ENGINE (UNMASK CONTACTS ONLY)
+# 5. TRACERFY SKIP-TRACING ENGINE
 # =====================================================================
 def skip_trace_clean_leads(leads):
     if not TRACERFY_API_KEY or not leads:
         return leads
 
-    logging.info(f"⚡ [TRACERFY ENGINE] Unmasking phone & email for {len(leads)} verified record(s)...")
+    logging.info(f"⚡ [TRACERFY ENGINE] Unmasking phone & email for {len(leads)} high-value record(s)...")
     tracerfy_url = "https://tracerfy.com/v1/api/trace/lookup/"
     headers = {"Authorization": f"Bearer {TRACERFY_API_KEY}", "Content-Type": "application/json"}
 
@@ -361,22 +320,22 @@ def skip_trace_clean_leads(leads):
     return leads
 
 # =====================================================================
-# 7. CLOUDFLARE WORKER INGESTION
+# 6. CLOUDFLARE WORKER INGESTION
 # =====================================================================
 def upload_to_cloudflare_kv(leads):
     if not leads:
-        logging.info("ℹ️ Zero clean leads to upload this cycle.")
+        logging.info("ℹ️ Zero clean $10k+ leads to upload this cycle.")
         return False
 
     endpoint = f"{WORKER_URL}/api/inbound-lead-hook"
     if DRY_RUN:
-        logging.info(f"🧪 [DRY RUN] Would write {len(leads)} pristine lead(s) to Cloudflare KV.")
+        logging.info(f"🧪 [DRY RUN] Would write {len(leads)} high-value lead(s) to Cloudflare KV.")
         return True
 
     try:
         res = session.post(endpoint, json=leads, headers=HEADERS, timeout=30)
         if res.status_code == 200:
-            logging.info(f"✅ [SUCCESS] Ingested {len(leads)} verified lead(s) directly to Executive Dashboard!")
+            logging.info(f"✅ [SUCCESS] Ingested {len(leads)} verified $10k+ lead(s) directly to Executive Dashboard!")
             return True
         else:
             logging.error(f"❌ Worker error [{res.status_code}]: {res.text}")
@@ -386,10 +345,10 @@ def upload_to_cloudflare_kv(leads):
         return False
 
 # =====================================================================
-# MAIN CONTROL ENGINE (ZERO OUTBOUND CONTACT)
+# MAIN CONTROL ENGINE
 # =====================================================================
 def run_nationwide_pipeline():
-    logging.info("🚀 Launching Universal Ingress & Trash Disposal Engine...")
+    logging.info("🚀 Launching $10k+ High-Yield Ingress Engine...")
     
     raw_harvest = collect_all_sources()
 
@@ -401,7 +360,7 @@ def run_nationwide_pipeline():
     enriched_batch = skip_trace_clean_leads(clean_batch)
     upload_to_cloudflare_kv(enriched_batch)
 
-    logging.info("🎉 Ingress Run Completed. Leads are active on your dashboard for review!")
+    logging.info("🎉 Ingress Run Completed. High-yield $10k+ leads populated on dashboard!")
 
 if __name__ == "__main__":
     run_nationwide_pipeline()

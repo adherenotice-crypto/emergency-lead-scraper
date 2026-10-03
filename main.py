@@ -39,7 +39,7 @@ session.mount("https://", HTTPAdapter(max_retries=retries))
 # 1. LIVE COURTHOUSE & COUNTY DATA HARVESTERS
 # =====================================================================
 def fetch_apify_live_dataset():
-    """Fetches real unverified court and tax surplus records from active Apify actor runs."""
+    """Fetches real court and tax surplus records from active Apify actor runs."""
     if not APIFY_TOKEN:
         logging.info("ℹ️ APIFY_TOKEN not configured. Skipping Apify ingestion.")
         return []
@@ -85,10 +85,10 @@ def collect_pure_raw_leads():
     """Aggregates strictly live scraped records from active scraper feeds."""
     raw_batch = []
     
-    # Live Source 1: Apify
+    # Source 1: Apify Scrapers
     raw_batch.extend(fetch_apify_live_dataset())
 
-    # Live Source 2: ScraperAPI
+    # Source 2: ScraperAPI Public Portals
     raw_batch.extend(fetch_scraperapi_court_feeds())
 
     logging.info(f"📊 [TOTAL REAL LEADS COLLECTED]: {len(raw_batch)}")
@@ -253,7 +253,7 @@ def upload_to_cloudflare_kv(leads_chunk):
 def run_nationwide_pipeline():
     logging.info("🚀 Starting Pure Live Courthouse Lead Ingestion Pipeline...")
 
-    # Step 1: Harvest Real Scraped Records from Active APIs
+    # Step 1: Harvest Real Scraped Records from Active Scrapers / APIs
     raw_scraped_batch = collect_pure_raw_leads()
 
     if not raw_scraped_batch:

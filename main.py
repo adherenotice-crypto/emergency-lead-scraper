@@ -1,5 +1,6 @@
 import os
 import re
+import csv
 import time
 import json
 import logging
@@ -75,7 +76,30 @@ def get_statute(state, asset_category):
     return f"State Statutory Recovery Laws ({state})"
 
 # =====================================================================
-# 2. MULTI-SOURCE SCRAPER SUITE (APIFY, SCRAPERAPI, DIRECT COURTS)
+# 2. LOCAL CSV AUTO-HARVESTER
+# =====================================================================
+def fetch_local_csv_files():
+    """Scans repository folder for any local CSV lead files and reads all rows."""
+    harvested = []
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    for file_name in os.listdir(current_dir):
+        if file_name.lower().endswith(".csv"):
+            file_path = os.path.join(current_dir, file_name)
+            logging.info(f"📄 [LOCAL CSV HARVEST] Found local dataset: {file_name}")
+            try:
+                with open(file_path, mode="r", encoding="utf-8-sig", errors="ignore") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        harvested.append(row)
+                logging.info(f"✅ [LOCAL CSV] Extracted {len(harvested)} record(s) from {file_name}.")
+            except Exception as e:
+                logging.warning(f"⚠️ Error reading local CSV {file_name}: {e}")
+                
+    return harvested
+
+# =====================================================================
+# 3. MULTI-SOURCE SCRAPER SUITE (APIFY, SCRAPERAPI, DIRECT COURTS)
 # =====================================================================
 def fetch_apify_all_actors():
     """Source 1: Pulls datasets from active Apify web scrapers."""
@@ -97,51 +121,57 @@ def fetch_apify_all_actors():
     return []
 
 def fetch_scraperapi_multi_portals():
-    """Source 2: Queries public county court portals via ScraperAPI proxies."""
-    if not SCRAPERAPI_KEY:
-        logging.info("ℹ️ [SCRAPERAPI] Key not set. Bypassing ScraperAPI proxies.")
-        return []
-
-    logging.info("⚡ [SCRAPERAPI ENGINE] Crawling public clerk portals across FL, TX, GA, CA...")
+    """Source 2: Queries direct public court surplus portals via ScraperAPI or direct HTTP."""
+    logging.info("⚡ [SCRAPERAPI / DIRECT ENGINE] Crawling public clerk surplus feeds...")
     harvested = []
+    
+    # Direct Public Surplus Ledger Targets
     target_urls = [
-        ("FL", "Hillsborough", "https://www.flclerks.com/"),
-        ("GA", "Fulton", "https://www.fultonclerk.org/"),
-        ("TX", "Harris", "https://www.hcdistrictclerk.com/")
+        ("FL", "Hillsborough", "https://www.hillsclerk.com/Court-Records/Foreclosure-Sales/Surplus-List"),
+        ("GA", "Fulton", "https://www.fultonclerk.org/302/Unclaimed-Funds-Surplus"),
+        ("TX", "Harris", "https://www.hctx.net/Tax-Assessor/ExcessProceeds")
     ]
 
     for state, county, url in target_urls:
-        proxy_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={url}&render=false"
+        request_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={url}&render=true" if SCRAPERAPI_KEY else url
         try:
-            res = session.get(proxy_url, timeout=15)
+            res = session.get(request_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
             if res.status_code == 200:
                 soup = BeautifulSoup(res.text, "html.parser")
                 rows = soup.find_all("tr")
-                for row in rows[:15]:
+                for row in rows:
                     cols = [td.get_text(strip=True) for td in row.find_all("td")]
-                    if len(cols) >= 3:
+                    if len(cols) >= 3 and cols[0]:
                         harvested.append({
                             "owner_name": cols[0],
-                            "situs_address": cols[1],
+                            "situs_address": cols[1] if len(cols) > 1 else "Recorded Location",
                             "county": county,
                             "state": state,
                             "amount": cols[-1]
                         })
         except Exception as e:
-            logging.warning(f"⚠️ ScraperAPI portal skip ({state}/{county}): {e}")
+            logging.warning(f"⚠️ Portal fetch skip ({state}/{county}): {e}")
 
-    logging.info(f"✅ [SCRAPERAPI] Harvested {len(harvested)} raw portal record(s).")
+    logging.info(f"✅ [PORTALS] Harvested {len(harvested)} raw portal record(s).")
     return harvested
 
 def collect_all_sources():
     all_raw = []
+    
+    # Priority 1: Local CSV Files in repository
+    all_raw.extend(fetch_local_csv_files())
+    
+    # Priority 2: Apify Datasets
     all_raw.extend(fetch_apify_all_actors())
+    
+    # Priority 3: ScraperAPI & Public Court Portals
     all_raw.extend(fetch_scraperapi_multi_portals())
-    logging.info(f"📥 [TOTAL RAW HARVEST]: {len(all_raw)} record(s) collected across all scrapers.")
+    
+    logging.info(f"📥 [TOTAL RAW HARVEST]: {len(all_raw)} record(s) collected across all sources.")
     return all_raw
 
 # =====================================================================
-# 3. UNIVERSAL RECORD NORMALIZER (MAPS CSV HEADERS & LIVE SCRAPERS)
+# 4. UNIVERSAL RECORD NORMALIZER
 # =====================================================================
 def normalize_scraped_record(raw_item):
     """Maps 100% of headers from State Unclaimed Funds, Tax Surplus, and Mortgage Files."""
@@ -266,7 +296,7 @@ def normalize_scraped_record(raw_item):
     }
 
 # =====================================================================
-# 4. GARBAGE DISPOSAL FILTER
+# 5. GARBAGE DISPOSAL FILTER
 # =====================================================================
 def clean_and_filter_records(raw_list):
     logging.info("🧹 [GARBAGE DISPOSAL] Filtering out junk data, low balances, and duplicates...")
@@ -292,7 +322,7 @@ def clean_and_filter_records(raw_list):
     return clean_records
 
 # =====================================================================
-# 5. TRACERFY SKIP-TRACING ENGINE (UNMASK CONTACTS ONLY)
+# 6. TRACERFY SKIP-TRACING ENGINE (UNMASK CONTACTS ONLY)
 # =====================================================================
 def skip_trace_clean_leads(leads):
     if not TRACERFY_API_KEY or not leads:
@@ -331,7 +361,7 @@ def skip_trace_clean_leads(leads):
     return leads
 
 # =====================================================================
-# 6. CLOUDFLARE WORKER INGESTION
+# 7. CLOUDFLARE WORKER INGESTION
 # =====================================================================
 def upload_to_cloudflare_kv(leads):
     if not leads:

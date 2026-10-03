@@ -14,17 +14,20 @@ logging.basicConfig(
 )
 
 # =====================================================================
-# CONFIGURATION & ENVIRONMENT BINDINGS
+# CONFIGURATION & PRODUCTION SECRETS
 # =====================================================================
 WORKER_URL = (os.getenv("WORKER_URL") or "https://emergencyaudit.com").rstrip('/')
 MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY") or os.getenv("EMERGENCY_KEY") or "recovery2026"
+
+APIFY_TOKEN = os.getenv("APIFY_TOKEN")
+SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY")
 TRACERFY_API_KEY = os.getenv("TRACERFY_API_KEY")
 
 SMS_BATCH_LIMIT = int(os.getenv("SMS_BATCH_LIMIT") or 50)
 DRY_RUN = (os.getenv("DRY_RUN") or "false").lower() in ["true", "1", "yes"]
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) EmergencyAudit Ingress Engine v25.2",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) EmergencyAudit Live Pipeline Engine v25.2",
     "X-Emergency-Key": MASTER_ADMIN_KEY,
     "Content-Type": "application/json"
 }
@@ -34,7 +37,73 @@ retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504]
 session.mount("https://", HTTPAdapter(max_retries=retries))
 
 # =====================================================================
-# 1. STATUTORY CODE CLASSIFIER (NATIONWIDE 50-STATE ENGINE)
+# 1. LIVE DATA SCRAPER ENGINES (APIFY & SCRAPERAPI INTEGRATION)
+# =====================================================================
+def fetch_apify_surplus_leads():
+    """Pulls live real estate tax sale & foreclosure overbid records using Apify Actor API."""
+    if not APIFY_TOKEN:
+        logging.warning("⚠️ APIFY_TOKEN not set. Skipping Apify scraper run.")
+        return []
+
+    logging.info("⚡ [APIFY ENGINE] Fetching live scraped surplus & auction leads...")
+    
+    # Query Apify dataset / actor runs for active scraped leads
+    apify_url = f"https://api.apify.com/v2/acts/apify~cheerio-scraper/runs/last/dataset/items?token={APIFY_TOKEN}"
+    
+    try:
+        res = session.get(apify_url, timeout=30)
+        if res.status_code == 200:
+            items = res.json()
+            if isinstance(items, list) and len(items) > 0:
+                logging.info(f"✅ [APIFY] Retrieved {len(items)} live lead(s) from Apify.")
+                return items
+        logging.info("ℹ️ Apify dataset empty or actor idle. Falling back to ScraperAPI endpoint...")
+    except Exception as e:
+        logging.error(f"⚠️ Apify fetch exception: {e}")
+
+    return []
+
+def fetch_scraperapi_county_feeds():
+    """Pulls public court overbid listings via ScraperAPI directly."""
+    if not SCRAPERAPI_KEY:
+        logging.warning("⚠️ SCRAPERAPI_KEY not set. Skipping ScraperAPI public portal crawl.")
+        return []
+
+    logging.info("⚡ [SCRAPERAPI ENGINE] Querying public county overbid lists...")
+    
+    # Example target endpoint routing through ScraperAPI proxy
+    target_portal = "https://www.miami-dadeclerk.com/api/foreclosure/surplus"
+    scraper_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={target_portal}&render=true"
+
+    try:
+        res = session.get(scraper_url, timeout=30)
+        if res.status_code == 200:
+            data = res.json()
+            if isinstance(data, list):
+                logging.info(f"✅ [SCRAPERAPI] Pulled {len(data)} live county surplus records.")
+                return data
+    except Exception as e:
+        logging.warning(f"⚠️ ScraperAPI live fetch bypass: {e}")
+
+    return []
+
+def collect_all_live_scraped_records():
+    """Aggregates all live data sources into a unified pipeline batch."""
+    records = []
+    
+    # Source 1: Apify Scrapers
+    apify_data = fetch_apify_surplus_leads()
+    records.extend(apify_data)
+
+    # Source 2: ScraperAPI Public Portals
+    scraperapi_data = fetch_scraperapi_county_feeds()
+    records.extend(scraperapi_data)
+
+    logging.info(f"📊 [TOTAL LIVE COLLECTED]: {len(records)} raw record(s) ready for normalization.")
+    return records
+
+# =====================================================================
+# 2. STATUTORY CODE CLASSIFIER & NORMALIZER
 # =====================================================================
 STATE_STATUTES = {
     "CA": "CA Rev & Tax Code § 4675 / Civil Code § 2924j",
@@ -46,22 +115,11 @@ STATE_STATUTES = {
     "OH": "OH Rev Code § 5721.20 / § 2329.44",
     "NC": "NC Gen Stat § 105-374 / § 1-339.67",
     "SC": "SC Code Ann § 12-51-130",
-    "AZ": "AZ Rev Stat § 33-812 / § 42-18205",
-    "NV": "NRS § 361.595 / Unclaimed Surplus Proceeds",
-    "MI": "MCL § 211.78t (Foreclosure Surplus Claims)",
-    "TN": "TCA § 67-5-2702 (Tax Sale Excess Proceeds)"
+    "AZ": "AZ Rev Stat § 33-812 / § 42-18205"
 }
 
-def get_statutory_citation(state_abbr):
-    """Returns exact legal statute governing unclaimed excess proceeds for the given state."""
-    st = str(state_abbr or "CA").upper().strip()
-    return STATE_STATUTES.get(st, f"State Unclaimed Property & Judicial Surplus Recovery Statutes ({st})")
-
-# =====================================================================
-# 2. NATIONWIDE RECORD NORMALIZER
-# =====================================================================
 def normalize_scraped_record(raw_item):
-    """Normalizes raw scraper dicts from any state/county into Worker v25.2.3 schema."""
+    """Standardizes raw scraper dicts into Worker v25.2.3 canonical schema."""
     state = str(raw_item.get("state") or raw_item.get("st") or "CA").upper().strip()
     county = str(raw_item.get("county") or raw_item.get("jurisdiction") or "County").title().strip()
     
@@ -84,14 +142,9 @@ def normalize_scraped_record(raw_item):
     except ValueError:
         amt_val = 18450.00
 
-    if amt_val >= 50000.0:
-        tier = "TIER 1 GOLD ($50k+)"
-    elif amt_val >= 25000.0:
-        tier = "TIER 2 SILVER ($25k+)"
-    else:
-        tier = "TIER 3 BRONZE ($5k+)"
+    tier = "TIER 1 GOLD ($50k+)" if amt_val >= 50000.0 else ("TIER 2 SILVER ($25k+)" if amt_val >= 25000.0 else "TIER 3 BRONZE ($5k+)")
 
-    situs_addr = raw_item.get("situs_address") or raw_item.get("address") or "Recorded Parcel Location"
+    situs_addr = raw_item.get("situs_address") or raw_item.get("address") or "Recorded Property Location"
     mailing_addr = raw_item.get("mailing_address") or raw_item.get("owner_address") or situs_addr
     agency = raw_item.get("holding_agency") or raw_item.get("court") or f"{county} County Treasurer / Clerk of Court"
 
@@ -100,7 +153,6 @@ def normalize_scraped_record(raw_item):
         "caseId": case_id,
         "citation_id": case_id,
         "real_case_number": real_case or case_id,
-        "docket_id": raw_item.get("docket_id") or real_case or "N/A",
         "owner_name": raw_item.get("owner_name") or raw_item.get("leadName") or "RECORDED CLAIMANT",
         "leadName": raw_item.get("owner_name") or raw_item.get("leadName") or "RECORDED CLAIMANT",
         "situs_address": situs_addr,
@@ -112,13 +164,10 @@ def normalize_scraped_record(raw_item):
         "zip": str(raw_item.get("zip") or "00000"),
         "apn": apn or "PENDING VERIFICATION",
         "holding_agency": agency,
-        "holding_office_address": raw_item.get("holding_office_address") or f"{county} Courthouse / Main Administrative Building",
-        "sale_date": raw_item.get("sale_date") or "Post-Auction Verification",
         "exactAmount": amt_val,
         "default_amount": f"${amt_val:,.2f}",
         "category": raw_item.get("category") or "TAX SALE EXCESS PROCEEDS",
-        "asset_type": raw_item.get("asset_type") or "Audited Surplus Funds held by Local Government",
-        "statutory_citation": get_statutory_citation(state),
+        "statutory_citation": STATE_STATUTES.get(state, f"State Surplus Statutes ({state})"),
         "value_tier": tier,
         "phone": raw_item.get("phone") or "PENDING UNMASK",
         "email": raw_item.get("email") or "N/A",
@@ -127,15 +176,15 @@ def normalize_scraped_record(raw_item):
     }
 
 # =====================================================================
-# 3. TRACERFY SKIP-TRACING ENGINE (MAILING ADDRESS PRIORITY)
+# 3. TRACERFY SKIP-TRACING ENGINE
 # =====================================================================
-def skip_trace_nationwide_leads(leads):
-    """Passes owner name and mailing address to Tracerfy to unmask target phone/email."""
+def skip_trace_leads(leads):
+    """Passes owner name & mailing address to Tracerfy to unmask mobile phone lines."""
     if not TRACERFY_API_KEY:
-        logging.info("ℹ️ Tracerfy API key not configured. Skipping automated skip-trace step.")
+        logging.info("ℹ️ Tracerfy API key not active. Skipping skip-trace step.")
         return leads
 
-    logging.info(f"⚡ [TRACERFY ENGINE] Unmasking contact information for {len(leads)} lead(s)...")
+    logging.info(f"⚡ [TRACERFY ENGINE] Unmasking contacts for {len(leads)} lead(s)...")
     tracerfy_url = "https://tracerfy.com/v1/api/trace/lookup/"
     headers = {"Authorization": f"Bearer {TRACERFY_API_KEY}", "Content-Type": "application/json"}
 
@@ -169,37 +218,38 @@ def skip_trace_nationwide_leads(leads):
     return leads
 
 # =====================================================================
-# 4. KV INGESTION ENGINE (BATCH PUSH, ZERO MANUAL DELETES)
+# 4. CLOUDFLARE WORKER INGESTION
 # =====================================================================
-def upload_to_cloudflare_kv(leads_chunk):
-    """Pushes normalized records into Cloudflare Worker KV."""
+def upload_to_cloudflare_kv(leads):
+    if not leads:
+        logging.info("ℹ️ No leads to upload to Worker.")
+        return False
+
     endpoint = f"{WORKER_URL}/api/inbound-lead-hook"
-    
     if DRY_RUN:
-        logging.info(f"🧪 [DRY RUN] Would upload {len(leads_chunk)} lead(s) to Cloudflare Worker KV.")
+        logging.info(f"🧪 [DRY RUN] Would upload {len(leads)} lead(s) to Cloudflare KV.")
         return True
 
     try:
-        res = session.post(endpoint, json=leads_chunk, headers=HEADERS, timeout=30)
+        res = session.post(endpoint, json=leads, headers=HEADERS, timeout=30)
         if res.status_code == 200:
-            logging.info(f"✅ Worker Ingestion Success: {len(leads_chunk)} record(s) active on dashboard.")
+            logging.info(f"✅ [WORKER KV INGESTION SUCCESS]: {len(leads)} lead(s) pushed to live dashboard.")
             return True
         else:
             logging.error(f"❌ Worker Ingestion Error [{res.status_code}]: {res.text}")
             return False
     except Exception as e:
-        logging.error(f"⚠️ Connection error posting to Worker: {e}")
+        logging.error(f"⚠️ Worker post error: {e}")
         return False
 
 # =====================================================================
-# 5. DIRECT SMS OUTREACH ENGINE
+# 5. DIRECT SMS OUTREACH DISPATCH
 # =====================================================================
 def execute_sms_outreach(leads, limit=SMS_BATCH_LIMIT):
-    """Fires targeted SMS messages to claimants containing precise court and holding details."""
     sms_endpoint = f"{WORKER_URL}/api/send-sms-direct"
     sent_count = 0
 
-    logging.info(f"📲 Executing SMS Outreach Sequence (Target: up to {limit} claimants)...")
+    logging.info(f"📲 Executing SMS Outreach Sequence (Limit: {limit})...")
 
     for lead in leads:
         if sent_count >= limit:
@@ -237,65 +287,37 @@ def execute_sms_outreach(leads, limit=SMS_BATCH_LIMIT):
                 if res.status_code == 200 and res.json().get("success"):
                     sent_count += 1
                     logging.info(f"🚀 [{sent_count}/{limit}] SMS Delivered -> {clean_phone} ({county} Co, {state})")
-                else:
-                    logging.warning(f"⚠️ SMS Failed for {clean_phone}: {res.text}")
             except Exception as e:
                 logging.error(f"⚠️ SMS Exception for {clean_phone}: {e}")
             time.sleep(0.5)
-        else:
-            sent_count += 1
-            logging.info(f"🧪 [DRY RUN SMS] To: {clean_phone} | Msg: {message_body}")
 
-    logging.info(f"🎉 Pipeline Ingress & Outreach Completed. Total Processed: {sent_count}")
+    logging.info(f"🎉 Pipeline Execution Complete. Delivered {sent_count} outreach message(s).")
 
 # =====================================================================
 # MAIN PIPELINE EXECUTION
 # =====================================================================
-def run_nationwide_pipeline(raw_scraped_batch):
-    """Entry point for processing GitHub scraper outputs."""
-    logging.info(f"🚀 Starting Nationwide Processing for {len(raw_scraped_batch)} raw record(s)...")
+def run_pipeline():
+    logging.info("🚀 Launching EmergencyAudit Live Ingress Pipeline...")
+    
+    # Step 1: Collect Live Scraped Records via Apify / ScraperAPI
+    raw_leads = collect_all_live_scraped_records()
 
-    normalized_batch = [normalize_scraped_record(item) for item in raw_scraped_batch]
-    enriched_batch = skip_trace_nationwide_leads(normalized_batch)
-    upload_to_cloudflare_kv(enriched_batch)
-    execute_sms_outreach(enriched_batch, limit=SMS_BATCH_LIMIT)
+    if not raw_leads:
+        logging.info("ℹ️ No new live scraper feeds returned this cycle.")
+        return
+
+    # Step 2: Normalize Schema
+    normalized = [normalize_scraped_record(item) for item in raw_leads]
+
+    # Step 3: Skip-Trace Contacts via Tracerfy
+    enriched = skip_trace_leads(normalized)
+
+    # Step 4: Push Records to Cloudflare Worker KV
+    upload_to_cloudflare_kv(enriched)
+
+    # Step 5: Dispatch SMS Outreach
+    execute_sms_outreach(enriched, limit=SMS_BATCH_LIMIT)
 
 if __name__ == "__main__":
-    sample_github_scraped_leads = [
-        {
-            "owner_name": "ROBERTO M ARMAS",
-            "situs_address": "10421 SW 40th St, Miami, FL 33165",
-            "mailing_address": "1840 CORAL WAY STE 200, MIAMI, FL 33145",
-            "city": "Miami",
-            "county": "Miami-Dade",
-            "state": "FL",
-            "docket_no": "2025-CV-04192",
-            "holding_agency": "11th Judicial Circuit Court & Clerk of Courts",
-            "amount": 48250.00,
-            "sale_date": "2025-11-14"
-        },
-        {
-            "owner_name": "MARCUS V HOLLOWAY",
-            "situs_address": "452 PEACHTREE ST NE",
-            "city": "Atlanta",
-            "county": "Fulton",
-            "state": "GA",
-            "case_no": "2024-EX-09821",
-            "holding_agency": "Fulton County Clerk of Superior Court",
-            "amount": 32100.00,
-            "sale_date": "2025-08-05"
-        },
-        {
-            "owner_name": "GREGORY & ELLEN MONROE",
-            "situs_address": "8802 CHIMNEY ROCK RD",
-            "city": "Houston",
-            "county": "Harris",
-            "state": "TX",
-            "parcel_id": "0410290000012",
-            "holding_agency": "Harris County District Clerk & Tax Assessor",
-            "amount": 67400.00,
-            "sale_date": "2025-10-07"
-        }
-    ]
-
+    run_pipeline()
     run_nationwide_pipeline(sample_github_scraped_leads)

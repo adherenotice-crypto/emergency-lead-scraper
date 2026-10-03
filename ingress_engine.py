@@ -13,7 +13,7 @@ from urllib3.util.retry import Retry
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # =====================================================================
-# CONFIGURATION & ENVIRONMENT BINDINGS ($10k MANDATED FLOOR)
+# CONFIGURATION & ENVIRONMENT BINDINGS
 # =====================================================================
 WORKER_URL = (os.getenv("WORKER_URL") or "https://emergencyaudit.com").rstrip('/')
 MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY") or os.getenv("EMERGENCY_KEY") or "recovery2026"
@@ -23,19 +23,10 @@ SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY")
 MIN_SURPLUS_THRESHOLD = float(os.getenv("MIN_SURPLUS_THRESHOLD") or 10000.00)
 DRY_RUN = (os.getenv("DRY_RUN") or "false").lower() in ["true", "1", "yes"]
 
-# BROWSER-GRADE HEADERS TO BYPASS GOVERNMENT 403 WAF BLOCKS
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Sec-Ch-Ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1"
+    "Accept-Language": "en-US,en;q=0.9"
 }
 
 WORKER_HEADERS = {
@@ -45,7 +36,7 @@ WORKER_HEADERS = {
 }
 
 session = requests.Session()
-retries = Retry(total=3, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
+retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
 session.mount("https://", HTTPAdapter(max_retries=retries))
 
 STATE_STATUTES = {
@@ -57,6 +48,12 @@ STATE_STATUTES = {
 }
 
 PUBLIC_SURPLUS_FEEDS = [
+    {
+        "state": "GA",
+        "county": "Fulton",
+        "type": "pdf",
+        "url": "https://www.fultonclerk.org/DocumentCenter/View/1245/Unclaimed-Funds-List-PDF"
+    },
     {
         "state": "FL",
         "county": "Orange",
@@ -70,12 +67,6 @@ PUBLIC_SURPLUS_FEEDS = [
         "url": "https://www.bexar.org/DocumentCenter/View/28221/Excess-Proceeds-List-PDF"
     },
     {
-        "state": "GA",
-        "county": "Fulton",
-        "type": "pdf",
-        "url": "https://www.fultonclerk.org/DocumentCenter/View/1245/Unclaimed-Funds-List-PDF"
-    },
-    {
         "state": "OH",
         "county": "Franklin",
         "type": "csv",
@@ -83,57 +74,95 @@ PUBLIC_SURPLUS_FEEDS = [
     }
 ]
 
-def fetch_feed_data(url):
-    """Attempts direct fetch with browser headers; falls back to ScraperAPI proxy if blocked."""
+def fetch_feed_data(url, name):
+    """Attempts direct fetch first, then tries ScraperAPI with diagnostic logging."""
     try:
-        res = session.get(url, headers=BROWSER_HEADERS, timeout=25)
-        if res.status_code == 200 and len(res.content) > 500:
+        res = session.get(url, headers=BROWSER_HEADERS, timeout=20)
+        if res.status_code == 200 and len(res.content) > 200:
+            logging.info(f"   [Direct HTTP 200] {len(res.content)} bytes retrieved for {name}")
             return res.content
+        logging.info(f"   [Direct HTTP {res.status_code}] Direct fetch restricted for {name}")
     except Exception as e:
-        logging.warning(f"Direct request bypass for {url}: {e}")
+        logging.warning(f"   [Direct HTTP Error] {name}: {e}")
 
     if SCRAPERAPI_KEY:
-        proxy_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={url}&keep_headers=true"
+        proxy_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={url}"
         try:
-            res = session.get(proxy_url, timeout=35)
-            if res.status_code == 200:
+            res = session.get(proxy_url, timeout=30)
+            logging.info(f"   [ScraperAPI HTTP {res.status_code}] Response for {name}")
+            if res.status_code == 200 and len(res.content) > 200:
                 return res.content
         except Exception as e:
-            logging.warning(f"Proxy request failure for {url}: {e}")
+            logging.warning(f"   [ScraperAPI Error] {name}: {e}")
+    else:
+        logging.info(f"   ℹ️ SCRAPERAPI_KEY not set. Cannot proxy restricted URL for {name}")
 
     return None
 
+def parse_amount(text):
+    """Extracts floating point value from various currency string formats ($10,000, 10000.00, $15,450.50)."""
+    clean_str = re.sub(r"[^\d.]", "", str(text))
+    try:
+        val = float(clean_str)
+        return val
+    except ValueError:
+        return 0.0
+
 # =====================================================================
-# 1. MULTI-FORMAT HARVESTERS
+# MULTI-FORMAT HARVESTERS
 # =====================================================================
 def harvest_pdf_feed(feed):
     logging.info(f"📄 Harvesting {feed['state']} - {feed['county']} County Surplus PDF...")
     records = []
-    content = fetch_feed_data(feed["url"])
-    
+    content = fetch_feed_data(feed["url"], feed["county"])
+
     if not content:
-        logging.warning(f"❌ Failed to fetch content for {feed['county']}")
         return records
 
     try:
         with pdfplumber.open(io.BytesIO(content)) as pdf:
             for page in pdf.pages:
-                text = page.extract_text() or ""
-                for line in text.split("\n"):
-                    amounts = re.findall(r"\$?\b[\d,]{4,}\.\d{2}\b", line)
-                    if amounts:
-                        clean_amt = float(re.sub(r"[^\d.]", "", amounts[-1]))
-                        if clean_amt >= MIN_SURPLUS_THRESHOLD:
-                            clean_line = re.sub(r"\$?\b[\d,]{4,}\.\d{2}\b", "", line).strip()
-                            parts = [p.strip() for p in clean_line.split("  ") if p.strip()]
-                            records.append({
-                                "owner_name": parts[0].upper() if parts else "RECORDED CLAIMANT",
-                                "situs_address": parts[-1].upper() if len(parts) > 1 else "RECORDED PROPERTY LOCATION",
-                                "amount": clean_amt,
-                                "county": feed["county"],
-                                "state": feed["state"]
-                            })
-        logging.info(f"✅ Extracted {len(records)} candidate record(s) from {feed['county']} PDF.")
+                # Primary Strategy: Table Grid Extraction
+                tables = page.extract_tables() or []
+                for table in tables:
+                    for row in table:
+                        if not row:
+                            continue
+                        row_str = " ".join([str(c) for c in row if c])
+                        # Regex matches $10,000, $10,000.00, 10000.00
+                        amounts = re.findall(r"\$?\b[\d,]{5,}(?:\.\d{2})?\b", row_str)
+                        for amt_text in amounts:
+                            amt_val = parse_amount(amt_text)
+                            if amt_val >= MIN_SURPLUS_THRESHOLD:
+                                records.append({
+                                    "owner_name": str(row[0]).strip().upper() if row[0] else "RECORDED CLAIMANT",
+                                    "situs_address": str(row[1]).strip().upper() if len(row) > 1 and row[1] else "RECORDED PROPERTY LOCATION",
+                                    "amount": amt_val,
+                                    "county": feed["county"],
+                                    "state": feed["state"]
+                                })
+                                break
+
+                # Secondary Strategy: Line-by-Line Regex Fallback
+                if not records:
+                    text = page.extract_text() or ""
+                    for line in text.split("\n"):
+                        amounts = re.findall(r"\$?\b[\d,]{5,}(?:\.\d{2})?\b", line)
+                        for amt_text in amounts:
+                            amt_val = parse_amount(amt_text)
+                            if amt_val >= MIN_SURPLUS_THRESHOLD:
+                                clean_line = re.sub(r"\$?\b[\d,]{5,}(?:\.\d{2})?\b", "", line).strip()
+                                parts = [p.strip() for p in clean_line.split("  ") if p.strip()]
+                                records.append({
+                                    "owner_name": parts[0].upper() if parts else "RECORDED CLAIMANT",
+                                    "situs_address": parts[-1].upper() if len(parts) > 1 else "RECORDED PROPERTY LOCATION",
+                                    "amount": amt_val,
+                                    "county": feed["county"],
+                                    "state": feed["state"]
+                                })
+                                break
+
+        logging.info(f"✅ Extracted {len(records)} record(s) from {feed['county']} PDF.")
     except Exception as e:
         logging.warning(f"⚠️ PDF parse exception for {feed['county']}: {e}")
 
@@ -142,10 +171,9 @@ def harvest_pdf_feed(feed):
 def harvest_csv_feed(feed):
     logging.info(f"📊 Harvesting {feed['state']} - {feed['county']} County Surplus CSV...")
     records = []
-    content = fetch_feed_data(feed["url"])
+    content = fetch_feed_data(feed["url"], feed["county"])
 
     if not content:
-        logging.warning(f"❌ Failed to fetch CSV content for {feed['county']}")
         return records
 
     try:
@@ -153,19 +181,19 @@ def harvest_csv_feed(feed):
         df = pd.read_csv(io.StringIO(csv_text), errors="ignore")
         for _, row in df.iterrows():
             row_str = " ".join([str(val) for val in row.values])
-            amounts = re.findall(r"\$?\b[\d,]{4,}\.\d{2}\b", row_str)
-            for amt_str in amounts:
-                clean_amt = float(re.sub(r"[^\d.]", "", amt_str))
-                if clean_amt >= MIN_SURPLUS_THRESHOLD:
+            amounts = re.findall(r"\$?\b[\d,]{5,}(?:\.\d{2})?\b", row_str)
+            for amt_text in amounts:
+                amt_val = parse_amount(amt_text)
+                if amt_val >= MIN_SURPLUS_THRESHOLD:
                     records.append({
                         "owner_name": str(row.iloc[0]).strip().upper(),
                         "situs_address": str(row.iloc[1]).strip().upper() if len(row) > 1 else "RECORDED PROPERTY LOCATION",
-                        "amount": clean_amt,
+                        "amount": amt_val,
                         "county": feed["county"],
                         "state": feed["state"]
                     })
                     break
-        logging.info(f"✅ Extracted {len(records)} candidate record(s) from {feed['county']} CSV.")
+        logging.info(f"✅ Extracted {len(records)} record(s) from {feed['county']} CSV.")
     except Exception as e:
         logging.warning(f"⚠️ CSV parse exception for {feed['county']}: {e}")
 
@@ -181,7 +209,7 @@ def collect_all_sources():
     return raw_harvest
 
 # =====================================================================
-# 2. NORMALIZER & $10k GARBAGE FILTER
+# NORMALIZER & $10k GARBAGE FILTER
 # =====================================================================
 def clean_and_normalize(raw_items):
     logging.info(f"🧹 Enforcing strict ${MIN_SURPLUS_THRESHOLD:,.2f} minimum floor...")
@@ -239,7 +267,7 @@ def clean_and_normalize(raw_items):
     return clean
 
 # =====================================================================
-# 3. TRACERFY SKIP-TRACING ENGINE
+# TRACERFY SKIP-TRACING ENGINE
 # =====================================================================
 def skip_trace(leads):
     if not TRACERFY_API_KEY or not leads:
@@ -268,7 +296,7 @@ def skip_trace(leads):
     return leads
 
 # =====================================================================
-# 4. WORKER KV INGESTION ENGINE
+# WORKER KV INGESTION ENGINE
 # =====================================================================
 def upload(leads):
     if not leads:

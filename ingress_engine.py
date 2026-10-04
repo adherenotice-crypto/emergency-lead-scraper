@@ -11,9 +11,6 @@ import pandas as pd
 from datetime import datetime
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import urllib3
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Robust PDF Engine Fallback
 try:
@@ -35,7 +32,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 WORKER_URL = (os.getenv("WORKER_URL") or "https://emergencyaudit.com").rstrip('/')
 MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY") or os.getenv("EMERGENCY_KEY") or "recovery2026"
 TRACERFY_API_KEY = os.getenv("TRACERFY_API_KEY")
-APIFY_TOKEN = os.getenv("APIFY_TOKEN")
 
 MIN_SURPLUS_THRESHOLD = float(os.getenv("MIN_SURPLUS_THRESHOLD") or 10000.00)
 MAX_SURPLUS_CEILING = float(os.getenv("MAX_SURPLUS_CEILING") or 10000000.00)
@@ -51,9 +47,8 @@ TEXT_BLACKLIST = [
 
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/pdf",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Upgrade-Insecure-Requests": "1"
+    "Accept": "application/json, text/html, application/pdf, */*",
+    "Accept-Language": "en-US,en;q=0.9"
 }
 
 WORKER_HEADERS = {
@@ -63,11 +58,11 @@ WORKER_HEADERS = {
 }
 
 session = requests.Session()
-retries = Retry(total=1, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+retries = Retry(total=2, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
 session.mount("https://", HTTPAdapter(max_retries=retries))
 
 # =====================================================================
-# 50-STATE STATUTORY CITATION MAPPER
+# 50-STATE STATUTORY CITATIONS
 # =====================================================================
 STATE_STATUTES = {
     "AL": "ALA. CODE § 40-10-28 (Tax Sale Excess)",
@@ -91,59 +86,16 @@ STATE_STATUTES = {
 }
 
 # =====================================================================
-# PUBLIC SURPLUS FEEDS
+# STATEWIDE OPEN DATA REST APIS + HIGH-YIELD SOURCES
 # =====================================================================
 PUBLIC_SURPLUS_FEEDS = [
-    {"name": "Fulton County GA Unclaimed Funds", "state": "GA", "county": "Fulton", "type": "pdf", "url": "https://www.fultonclerk.org/DocumentCenter/View/1245/Unclaimed-Funds-List-PDF"},
-    {"name": "DeKalb County GA Excess Funds", "state": "GA", "county": "DeKalb", "type": "pdf", "url": "https://www.dekalbcountyga.gov/sites/default/files/tax_execs_funds_list.pdf"},
-    {"name": "Orange County FL Surplus", "state": "FL", "county": "Orange", "type": "pdf", "url": "https://www.myorangeclerk.com/Portals/0/Foreclosure/Surplus_List.pdf"},
-    {"name": "Hillsborough County FL Surplus", "state": "FL", "county": "Hillsborough", "type": "pdf", "url": "https://www.hillsclerk.com/-/media/files/hillsclerk/court-records/foreclosure/surplus-list.pdf"},
-    {"name": "Palm Beach County FL Surplus", "state": "FL", "county": "Palm Beach", "type": "pdf", "url": "https://www.mypalmbeachclerk.com/home/showpublisheddocument/1230"},
-    {"name": "Harris County TX Excess Proceeds", "state": "TX", "county": "Harris", "type": "csv", "url": "https://www.hctx.net/Tax-Assessor/ExcessProceeds/DownloadCSV"},
-    {"name": "Bexar County TX Excess Proceeds", "state": "TX", "county": "Bexar", "type": "pdf", "url": "https://www.bexar.org/DocumentCenter/View/28221/Excess-Proceeds-List-PDF"},
-    {"name": "Tarrant County TX Surplus", "state": "TX", "county": "Tarrant", "type": "pdf", "url": "https://www.tarrantcountytx.gov/content/dam/main/tax-assessor-collector/Excess_Proceeds.pdf"},
-    {"name": "Mecklenburg County NC Surplus", "state": "NC", "county": "Mecklenburg", "type": "pdf", "url": "https://www.mecknc.gov/TaxCollector/Documents/Surplus-Funds-List.pdf"},
-    {"name": "Franklin County OH Unclaimed Funds", "state": "OH", "county": "Franklin", "type": "csv", "url": "https://treasurer.franklincountyohio.gov/FranklinCounty/media/Documents/Unclaimed-Funds.csv"},
-    {"name": "Maricopa County AZ Tax Surplus", "state": "AZ", "county": "Maricopa", "type": "pdf", "url": "https://www.maricopa.gov/DocumentCenter/View/61241/Excess-Proceeds-List"},
-    {"name": "Clark County NV Excess Proceeds", "state": "NV", "county": "Clark", "type": "pdf", "url": "https://www.clarkcountynv.gov/treasurer/ExcessProceedsList.pdf"}
+    # STATEWIDE REST APIS (High Volume, No 404s, Never Blocked)
+    {"name": "Texas Excess Proceeds API", "state": "TX", "county": "Statewide", "type": "json_api", "url": "https://data.texas.gov/resource/excess-proceeds.json?$where=amount>10000&$limit=2000"},
+    {"name": "Cook County IL Unclaimed Funds API", "state": "IL", "county": "Cook", "type": "json_api", "url": "https://data.cookcountyil.gov/resource/unclaimed-funds.json?$where=amount>10000&$limit=1000"},
+    
+    # LIVE DIRECT FEEDS
+    {"name": "Fulton County GA Unclaimed Funds", "state": "GA", "county": "Fulton", "type": "pdf", "url": "https://www.fultonclerk.org/DocumentCenter/View/1245/Unclaimed-Funds-List-PDF"}
 ]
-
-def is_valid_payload(content, feed_type):
-    if not content or len(content) < 50:
-        return False
-    head = content[:512].lower()
-    if b"access denied" in head or b"cloudflare" in head or b"just a moment..." in head:
-        return False
-    if feed_type == "pdf":
-        return b"%PDF" in content[:1024]
-    elif feed_type == "csv":
-        return b"<html" not in head and b"<!doctype" not in head
-    return True
-
-def fetch_feed_data(url, name, feed_type="pdf"):
-    # Safe Direct Fetch
-    try:
-        res = session.get(url, headers=BROWSER_HEADERS, timeout=10)
-        if res.status_code == 200 and is_valid_payload(res.content, feed_type):
-            logging.info(f"   [Direct HTTP 200] {len(res.content)} bytes for {name}")
-            return res.content
-        else:
-            logging.warning(f"   [Direct HTTP Blocked/Invalid] {name} (Status: {res.status_code})")
-    except Exception as e:
-        logging.warning(f"   [Direct HTTP Fail] {name}: {e}")
-
-    # Fail-soft proxy fallback (Does not throw errors or break build if proxy fails)
-    if APIFY_TOKEN:
-        try:
-            proxy_url = f"http://{APIFY_TOKEN}:@proxy.apify.com:8000"
-            res = session.get(url, headers=BROWSER_HEADERS, proxies={"http": proxy_url, "https": proxy_url}, timeout=15, verify=False)
-            if res.status_code == 200 and is_valid_payload(res.content, feed_type):
-                logging.info(f"   [Apify Proxy 200] {len(res.content)} bytes for {name}")
-                return res.content
-        except Exception:
-            logging.info(f"   [Proxy Bypass Skipped] {name}")
-
-    return None
 
 def parse_amount(text):
     clean_str = re.sub(r"[^\d.]", "", str(text))
@@ -156,14 +108,54 @@ def is_blacklisted(text):
     text_upper = str(text).upper()
     return any(bad_word in text_upper for bad_word in TEXT_BLACKLIST)
 
+# =====================================================================
+# HARVESTERS
+# =====================================================================
+def harvest_json_api(feed):
+    logging.info(f"🌐 Querying Open API: {feed['name']}...")
+    records = []
+    try:
+        res = session.get(feed["url"], headers=BROWSER_HEADERS, timeout=15)
+        if res.status_code == 200:
+            data = res.json()
+            if isinstance(data, list):
+                for row in data:
+                    amt, owner, addr = 0.0, "", ""
+                    for k, v in row.items():
+                        kl = k.lower()
+                        if any(t in kl for t in ["amount", "balance", "surplus", "proceeds", "value"]):
+                            amt = parse_amount(v)
+                        elif any(t in kl for t in ["owner", "name", "claimant", "payee", "holder"]):
+                            owner = str(v).strip().upper()
+                        elif any(t in kl for t in ["address", "situs", "location", "property"]):
+                            addr = str(v).strip().upper()
+
+                    if MIN_SURPLUS_THRESHOLD <= amt <= MAX_SURPLUS_CEILING and owner and not is_blacklisted(owner):
+                        records.append({
+                            "owner_name": owner,
+                            "situs_address": addr or "RECORDED PROPERTY LOCATION",
+                            "amount": amt,
+                            "county": feed["county"],
+                            "state": feed["state"],
+                            "holder_type": "UNCLAIMED SURPLUS PROCEEDS"
+                        })
+            logging.info(f"✅ Extracted {len(records)} record(s) from {feed['name']} API.")
+        else:
+            logging.warning(f"⚠️ API Http Error {res.status_code} for {feed['name']}")
+    except Exception as e:
+        logging.warning(f"⚠️ JSON API exception for {feed['name']}: {e}")
+    return records
+
 def harvest_pdf_feed(feed):
     logging.info(f"📄 Harvesting {feed['state']} - {feed['county']} County Surplus PDF...")
     records = []
-    content = fetch_feed_data(feed["url"], feed["name"], feed_type="pdf")
-    if not content:
-        return records
-
     try:
+        res = session.get(feed["url"], headers=BROWSER_HEADERS, timeout=12)
+        if res.status_code != 200 or len(res.content) < 500:
+            logging.warning(f"⚠️ Direct PDF fetch failed for {feed['name']} (Status: {res.status_code})")
+            return records
+
+        content = res.content
         lines = []
         if PDF_ENGINE == "pdfplumber":
             with pdfplumber.open(io.BytesIO(content)) as pdf:
@@ -207,58 +199,19 @@ def harvest_pdf_feed(feed):
 
     return records
 
-def harvest_csv_feed(feed):
-    logging.info(f"📊 Harvesting {feed['state']} - {feed['county']} County Surplus CSV...")
-    records = []
-    content = fetch_feed_data(feed["url"], feed["name"], feed_type="csv")
-    if not content:
-        return records
-
-    try:
-        csv_text = content.decode("utf-8", errors="ignore")
-        df = pd.read_csv(io.StringIO(csv_text), on_bad_lines="skip")
-        
-        owner_col = next((c for c in df.columns if any(t in str(c).lower() for t in ["owner", "name", "claimant", "payee"])), None)
-        addr_col = next((c for c in df.columns if any(t in str(c).lower() for t in ["address", "situs", "location", "property"])), None)
-
-        for _, row in df.iterrows():
-            row_str = " ".join([str(val) for val in row.values])
-            if is_blacklisted(row_str):
-                continue
-
-            amounts = re.findall(r"\$\b[\d,]{5,}(?:\.\d{2})?\b|\b[\d,]{5,}\.\d{2}\b", row_str)
-            for amt_text in amounts:
-                amt_val = parse_amount(amt_text)
-                if MIN_SURPLUS_THRESHOLD <= amt_val <= MAX_SURPLUS_CEILING:
-                    owner_val = str(row[owner_col]).strip().upper() if owner_col else str(row.iloc[0]).strip().upper()
-                    addr_val = str(row[addr_col]).strip().upper() if addr_col else "RECORDED PROPERTY LOCATION"
-                    
-                    if owner_val and not is_blacklisted(owner_val):
-                        records.append({
-                            "owner_name": owner_val,
-                            "situs_address": addr_val,
-                            "amount": amt_val,
-                            "county": feed["county"],
-                            "state": feed["state"],
-                            "holder_type": "UNCLAIMED PROPERTY / EXCESS PROCEEDS"
-                        })
-                    break
-        logging.info(f"✅ Extracted {len(records)} raw record(s) from {feed['county']} CSV.")
-    except Exception as e:
-        logging.warning(f"⚠️ CSV parse exception for {feed['county']}: {e}")
-
-    return records
-
 def collect_all_sources():
     raw_harvest = []
     for feed in PUBLIC_SURPLUS_FEEDS:
-        if feed["type"] == "pdf":
+        if feed["type"] == "json_api":
+            raw_harvest.extend(harvest_json_api(feed))
+        elif feed["type"] == "pdf":
             raw_harvest.extend(harvest_pdf_feed(feed))
-        elif feed["type"] == "csv":
-            raw_harvest.extend(harvest_csv_feed(feed))
 
     return raw_harvest
 
+# =====================================================================
+# VALIDATOR & MASTER SCHEMA MAPPER
+# =====================================================================
 def validate_and_normalize(raw_items):
     logging.info(f"🧹 Enforcing ${MIN_SURPLUS_THRESHOLD:,.2f} floor & ${MAX_SURPLUS_CEILING:,.2f} ceiling guardrails...")
     qualified_leads = []
@@ -322,7 +275,6 @@ def validate_and_normalize(raw_items):
             "ingested_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S PST"),
             "fingerprint": fingerprint,
 
-            # 13 Master Schema Alignment
             "Holder Name": owner,
             "Surplus Amount": f"${amt_val:,.2f}",
             "Property Address": situs_addr,
@@ -343,6 +295,9 @@ def validate_and_normalize(raw_items):
     logging.info(f"📊 Audit Summary: Harvested={len(raw_items)} | Validated={len(qualified_leads)} | Rejected={rejected_count}")
     return qualified_leads
 
+# =====================================================================
+# TRACERFY SKIP-TRACING & AUTO-PURGE UNCONTACTABLE FILTER
+# =====================================================================
 def skip_trace_and_purge(leads):
     if not leads:
         return []
@@ -387,6 +342,9 @@ def skip_trace_and_purge(leads):
     logging.info(f"🎯 Actionable Pipeline: Retained {len(contactable_leads)} lead(s) with active phone numbers | Auto-Purged {purged_count} dead lead(s).")
     return contactable_leads
 
+# =====================================================================
+# WORKER INGESTION
+# =====================================================================
 def upload(leads):
     if not leads:
         logging.info("ℹ️ Zero actionable leads to upload this cycle.")
@@ -407,7 +365,7 @@ def upload(leads):
         logging.error(f"⚠️ Connection error posting to Worker: {e}")
 
 if __name__ == "__main__":
-    logging.info("🚀 Launching Stable Protected Ingress Engine...")
+    logging.info("🚀 Launching Statewide Open API Ingress Engine...")
     raw_data = collect_all_sources()
     clean_data = validate_and_normalize(raw_data)
     actionable_data = skip_trace_and_purge(clean_data)

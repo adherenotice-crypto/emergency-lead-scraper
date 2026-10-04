@@ -216,18 +216,15 @@ def harvest_pdf_feed(feed):
 
         logging.info(f"✅ Extracted {len(records)} raw record(s) from {feed['county']} PDF.")
     except Exception as e:
-        logging.warning(f"⚠️️ PDF parse exception for {feed['county']}: {e}")
+        logging.warning(f"⚠️ PDF parse exception for {feed['county']}: {e}")
 
     return records
 
 def collect_all_sources():
     raw_harvest = []
-    
-    # 1. Harvest Socrata Open APIs across the US
     socrata_records = discover_socrata_datasets()
     raw_harvest.extend(socrata_records)
     
-    # 2. Harvest Direct PDF Feeds
     for feed in DIRECT_FEEDS:
         if feed["type"] == "pdf":
             raw_harvest.extend(harvest_pdf_feed(feed))
@@ -369,9 +366,9 @@ def skip_trace_and_purge(leads):
     return contactable_leads
 
 # =====================================================================
-# 5. WORKER INGESTION
+# 5. CHUNKED BATCH WORKER INGESTION (PREVENTS WORKER TIMEOUTS)
 # =====================================================================
-def upload(leads):
+def upload(leads, batch_size=50):
     if not leads:
         logging.info("ℹ️ Zero actionable leads to upload this cycle.")
         return
@@ -381,14 +378,25 @@ def upload(leads):
         return
 
     endpoint = f"{WORKER_URL}/api/inbound-lead-hook"
-    try:
-        res = session.post(endpoint, json=leads, headers=WORKER_HEADERS, timeout=40)
-        if res.status_code == 200:
-            logging.info(f"✅ SUCCESS: Ingested {len(leads)} actionable $10k+ lead(s) into Executive Command Hub!")
-        else:
-            logging.error(f"❌ Worker Ingest Error [{res.status_code}]: {res.text}")
-    except Exception as e:
-        logging.error(f"⚠️️ Connection error posting to Worker: {e}")
+    total_uploaded = 0
+    total_batches = (len(leads) + batch_size - 1) // batch_size
+
+    logging.info(f"🚀 Uploading {len(leads)} leads in {total_batches} chunked batch(es) of {batch_size}...")
+
+    for idx in range(0, len(leads), batch_size):
+        batch = leads[idx:idx + batch_size]
+        current_batch_num = (idx // batch_size) + 1
+        try:
+            res = session.post(endpoint, json=batch, headers=WORKER_HEADERS, timeout=25)
+            if res.status_code == 200:
+                total_uploaded += len(batch)
+                logging.info(f"   ✅ Batch [{current_batch_num}/{total_batches}] Ingested ({len(batch)} leads).")
+            else:
+                logging.error(f"   ❌ Batch [{current_batch_num}/{total_batches}] Failed [{res.status_code}]: {res.text}")
+        except Exception as e:
+            logging.error(f"   ⚠️ Batch [{current_batch_num}/{total_batches}] Connection Error: {e}")
+
+    logging.info(f"🎉 FINAL INGESTION SUMMARY: Successfully uploaded {total_uploaded}/{len(leads)} leads into Executive Command Hub!")
 
 if __name__ == "__main__":
     logging.info("🚀 Launching Socrata Discovery & Ingress Engine...")

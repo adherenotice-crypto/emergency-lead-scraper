@@ -5,6 +5,7 @@ import time
 import json
 import logging
 import hashlib
+import urllib.parse
 import requests
 import pandas as pd
 from datetime import datetime
@@ -143,7 +144,6 @@ def harvest_socrata_endpoint(url, domain):
                             addr = str(v).strip().upper()
 
                     if MIN_SURPLUS_THRESHOLD <= amt <= MAX_SURPLUS_CEILING and owner and not is_blacklisted(owner):
-                        # Infer state code from domain
                         state_code = "US"
                         state_match = re.search(r"\.([a-z]{2})\.gov", domain, re.IGNORECASE)
                         if state_match:
@@ -216,7 +216,7 @@ def harvest_pdf_feed(feed):
 
         logging.info(f"✅ Extracted {len(records)} raw record(s) from {feed['county']} PDF.")
     except Exception as e:
-        logging.warning(f"⚠️ PDF parse exception for {feed['county']}: {e}")
+        logging.warning(f"⚠️️ PDF parse exception for {feed['county']}: {e}")
 
     return records
 
@@ -388,7 +388,7 @@ def upload(leads):
         else:
             logging.error(f"❌ Worker Ingest Error [{res.status_code}]: {res.text}")
     except Exception as e:
-        logging.error(f"⚠️ Connection error posting to Worker: {e}")
+        logging.error(f"⚠️️ Connection error posting to Worker: {e}")
 
 if __name__ == "__main__":
     logging.info("🚀 Launching Socrata Discovery & Ingress Engine...")

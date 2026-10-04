@@ -3,6 +3,7 @@ import re
 import io
 import time
 import json
+import math
 import logging
 import hashlib
 import urllib.parse
@@ -422,17 +423,40 @@ def skip_trace_and_purge(leads):
     return contactable_leads
 
 # =====================================================================
-# 5. CHUNKED BATCH INGESTION & LOCAL CSV ARTIFACT EXPORT
+# 5. CHUNKED BATCH INGESTION & BATCHED CSV ARTIFACT EXPORT
 # =====================================================================
-def upload(leads, batch_size=50):
+def export_and_batch_csv(leads, batch_size=2000):
+    """Generates master CSV and splits leads into 2,000-lead CSV batches inside batches/ folder."""
+    if not leads:
+        return
+
+    df = pd.DataFrame(leads)
+    
+    # 1. Master CSV Export
+    df.to_csv("master_surplus_leads.csv", index=False)
+    logging.info(f"📁 MASTER CSV GENERATED: Saved {len(leads)} verified leads into 'master_surplus_leads.csv'!")
+
+    # 2. 2,000-Lead Batch CSV Exports
+    os.makedirs("batches", exist_ok=True)
+    total_batches = math.ceil(len(leads) / batch_size)
+
+    for i in range(total_batches):
+        start_idx = i * batch_size
+        end_idx = min(start_idx + batch_size, len(leads))
+        
+        batch_df = df.iloc[start_idx:end_idx]
+        batch_filename = f"batches/surplus_batch_{i+1}_leads_{start_idx+1}_to_{end_idx}.csv"
+        
+        batch_df.to_csv(batch_filename, index=False)
+        logging.info(f"📦 BATCH CSV EXPORTED [{i+1}/{total_batches}]: Saved {len(batch_df)} leads to '{batch_filename}'")
+
+def upload(leads, kv_batch_size=50, csv_batch_size=2000):
     if not leads:
         logging.info("ℹ️ Zero actionable leads to process.")
         return
 
-    # Always generate local CSV artifact in GitHub workspace
-    df = pd.DataFrame(leads)
-    df.to_csv("master_surplus_leads.csv", index=False)
-    logging.info(f"📁 MASTER CSV GENERATED: Saved {len(leads)} verified leads into 'master_surplus_leads.csv'!")
+    # Always generate master CSV & 2,000-lead batch CSV artifacts for GitHub Actions
+    export_and_batch_csv(leads, batch_size=csv_batch_size)
 
     if DRY_RUN:
         logging.info(f"🧪 [DRY RUN] Would write {len(leads)} leads to Cloudflare KV.")
@@ -440,26 +464,26 @@ def upload(leads, batch_size=50):
 
     endpoint = f"{WORKER_URL}/api/inbound-lead-hook"
     total_uploaded = 0
-    total_batches = (len(leads) + batch_size - 1) // batch_size
+    total_batches = (len(leads) + kv_batch_size - 1) // kv_batch_size
 
-    logging.info(f"🚀 Uploading {len(leads)} leads in {total_batches} chunked batch(es) of {batch_size}...")
+    logging.info(f"🚀 Uploading {len(leads)} leads in {total_batches} chunked batch(es) of {kv_batch_size}...")
 
-    for idx in range(0, len(leads), batch_size):
-        batch = leads[idx:idx + batch_size]
-        current_batch_num = (idx // batch_size) + 1
+    for idx in range(0, len(leads), kv_batch_size):
+        batch = leads[idx:idx + kv_batch_size]
+        current_batch_num = (idx // kv_batch_size) + 1
         try:
             res = session.post(endpoint, json=batch, headers=WORKER_HEADERS, timeout=25)
             if res.status_code == 200:
                 total_uploaded += len(batch)
-                logging.info(f"   ✅ Batch [{current_batch_num}/{total_batches}] Ingested ({len(batch)} leads).")
+                logging.info(f"    ✅ Batch [{current_batch_num}/{total_batches}] Ingested ({len(batch)} leads).")
             else:
-                logging.warning(f"   ⚠️ KV write paused at Batch [{current_batch_num}/{total_batches}] (Status {res.status_code}). Full dataset safe in CSV artifact.")
+                logging.warning(f"    ⚠️ KV write paused at Batch [{current_batch_num}/{total_batches}] (Status {res.status_code}). Full dataset safe in CSV artifacts.")
                 break
         except Exception as e:
-            logging.error(f"   ⚠️ Batch [{current_batch_num}/{total_batches}] Connection Error: {e}")
+            logging.error(f"    ⚠️ Batch [{current_batch_num}/{total_batches}] Connection Error: {e}")
             break
 
-    logging.info(f"🎉 INGESTION SUMMARY: {total_uploaded}/{len(leads)} uploaded to KV. Complete dataset exported to master_surplus_leads.csv.")
+    logging.info(f"🎉 INGESTION SUMMARY: {total_uploaded}/{len(leads)} uploaded to KV. Complete dataset exported to master_surplus_leads.csv and batches/ directory.")
 
 if __name__ == "__main__":
     logging.info("🚀 Launching Master 50-State Ingress Engine...")

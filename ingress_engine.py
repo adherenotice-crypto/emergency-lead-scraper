@@ -39,6 +39,15 @@ MAX_SURPLUS_CEILING = float(os.getenv("MAX_SURPLUS_CEILING") or 10000000.00) # $
 REQUIRE_PHONE_TO_UPLOAD = (os.getenv("REQUIRE_PHONE_TO_UPLOAD") or "true").lower() in ["true", "1", "yes"]
 DRY_RUN = (os.getenv("DRY_RUN") or "false").lower() in ["true", "1", "yes"]
 
+# All 50 US States Postal Codes
+ALL_50_STATES = [
+    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA",
+    "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
+    "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
+    "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC",
+    "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY"
+]
+
 # Criminal Court Docket & Bad Row Blacklist
 TEXT_BLACKLIST = [
     "COUNT(S)", "CONVICTED", "FELONY", "FELON", "CRIMINAL", "HIJACKING", "CLERK NO",
@@ -60,7 +69,7 @@ WORKER_HEADERS = {
 }
 
 session = requests.Session()
-retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+retries = Retry(total=2, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
 session.mount("https://", HTTPAdapter(max_retries=retries))
 
 # =====================================================================
@@ -88,55 +97,67 @@ STATE_STATUTES = {
 }
 
 # =====================================================================
-# 1. 30+ MAJOR METRO COUNTY REGISTRY & STATE APIs
+# STATIC BASE FEEDS
 # =====================================================================
 PUBLIC_SURPLUS_FEEDS = [
-    # STATEWIDE REST APIs (Bulk Ingestion)
-    {"name": "Texas Excess Proceeds API", "state": "TX", "county": "Statewide", "type": "json_api", "url": "https://data.texas.gov/resource/excess-proceeds.json?$where=amount>10000&$limit=2000"},
-    {"name": "LA County CA Tax Surplus API", "state": "CA", "county": "Los Angeles", "type": "json_api", "url": "https://data.lacounty.gov/resource/tax-surplus.json?$where=amount>10000&$limit=2000"},
-    {"name": "Cook County IL Unclaimed Funds API", "state": "IL", "county": "Cook", "type": "json_api", "url": "https://data.cookcountyil.gov/resource/unclaimed-funds.json?$where=amount>10000&$limit=2000"},
+    # OPEN DATA REST APIS
+    {"name": "Texas Excess Proceeds API", "state": "TX", "county": "Harris", "type": "json_api", "url": "https://data.texas.gov/resource/excess-proceeds.json?$where=amount>10000&$limit=2000"},
+    {"name": "Cook County IL Unclaimed Funds API", "state": "IL", "county": "Cook", "type": "json_api", "url": "https://data.cookcountyil.gov/resource/unclaimed-funds.json?$where=amount>10000&$limit=1000"},
     
-    # FLORIDA METROS
+    # FLORIDA
     {"name": "Orange County FL Surplus", "state": "FL", "county": "Orange", "type": "pdf", "url": "https://www.myorangeclerk.com/Portals/0/Foreclosure/Surplus_List.pdf"},
     {"name": "Hillsborough County FL Surplus", "state": "FL", "county": "Hillsborough", "type": "pdf", "url": "https://www.hillsclerk.com/-/media/files/hillsclerk/court-records/foreclosure/surplus-list.pdf"},
     {"name": "Palm Beach County FL Surplus", "state": "FL", "county": "Palm Beach", "type": "pdf", "url": "https://www.mypalmbeachclerk.com/home/showpublisheddocument/1230"},
-    {"name": "Miami-Dade County FL Tax Surplus", "state": "FL", "county": "Miami-Dade", "type": "pdf", "url": "https://www.miamidade.clerk.org/foreclosure_surplus.pdf"},
-    {"name": "Broward County FL Surplus", "state": "FL", "county": "Broward", "type": "pdf", "url": "https://www.browardclerk.org/Documents/SurplusList.pdf"},
     
-    # TEXAS METROS
+    # TEXAS
     {"name": "Harris County TX Excess Proceeds", "state": "TX", "county": "Harris", "type": "csv", "url": "https://www.hctx.net/Tax-Assessor/ExcessProceeds/DownloadCSV"},
     {"name": "Bexar County TX Excess Proceeds", "state": "TX", "county": "Bexar", "type": "pdf", "url": "https://www.bexar.org/DocumentCenter/View/28221/Excess-Proceeds-List-PDF"},
     {"name": "Tarrant County TX Surplus", "state": "TX", "county": "Tarrant", "type": "pdf", "url": "https://www.tarrantcountytx.gov/content/dam/main/tax-assessor-collector/Excess_Proceeds.pdf"},
-    {"name": "Dallas County TX Tax Excess", "state": "TX", "county": "Dallas", "type": "pdf", "url": "https://www.dallascounty.org/departments/tax/docs/ExcessProceeds.pdf"},
 
-    # GEORGIA METROS
+    # GEORGIA, NC, OH, AZ, NV
+    {"name": "Fulton County GA Unclaimed Funds", "state": "GA", "county": "Fulton", "type": "pdf", "url": "https://www.fultonclerk.org/DocumentCenter/View/1245/Unclaimed-Funds-List-PDF"},
     {"name": "DeKalb County GA Excess Funds", "state": "GA", "county": "DeKalb", "type": "pdf", "url": "https://www.dekalbcountyga.gov/sites/default/files/tax_execs_funds_list.pdf"},
-    {"name": "Gwinnett County GA Tax Surplus", "state": "GA", "county": "Gwinnett", "type": "pdf", "url": "https://www.gwinnettcounty.com/static/departments/tax/pdf/ExcessFunds.pdf"},
-
-    # NORTH CAROLINA, OHIO & ARIZONA
     {"name": "Mecklenburg County NC Surplus", "state": "NC", "county": "Mecklenburg", "type": "pdf", "url": "https://www.mecknc.gov/TaxCollector/Documents/Surplus-Funds-List.pdf"},
-    {"name": "Wake County NC Tax Surplus", "state": "NC", "county": "Wake", "type": "pdf", "url": "https://www.wake.gov/media/tax/surplus_funds.pdf"},
     {"name": "Franklin County OH Unclaimed Funds", "state": "OH", "county": "Franklin", "type": "csv", "url": "https://treasurer.franklincountyohio.gov/FranklinCounty/media/Documents/Unclaimed-Funds.csv"},
     {"name": "Maricopa County AZ Tax Surplus", "state": "AZ", "county": "Maricopa", "type": "pdf", "url": "https://www.maricopa.gov/DocumentCenter/View/61241/Excess-Proceeds-List"},
     {"name": "Clark County NV Excess Proceeds", "state": "NV", "county": "Clark", "type": "pdf", "url": "https://www.clarkcountynv.gov/treasurer/ExcessProceedsList.pdf"}
 ]
 
-def fetch_feed_data(url, name):
+def is_valid_payload(content, feed_type):
+    """Detects WAF HTML challenge pages masquerading as HTTP 200 OK."""
+    if not content or len(content) < 200:
+        return False
+    
+    head = content[:150].lower()
+    if b"<html" in head or b"<!doctype" in head or b"<head" in head or b"access denied" in head:
+        return False
+        
+    if feed_type == "pdf" and not content.startswith(b"%PDF"):
+        return False
+        
+    return True
+
+def fetch_feed_data(url, name, feed_type="pdf"):
+    """Fetches feed content with payload validation and automatic ScraperAPI fallback."""
     try:
-        res = session.get(url, headers=BROWSER_HEADERS, timeout=12)
-        if res.status_code == 200 and len(res.content) > 200:
+        res = session.get(url, headers=BROWSER_HEADERS, timeout=10)
+        if res.status_code == 200 and is_valid_payload(res.content, feed_type):
             logging.info(f"   [Direct HTTP 200] {len(res.content)} bytes for {name}")
             return res.content
+        else:
+            logging.warning(f"   [Direct WAF Challenge / Invalid Payload] {name} - Falling back to ScraperAPI...")
     except Exception as e:
         logging.warning(f"   [Direct HTTP Fail] {name}: {e}")
 
     if SCRAPERAPI_KEY:
-        proxy_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={url}&render=true&country_code=us"
+        proxy_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={urllib.parse.quote(url)}&country_code=us"
         try:
             res = session.get(proxy_url, timeout=25)
-            if res.status_code == 200 and len(res.content) > 200:
+            if res.status_code == 200 and is_valid_payload(res.content, feed_type):
                 logging.info(f"   [ScraperAPI Residential 200] {len(res.content)} bytes for {name}")
                 return res.content
+            else:
+                logging.warning(f"   [ScraperAPI Invalid Payload] {name}")
         except Exception as e:
             logging.warning(f"   [ScraperAPI Fail] {name}: {e}")
 
@@ -154,53 +175,42 @@ def is_blacklisted(text):
     return any(bad_word in text_upper for bad_word in TEXT_BLACKLIST)
 
 # =====================================================================
-# 2. DYNAMIC 50-STATE DISCOVERY ENGINE (.GOV SEARCH HARVESTER)
+# DYNAMIC 50-STATE DISCOVERY ENGINE
 # =====================================================================
-def run_dynamic_discovery():
-    logging.info("🔎 Launching 50-State Dynamic .gov Discovery Engine...")
+def run_50_state_discovery():
+    logging.info("🔎 Scanning all 50 States for active .gov surplus registries...")
     discovered_feeds = []
-    
-    # Search Engine Queries targeting public county files
-    queries = [
-        'site:.gov filetype:pdf "surplus funds" OR "excess proceeds" OR "tax sale surplus" 2026',
-        'site:.gov filetype:csv "unclaimed excess proceeds" OR "tax deed overbid"'
-    ]
 
-    for q in queries:
+    # Iterates across all 50 states dynamically
+    for state in ALL_50_STATES:
+        q = f'site:.gov "{state}" "surplus funds" OR "excess proceeds" OR "tax sale overbid" filetype:pdf'
         search_url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(q)}"
-        content = fetch_feed_data(search_url, f"Discovery Engine: {q[:30]}")
-        if not content:
-            continue
+        content = fetch_feed_data(search_url, f"Discovery Engine ({state})", feed_type="html")
+        
+        if content:
+            try:
+                found_urls = re.findall(r'https?://[a-zA-Z0-9.\-_]+\.gov/[^"\s<>]+\.pdf', content.decode("utf-8", errors="ignore"))
+                for link in set(found_urls)[:2]: # Grab top 2 live links per state
+                    discovered_feeds.append({
+                        "name": f"Dynamic Discovery ({state})",
+                        "state": state,
+                        "county": f"{state} County",
+                        "type": "pdf",
+                        "url": link
+                    })
+            except Exception as e:
+                logging.warning(f"⚠️ Discovery parse error for {state}: {e}")
 
-        try:
-            # Extract links ending in .pdf or .csv from gov domains
-            found_urls = re.findall(r'https?://[a-zA-Z0-9.\-_]+\.gov/[^"\s<>]+\.(?:pdf|csv)', content.decode("utf-8", errors="ignore"))
-            for link in set(found_urls):
-                file_type = "pdf" if link.endswith(".pdf") else "csv"
-                # Infer state code from URL if possible
-                state_match = re.search(r'\.([a-z]{2})\.gov', link, re.IGNORECASE)
-                state_code = state_match.group(1).upper() if state_match else "US"
-
-                discovered_feeds.append({
-                    "name": f"Dynamic Discovery ({state_code})",
-                    "state": state_code,
-                    "county": "Discovered County",
-                    "type": file_type,
-                    "url": link
-                })
-        except Exception as e:
-            logging.warning(f"⚠️ Discovery parsing error: {e}")
-
-    logging.info(f"✨ Discovered {len(discovered_feeds)} new live .gov surplus documents across the US!")
+    logging.info(f"✨ Discovered {len(discovered_feeds)} dynamic 50-state surplus endpoints!")
     return discovered_feeds
 
 # =====================================================================
-# 3. HARVESTERS
+# HARVESTERS
 # =====================================================================
 def harvest_json_api(feed):
     logging.info(f"🌐 Querying Open API: {feed['name']}...")
     records = []
-    content = fetch_feed_data(feed["url"], feed["name"])
+    content = fetch_feed_data(feed["url"], feed["name"], feed_type="json_api")
     if not content:
         return records
     try:
@@ -234,7 +244,7 @@ def harvest_json_api(feed):
 def harvest_pdf_feed(feed):
     logging.info(f"📄 Harvesting {feed['state']} - {feed['county']} County Surplus PDF...")
     records = []
-    content = fetch_feed_data(feed["url"], feed["name"])
+    content = fetch_feed_data(feed["url"], feed["name"], feed_type="pdf")
     if not content:
         return records
 
@@ -285,7 +295,7 @@ def harvest_pdf_feed(feed):
 def harvest_csv_feed(feed):
     logging.info(f"📊 Harvesting {feed['state']} - {feed['county']} County Surplus CSV...")
     records = []
-    content = fetch_feed_data(feed["url"], feed["name"])
+    content = fetch_feed_data(feed["url"], feed["name"], feed_type="csv")
     if not content:
         return records
 
@@ -326,9 +336,9 @@ def harvest_csv_feed(feed):
 
 def collect_all_sources():
     raw_harvest = []
-    # Combine Static Feeds + Dynamic Discovered Feeds
-    all_feeds = PUBLIC_SURPLUS_FEEDS + run_dynamic_discovery()
-    
+    # Combines static registry + dynamic 50-state search discovery
+    all_feeds = PUBLIC_SURPLUS_FEEDS + run_50_state_discovery()
+
     for feed in all_feeds:
         if feed["type"] == "json_api":
             raw_harvest.extend(harvest_json_api(feed))
@@ -339,7 +349,7 @@ def collect_all_sources():
     return raw_harvest
 
 # =====================================================================
-# 4. VALIDATOR & 13-HEADER MASTER SCHEMA MAPPER
+# VALIDATOR & 13-HEADER MASTER SCHEMA MAPPER
 # =====================================================================
 def validate_and_normalize(raw_items):
     logging.info(f"🧹 Enforcing ${MIN_SURPLUS_THRESHOLD:,.2f} floor & ${MAX_SURPLUS_CEILING:,.2f} ceiling guardrails...")
@@ -427,7 +437,7 @@ def validate_and_normalize(raw_items):
     return qualified_leads
 
 # =====================================================================
-# 5. TRACERFY SKIP-TRACING & AUTO-PURGE UNCONTACTABLE FILTER
+# TRACERFY SKIP-TRACING & AUTO-PURGE UNCONTACTABLE FILTER
 # =====================================================================
 def skip_trace_and_purge(leads):
     if not leads:
@@ -468,13 +478,13 @@ def skip_trace_and_purge(leads):
             contactable_leads.append(item)
         else:
             purged_count += 1
-            logging.info(f"🗑️ PURGED UNCONTACTABLE LEAD [No Phone Hit]: {item['owner_name']}")
+            logging.info(f"🗑 PURGED UNCONTACTABLE LEAD [No Phone Hit]: {item['owner_name']}")
 
     logging.info(f"🎯 Actionable Pipeline: Retained {len(contactable_leads)} lead(s) with active phone numbers | Auto-Purged {purged_count} dead lead(s).")
     return contactable_leads
 
 # =====================================================================
-# 6. WORKER INGESTION
+# WORKER INGESTION
 # =====================================================================
 def upload(leads):
     if not leads:
@@ -499,7 +509,7 @@ def upload(leads):
 # MAIN EXECUTION
 # =====================================================================
 if __name__ == "__main__":
-    logging.info("🚀 Launching Master 50-State Nationwide Actionable Ingress Engine...")
+    logging.info("🚀 Launching Master 50-State Actionable Ingress Engine...")
     raw_data = collect_all_sources()
     clean_data = validate_and_normalize(raw_data)
     actionable_data = skip_trace_and_purge(clean_data)

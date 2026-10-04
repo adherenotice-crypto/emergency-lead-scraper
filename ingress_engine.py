@@ -66,23 +66,55 @@ session.mount("https://", HTTPAdapter(max_retries=retries))
 # =====================================================================
 STATE_STATUTES = {
     "AL": "ALA. CODE § 40-10-28 (Tax Sale Excess)",
+    "AK": "ALASKA STAT. § 29.45.480 (Tax Foreclosure Surplus)",
     "AZ": "A.R.S. § 33-812 / § 42-18205 (Excess Proceeds)",
+    "AR": "ARK. CODE § 26-37-205 (Unclaimed Tax Surplus)",
     "CA": "CA REV & TAX CODE § 4675 / CIVIL CODE § 2924J",
     "CO": "C.R.S. § 39-11-115 (Tax Sale Overbid)",
+    "CT": "CONN. GEN. STAT. § 12-157 (Tax Collector Surplus)",
+    "DE": "DEL. CODE ANN. TIT. 9 § 8779 (Excess Tax Proceeds)",
     "FL": "FL STATUTES § 197.582 & § 45.032",
     "GA": "O.C.G.A. § 48-4-5 (Tax Sale Excess Funds)",
+    "HI": "HAWAII REV. STAT. § 246-60 (Tax Sale Surplus)",
+    "ID": "IDAHO CODE § 31-808 (Tax Deed Excess Sale)",
     "IL": "35 ILCS 200/21-295 (Indemnity/Surplus Fund)",
     "IN": "IND. CODE § 6-1.1-24-7 (Tax Sale Surplus)",
+    "IA": "IOWA CODE § 446.27 (Tax Sale Proceeds)",
+    "KS": "KAN. STAT. ANN. § 79-2803 (Foreclosure Surplus)",
+    "KY": "KRS § 134.545 (Unclaimed Tax Overpayment)",
+    "LA": "LA. REV. STAT. § 47:2211 (Tax Sale Excess)",
+    "ME": "ME. REV. STAT. TIT. 36 § 949 (Tax Lien Surplus)",
+    "MD": "MD. CODE TAX-PROP. § 14-844 (Tax Foreclosure Excess)",
+    "MA": "MASS. GEN. LAWS CH. 60 § 79 (Tax Title Surplus)",
     "MI": "MCL § 211.78T (Foreclosure Surplus Claims)",
-    "NC": "NC GEN STAT § 105-374 / § 1-339.67",
+    "MN": "MINN. STAT. § 282.08 (Tax Forfeited Surplus)",
+    "MS": "MISS. CODE § 27-41-79 (Tax Sale Overplus)",
+    "MO": "MO. REV. STAT. § 140.230 (Tax Sale Surplus)",
+    "MT": "MONT. CODE § 15-18-211 (Tax Deed Excess)",
+    "NE": "NEB. REV. STAT. § 77-1837 (Tax Sale Excess)",
     "NV": "NRS § 361.595 (Unclaimed Surplus Proceeds)",
+    "NH": "N.H. REV. STAT. § 80:88 (Tax Deed Overplus)",
+    "NJ": "N.J.S.A. 54:5-114.6 (Tax Sale Surplus)",
+    "NM": "N.M. STAT. § 7-38-71 (Tax Sale Overage)",
     "NY": "NY CPLR § 5236 / REAL PROPERTY TAX LAW § 1136",
+    "NC": "NC GEN STAT § 105-374 / § 1-339.67",
+    "ND": "N.D. CENT. CODE § 57-28-20 (Tax Sale Excess)",
     "OH": "OH REV CODE § 5721.20 / § 2329.44",
+    "OK": "OKLA. STAT. TIT. 68 § 3131 (Tax Sale Surplus)",
+    "OR": "ORS § 312.270 (Foreclosure Excess Proceeds)",
     "PA": "72 P.S. § 5860.205 (REAL ESTATE TAX SALE LAW)",
+    "RI": "R.I. GEN. LAWS § 44-9-18.1 (Tax Title Excess)",
     "SC": "SC CODE ANN § 12-51-130 (Overages)",
+    "SD": "S.D. CODIFIED LAWS § 10-23-28 (Tax Sale Overplus)",
     "TN": "T.C.A. § 67-5-2702 (Tax Sale Excess Proceeds)",
     "TX": "TX TAX CODE § 34.04 & PROPERTY CODE § 51.002",
-    "WA": "RCW 84.64.080 (Tax Foreclosure Excess Proceeds)"
+    "UT": "UTAH CODE § 59-2-1351.1 (Tax Sale Overbid)",
+    "VT": "VT. STAT. ANN. TIT. 32 § 5259 (Tax Sale Surplus)",
+    "VA": "VA. CODE ANN. § 58.1-3967 (Tax Sale Excess)",
+    "WA": "RCW 84.64.080 (Tax Foreclosure Excess Proceeds)",
+    "WV": "W. VA. CODE § 11A-3-28 (Tax Sale Excess)",
+    "WI": "WIS. STAT. § 75.36 (Tax Deeded Foreclosure Surplus)",
+    "WY": "WYO. STAT. § 39-13-108 (Tax Sale Surplus)"
 }
 
 def parse_amount(text):
@@ -97,17 +129,23 @@ def is_blacklisted(text):
     return any(bad_word in text_upper for bad_word in TEXT_BLACKLIST)
 
 # =====================================================================
-# 1. SOCRATA NATIONWIDE DISCOVERY ENGINE
+# 1. AUTOMATED PAGINATED DISCOVERY ENGINE (100% DATA RECOVERY)
 # =====================================================================
 def discover_socrata_datasets():
-    logging.info("🔎 Querying Socrata Global Catalog for Live Surplus Portals...")
+    logging.info("🔎 Launching Paginated 50-State Socrata Discovery Engine...")
     discovered_records = []
-    keywords = ["excess proceeds", "surplus funds", "unclaimed surplus"]
+    seen_datasets = set()
+
+    keywords = [
+        "excess proceeds", "surplus funds", "unclaimed surplus", 
+        "tax sale overage", "tax deed overbid", "foreclosure surplus",
+        "unclaimed property", "excess tax funds"
+    ]
     
     for kw in keywords:
-        catalog_url = f"https://api.us.socrata.com/api/catalog/v1?q={urllib.parse.quote(kw)}&limit=15"
+        catalog_url = f"https://api.us.socrata.com/api/catalog/v1?q={urllib.parse.quote(kw)}&limit=100"
         try:
-            res = session.get(catalog_url, headers=BROWSER_HEADERS, timeout=10)
+            res = session.get(catalog_url, headers=BROWSER_HEADERS, timeout=12)
             if res.status_code == 200:
                 data = res.json()
                 results = data.get("results", [])
@@ -116,53 +154,71 @@ def discover_socrata_datasets():
                     domain = item.get("metadata", {}).get("domain") or resource.get("domain")
                     dataset_id = resource.get("id")
                     
-                    if domain and dataset_id:
-                        data_url = f"https://{domain}/resource/{dataset_id}.json?$limit=500"
-                        records = harvest_socrata_endpoint(data_url, domain)
+                    if domain and dataset_id and dataset_id not in seen_datasets:
+                        seen_datasets.add(dataset_id)
+                        records = harvest_socrata_paginated(domain, dataset_id)
                         discovered_records.extend(records)
         except Exception as e:
-            logging.warning(f"⚠️ Socrata Discovery exception for keyword '{kw}': {e}")
+            logging.warning(f"⚠️ Socrata Catalog Exception for keyword '{kw}': {e}")
 
+    logging.info(f"✨ Total Socrata Raw Records Harvested: {len(discovered_records)}")
     return discovered_records
 
-def harvest_socrata_endpoint(url, domain):
+def harvest_socrata_paginated(domain, dataset_id):
+    """Loops through all pages ($offset) to download 100% of dataset rows without hitting payload caps."""
     records = []
-    try:
-        res = session.get(url, headers=BROWSER_HEADERS, timeout=12)
-        if res.status_code == 200:
+    limit = 10000
+    offset = 0
+    state_code = "US"
+    state_match = re.search(r"\.([a-z]{2})\.gov", domain, re.IGNORECASE)
+    if state_match:
+        state_code = state_match.group(1).upper()
+
+    while True:
+        url = f"https://{domain}/resource/{dataset_id}.json?$limit={limit}&$offset={offset}"
+        try:
+            res = session.get(url, headers=BROWSER_HEADERS, timeout=20)
+            if res.status_code != 200:
+                break
+            
             data = res.json()
-            if isinstance(data, list):
-                for row in data:
-                    amt, owner, addr = 0.0, "", ""
-                    for k, v in row.items():
-                        kl = k.lower()
-                        if any(t in kl for t in ["amount", "balance", "surplus", "proceeds", "value", "cash"]):
-                            amt = parse_amount(v)
-                        elif any(t in kl for t in ["owner", "name", "claimant", "payee", "holder"]):
-                            owner = str(v).strip().upper()
-                        elif any(t in kl for t in ["address", "situs", "location", "property"]):
-                            addr = str(v).strip().upper()
+            if not isinstance(data, list) or len(data) == 0:
+                break
 
-                    if MIN_SURPLUS_THRESHOLD <= amt <= MAX_SURPLUS_CEILING and owner and not is_blacklisted(owner):
-                        state_code = "US"
-                        state_match = re.search(r"\.([a-z]{2})\.gov", domain, re.IGNORECASE)
-                        if state_match:
-                            state_code = state_match.group(1).upper()
+            for row in data:
+                amt, owner, addr = 0.0, "", ""
+                for k, v in row.items():
+                    kl = k.lower()
+                    if any(t in kl for t in ["amount", "balance", "surplus", "proceeds", "value", "cash", "overage", "overbid"]):
+                        amt = parse_amount(v)
+                    elif any(t in kl for t in ["owner", "name", "claimant", "payee", "holder", "defendant"]):
+                        owner = str(v).strip().upper()
+                    elif any(t in kl for t in ["address", "situs", "location", "property", "street"]):
+                        addr = str(v).strip().upper()
 
-                        records.append({
-                            "owner_name": owner,
-                            "situs_address": addr or "RECORDED PROPERTY LOCATION",
-                            "amount": amt,
-                            "county": domain.split(".")[0].title(),
-                            "state": state_code,
-                            "holder_type": "UNCLAIMED SURPLUS PROCEEDS"
-                        })
-    except Exception:
-        pass
+                if MIN_SURPLUS_THRESHOLD <= amt <= MAX_SURPLUS_CEILING and owner and not is_blacklisted(owner):
+                    records.append({
+                        "owner_name": owner,
+                        "situs_address": addr or "RECORDED PROPERTY LOCATION",
+                        "amount": amt,
+                        "county": domain.split(".")[0].replace("-", " ").title(),
+                        "state": state_code,
+                        "holder_type": "UNCLAIMED SURPLUS PROCEEDS"
+                    })
+
+            # Reached end of dataset
+            if len(data) < limit:
+                break
+            
+            offset += limit
+        except Exception as e:
+            logging.warning(f"⚠️ Pagination error on {domain}/{dataset_id} at offset {offset}: {e}")
+            break
+
     return records
 
 # =====================================================================
-# 2. DIRECT COUNTY FEEDS
+# 2. DIRECT FEEDS
 # =====================================================================
 DIRECT_FEEDS = [
     {"name": "Fulton County GA Unclaimed Funds", "state": "GA", "county": "Fulton", "type": "pdf", "url": "https://www.fultonclerk.org/DocumentCenter/View/1245/Unclaimed-Funds-List-PDF"}
@@ -366,7 +422,7 @@ def skip_trace_and_purge(leads):
     return contactable_leads
 
 # =====================================================================
-# 5. CHUNKED BATCH WORKER INGESTION (PREVENTS WORKER TIMEOUTS)
+# 5. CHUNKED BATCH WORKER INGESTION
 # =====================================================================
 def upload(leads, batch_size=50):
     if not leads:
@@ -399,7 +455,7 @@ def upload(leads, batch_size=50):
     logging.info(f"🎉 FINAL INGESTION SUMMARY: Successfully uploaded {total_uploaded}/{len(leads)} leads into Executive Command Hub!")
 
 if __name__ == "__main__":
-    logging.info("🚀 Launching Socrata Discovery & Ingress Engine...")
+    logging.info("🚀 Launching Uncapped Paginated Socrata Engine...")
     raw_data = collect_all_sources()
     clean_data = validate_and_normalize(raw_data)
     actionable_data = skip_trace_and_purge(clean_data)

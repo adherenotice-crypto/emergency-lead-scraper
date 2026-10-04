@@ -11,6 +11,10 @@ import pandas as pd
 from datetime import datetime
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import urllib3
+
+# Suppress SSL warnings for proxy routing
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Robust PDF Engine Fallback
 try:
@@ -32,23 +36,13 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 WORKER_URL = (os.getenv("WORKER_URL") or "https://emergencyaudit.com").rstrip('/')
 MASTER_ADMIN_KEY = os.getenv("MASTER_ADMIN_KEY") or os.getenv("EMERGENCY_KEY") or "recovery2026"
 TRACERFY_API_KEY = os.getenv("TRACERFY_API_KEY")
-SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY")
+APIFY_TOKEN = os.getenv("APIFY_TOKEN")
 
 MIN_SURPLUS_THRESHOLD = float(os.getenv("MIN_SURPLUS_THRESHOLD") or 10000.00)
-MAX_SURPLUS_CEILING = float(os.getenv("MAX_SURPLUS_CEILING") or 10000000.00) # $10M Ceiling
+MAX_SURPLUS_CEILING = float(os.getenv("MAX_SURPLUS_CEILING") or 10000000.00)
 REQUIRE_PHONE_TO_UPLOAD = (os.getenv("REQUIRE_PHONE_TO_UPLOAD") or "false").lower() in ["true", "1", "yes"]
 DRY_RUN = (os.getenv("DRY_RUN") or "false").lower() in ["true", "1", "yes"]
 
-# All 50 US States Postal Codes
-ALL_50_STATES = [
-    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA",
-    "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
-    "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
-    "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC",
-    "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY"
-]
-
-# Criminal Court Docket & Bad Row Blacklist
 TEXT_BLACKLIST = [
     "COUNT(S)", "CONVICTED", "FELONY", "FELON", "CRIMINAL", "HIJACKING", "CLERK NO",
     "HAVING BEEN", "COMMISSION", "PARTICIPATION", "DOCKET", "JUDGMENT", "O.C.G.A",
@@ -57,8 +51,8 @@ TEXT_BLACKLIST = [
 ]
 
 BROWSER_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/html, application/pdf, */*",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/pdf, text/html, application/xhtml+xml, application/xml;q=0.9, */*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9"
 }
 
@@ -73,48 +67,17 @@ retries = Retry(total=2, backoff_factor=1, status_forcelist=[429, 500, 502, 503,
 session.mount("https://", HTTPAdapter(max_retries=retries))
 
 # =====================================================================
-# 50-STATE STATUTORY CITATION MAPPER
-# =====================================================================
-STATE_STATUTES = {
-    "AL": "ALA. CODE § 40-10-28 (Tax Sale Excess)",
-    "AZ": "A.R.S. § 33-812 / § 42-18205 (Excess Proceeds)",
-    "CA": "CA REV & TAX CODE § 4675 / CIVIL CODE § 2924J",
-    "CO": "C.R.S. § 39-11-115 (Tax Sale Overbid)",
-    "FL": "FL STATUTES § 197.582 & § 45.032",
-    "GA": "O.C.G.A. § 48-4-5 (Tax Sale Excess Funds)",
-    "IL": "35 ILCS 200/21-295 (Indemnity/Surplus Fund)",
-    "IN": "IND. CODE § 6-1.1-24-7 (Tax Sale Surplus)",
-    "MI": "MCL § 211.78T (Foreclosure Surplus Claims)",
-    "NC": "NC GEN STAT § 105-374 / § 1-339.67",
-    "NV": "NRS § 361.595 (Unclaimed Surplus Proceeds)",
-    "NY": "NY CPLR § 5236 / REAL PROPERTY TAX LAW § 1136",
-    "OH": "OH REV CODE § 5721.20 / § 2329.44",
-    "PA": "72 P.S. § 5860.205 (REAL ESTATE TAX SALE LAW)",
-    "SC": "SC CODE ANN § 12-51-130 (Overages)",
-    "TN": "T.C.A. § 67-5-2702 (Tax Sale Excess Proceeds)",
-    "TX": "TX TAX CODE § 34.04 & PROPERTY CODE § 51.002",
-    "WA": "RCW 84.64.080 (Tax Foreclosure Excess Proceeds)"
-}
-
-# =====================================================================
-# LIVE PUBLIC SURPLUS FEEDS ONLY
+# PUBLIC SURPLUS FEEDS
 # =====================================================================
 PUBLIC_SURPLUS_FEEDS = [
-    # GEORGIA TAX SURPLUS
     {"name": "Fulton County GA Unclaimed Funds", "state": "GA", "county": "Fulton", "type": "pdf", "url": "https://www.fultonclerk.org/DocumentCenter/View/1245/Unclaimed-Funds-List-PDF"},
     {"name": "DeKalb County GA Excess Funds", "state": "GA", "county": "DeKalb", "type": "pdf", "url": "https://www.dekalbcountyga.gov/sites/default/files/tax_execs_funds_list.pdf"},
-    
-    # FLORIDA TAX SURPLUS
     {"name": "Orange County FL Surplus", "state": "FL", "county": "Orange", "type": "pdf", "url": "https://www.myorangeclerk.com/Portals/0/Foreclosure/Surplus_List.pdf"},
     {"name": "Hillsborough County FL Surplus", "state": "FL", "county": "Hillsborough", "type": "pdf", "url": "https://www.hillsclerk.com/-/media/files/hillsclerk/court-records/foreclosure/surplus-list.pdf"},
     {"name": "Palm Beach County FL Surplus", "state": "FL", "county": "Palm Beach", "type": "pdf", "url": "https://www.mypalmbeachclerk.com/home/showpublisheddocument/1230"},
-    
-    # TEXAS TAX OVERBIDS
     {"name": "Harris County TX Excess Proceeds", "state": "TX", "county": "Harris", "type": "csv", "url": "https://www.hctx.net/Tax-Assessor/ExcessProceeds/DownloadCSV"},
     {"name": "Bexar County TX Excess Proceeds", "state": "TX", "county": "Bexar", "type": "pdf", "url": "https://www.bexar.org/DocumentCenter/View/28221/Excess-Proceeds-List-PDF"},
     {"name": "Tarrant County TX Surplus", "state": "TX", "county": "Tarrant", "type": "pdf", "url": "https://www.tarrantcountytx.gov/content/dam/main/tax-assessor-collector/Excess_Proceeds.pdf"},
-
-    # NC, OH, AZ, NV
     {"name": "Mecklenburg County NC Surplus", "state": "NC", "county": "Mecklenburg", "type": "pdf", "url": "https://www.mecknc.gov/TaxCollector/Documents/Surplus-Funds-List.pdf"},
     {"name": "Franklin County OH Unclaimed Funds", "state": "OH", "county": "Franklin", "type": "csv", "url": "https://treasurer.franklincountyohio.gov/FranklinCounty/media/Documents/Unclaimed-Funds.csv"},
     {"name": "Maricopa County AZ Tax Surplus", "state": "AZ", "county": "Maricopa", "type": "pdf", "url": "https://www.maricopa.gov/DocumentCenter/View/61241/Excess-Proceeds-List"},
@@ -122,50 +85,46 @@ PUBLIC_SURPLUS_FEEDS = [
 ]
 
 def is_valid_payload(content, feed_type):
-    """Context-aware payload validation for HTML discovery vs Binary data feeds."""
     if not content or len(content) < 50:
         return False
-
-    if feed_type == "html":
-        return True
-
     head = content[:512].lower()
     if b"access denied" in head or b"cloudflare" in head or b"just a moment..." in head or b"enable javascript" in head:
         return False
-
     if feed_type == "pdf":
         return b"%PDF" in content[:1024]
-    elif feed_type == "json_api":
-        stripped = content.strip()
-        return stripped.startswith(b"[") or stripped.startswith(b"{")
     elif feed_type == "csv":
         return b"<html" not in head and b"<!doctype" not in head
-
     return True
 
 def fetch_feed_data(url, name, feed_type="pdf"):
-    """Fetches feed content with payload validation and automatic ScraperAPI fallback."""
+    # 1. Try direct HTTP fetch
     try:
-        res = session.get(url, headers=BROWSER_HEADERS, timeout=10)
+        res = session.get(url, headers=BROWSER_HEADERS, timeout=8)
         if res.status_code == 200 and is_valid_payload(res.content, feed_type):
             logging.info(f"   [Direct HTTP 200] {len(res.content)} bytes for {name}")
             return res.content
         else:
-            logging.warning(f"   [Direct WAF Challenge / Invalid Payload] {name} - Falling back to ScraperAPI...")
+            logging.warning(f"   [Direct HTTP Blocked] {name} - Routing through Apify Residential Proxy...")
     except Exception as e:
         logging.warning(f"   [Direct HTTP Fail] {name}: {e}")
 
-    if SCRAPERAPI_KEY:
-        proxy_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={urllib.parse.quote(url)}&country_code=us"
+    # 2. Apify Residential Proxy Fallback
+    if APIFY_TOKEN:
+        proxies = {
+            "http": f"http://auto:{APIFY_TOKEN}@proxy.apify.com:8000",
+            "https": f"http://auto:{APIFY_TOKEN}@proxy.apify.com:8000"
+        }
         try:
-            res = session.get(proxy_url, timeout=25)
+            res = session.get(url, headers=BROWSER_HEADERS, proxies=proxies, timeout=25, verify=False)
             if res.status_code == 200 and is_valid_payload(res.content, feed_type):
-                logging.info(f"   [ScraperAPI Residential 200] {len(res.content)} bytes for {name}")
+                logging.info(f"   [Apify Proxy 200 SUCCESS] {len(res.content)} bytes for {name}")
                 return res.content
             else:
-                logging.warning(f"   [ScraperAPI Invalid Payload] {name}")
+                logging.warning(f"   [Apify Proxy Invalid Payload] {name} (Status Code: {res.status_code})")
         except Exception as e:
-            logging.warning(f"   [ScraperAPI Fail] {name}: {e}")
+            logging.error(f"   [Apify Proxy Connection Fail] {name}: {e}")
+    else:
+        logging.error("❌ APIFY_TOKEN secret is missing in GitHub Secrets!")
 
     return None
 
@@ -180,38 +139,6 @@ def is_blacklisted(text):
     text_upper = str(text).upper()
     return any(bad_word in text_upper for bad_word in TEXT_BLACKLIST)
 
-# =====================================================================
-# DYNAMIC 50-STATE DISCOVERY ENGINE
-# =====================================================================
-def run_50_state_discovery():
-    logging.info("🔎 Scanning 50 States for active .gov surplus registries...")
-    discovered_feeds = []
-
-    for state in ALL_50_STATES[:10]:
-        q = f'site:.gov "{state}" "surplus funds" OR "excess proceeds" filetype:pdf'
-        search_url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(q)}"
-        content = fetch_feed_data(search_url, f"Discovery Engine ({state})", feed_type="html")
-        
-        if content:
-            try:
-                found_urls = re.findall(r'https?://[a-zA-Z0-9.\-_]+\.gov/[^"\s<>]+\.pdf', content.decode("utf-8", errors="ignore"))
-                for link in set(found_urls)[:2]:
-                    discovered_feeds.append({
-                        "name": f"Dynamic Discovery ({state})",
-                        "state": state,
-                        "county": f"{state} County",
-                        "type": "pdf",
-                        "url": link
-                    })
-            except Exception as e:
-                logging.warning(f"⚠️️ Discovery parse error for {state}: {e}")
-
-    logging.info(f"✨ Discovered {len(discovered_feeds)} dynamic surplus endpoints!")
-    return discovered_feeds
-
-# =====================================================================
-# HARVESTERS
-# =====================================================================
 def harvest_pdf_feed(feed):
     logging.info(f"📄 Harvesting {feed['state']} - {feed['county']} County Surplus PDF...")
     records = []
@@ -307,9 +234,7 @@ def harvest_csv_feed(feed):
 
 def collect_all_sources():
     raw_harvest = []
-    all_feeds = PUBLIC_SURPLUS_FEEDS + run_50_state_discovery()
-
-    for feed in all_feeds:
+    for feed in PUBLIC_SURPLUS_FEEDS:
         if feed["type"] == "pdf":
             raw_harvest.extend(harvest_pdf_feed(feed))
         elif feed["type"] == "csv":
@@ -317,9 +242,6 @@ def collect_all_sources():
 
     return raw_harvest
 
-# =====================================================================
-# VALIDATOR & 13-HEADER MASTER SCHEMA MAPPER
-# =====================================================================
 def validate_and_normalize(raw_items):
     logging.info(f"🧹 Enforcing ${MIN_SURPLUS_THRESHOLD:,.2f} floor & ${MAX_SURPLUS_CEILING:,.2f} ceiling guardrails...")
     qualified_leads = []
@@ -345,7 +267,6 @@ def validate_and_normalize(raw_items):
         county = str(item.get("county") or "County").strip().title()
         case_num = f"CS-{state}-{int(time.time())}-{idx}"
 
-        # Fingerprint Deduplication
         fp_str = f"{owner}|{situs_addr}|{amt_val:.2f}|{state}|{county}"
         fingerprint = hashlib.md5(fp_str.encode("utf-8")).hexdigest()[:12]
         
@@ -376,7 +297,7 @@ def validate_and_normalize(raw_items):
             "exactAmount": amt_val,
             "default_amount": f"${amt_val:,.2f}",
             "category": "TAX SALE EXCESS PROCEEDS",
-            "statutory_citation": STATE_STATUTES.get(state, f"State Statutory Recovery Laws ({state})"),
+            "statutory_citation": f"State Statutory Recovery Laws ({state})",
             "value_tier": tier,
             "phone": "PENDING UNMASK",
             "email": "N/A",
@@ -384,7 +305,6 @@ def validate_and_normalize(raw_items):
             "ingested_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S PST"),
             "fingerprint": fingerprint,
 
-            # 13 Master Schema Alignment
             "Holder Name": owner,
             "Surplus Amount": f"${amt_val:,.2f}",
             "Property Address": situs_addr,
@@ -405,9 +325,6 @@ def validate_and_normalize(raw_items):
     logging.info(f"📊 Audit Summary: Harvested={len(raw_items)} | Validated={len(qualified_leads)} | Rejected={rejected_count}")
     return qualified_leads
 
-# =====================================================================
-# TRACERFY SKIP-TRACING & AUTO-PURGE UNCONTACTABLE FILTER
-# =====================================================================
 def skip_trace_and_purge(leads):
     if not leads:
         return []
@@ -447,14 +364,11 @@ def skip_trace_and_purge(leads):
             contactable_leads.append(item)
         else:
             purged_count += 1
-            logging.info(f"🗑 PURGED UNCONTACTABLE LEAD [No Phone Hit]: {item['owner_name']}")
+            logging.info(f"🗑 PURGED UNCONTACTABLE LEAD: {item['owner_name']}")
 
     logging.info(f"🎯 Actionable Pipeline: Retained {len(contactable_leads)} lead(s) with active phone numbers | Auto-Purged {purged_count} dead lead(s).")
     return contactable_leads
 
-# =====================================================================
-# WORKER INGESTION
-# =====================================================================
 def upload(leads):
     if not leads:
         logging.info("ℹ️ Zero actionable leads to upload this cycle.")
@@ -474,11 +388,8 @@ def upload(leads):
     except Exception as e:
         logging.error(f"⚠️ Connection error posting to Worker: {e}")
 
-# =====================================================================
-# MAIN EXECUTION
-# =====================================================================
 if __name__ == "__main__":
-    logging.info("🚀 Launching Master 50-State Actionable Ingress Engine (Pure Live Mode)...")
+    logging.info("🚀 Launching Apify-Powered Ingress Engine...")
     raw_data = collect_all_sources()
     clean_data = validate_and_normalize(raw_data)
     actionable_data = skip_trace_and_purge(clean_data)

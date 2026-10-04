@@ -62,7 +62,7 @@ retries = Retry(total=2, backoff_factor=1, status_forcelist=[500, 502, 503, 504]
 session.mount("https://", HTTPAdapter(max_retries=retries))
 
 # =====================================================================
-# 50-STATE STATUTORY CITATIONS
+# FULL 50-STATE STATUTORY CITATIONS MAPPER
 # =====================================================================
 STATE_STATUTES = {
     "AL": "ALA. CODE § 40-10-28 (Tax Sale Excess)",
@@ -117,6 +117,13 @@ STATE_STATUTES = {
     "WY": "WYO. STAT. § 39-13-108 (Tax Sale Surplus)"
 }
 
+# =====================================================================
+# DIRECT COUNTY PUBLIC FEEDS
+# =====================================================================
+PUBLIC_SURPLUS_FEEDS = [
+    {"name": "Fulton County GA Unclaimed Funds", "state": "GA", "county": "Fulton", "type": "pdf", "url": "https://www.fultonclerk.org/DocumentCenter/View/1245/Unclaimed-Funds-List-PDF"}
+]
+
 def parse_amount(text):
     clean_str = re.sub(r"[^\d.]", "", str(text))
     try:
@@ -129,10 +136,10 @@ def is_blacklisted(text):
     return any(bad_word in text_upper for bad_word in TEXT_BLACKLIST)
 
 # =====================================================================
-# 1. AUTOMATED PAGINATED DISCOVERY ENGINE (100% DATA RECOVERY)
+# 1. SOCRATA NATIONWIDE DISCOVERY ENGINE
 # =====================================================================
 def discover_socrata_datasets():
-    logging.info("🔎 Launching Paginated 50-State Socrata Discovery Engine...")
+    logging.info("🔎 Launching Full 50-State Socrata Master Catalog Discovery...")
     discovered_records = []
     seen_datasets = set()
 
@@ -159,13 +166,12 @@ def discover_socrata_datasets():
                         records = harvest_socrata_paginated(domain, dataset_id)
                         discovered_records.extend(records)
         except Exception as e:
-            logging.warning(f"⚠️ Socrata Catalog Exception for keyword '{kw}': {e}")
+            logging.warning(f"⚠️ Socrata Discovery exception for keyword '{kw}': {e}")
 
     logging.info(f"✨ Total Socrata Raw Records Harvested: {len(discovered_records)}")
     return discovered_records
 
 def harvest_socrata_paginated(domain, dataset_id):
-    """Loops through all pages ($offset) to download 100% of dataset rows without hitting payload caps."""
     records = []
     limit = 10000
     offset = 0
@@ -206,10 +212,8 @@ def harvest_socrata_paginated(domain, dataset_id):
                         "holder_type": "UNCLAIMED SURPLUS PROCEEDS"
                     })
 
-            # Reached end of dataset
             if len(data) < limit:
                 break
-            
             offset += limit
         except Exception as e:
             logging.warning(f"⚠️ Pagination error on {domain}/{dataset_id} at offset {offset}: {e}")
@@ -218,12 +222,8 @@ def harvest_socrata_paginated(domain, dataset_id):
     return records
 
 # =====================================================================
-# 2. DIRECT FEEDS
+# 2. DIRECT COUNTY PDF & CSV HARVESTERS
 # =====================================================================
-DIRECT_FEEDS = [
-    {"name": "Fulton County GA Unclaimed Funds", "state": "GA", "county": "Fulton", "type": "pdf", "url": "https://www.fultonclerk.org/DocumentCenter/View/1245/Unclaimed-Funds-List-PDF"}
-]
-
 def harvest_pdf_feed(feed):
     logging.info(f"📄 Harvesting {feed['state']} - {feed['county']} County Surplus PDF...")
     records = []
@@ -281,7 +281,7 @@ def collect_all_sources():
     socrata_records = discover_socrata_datasets()
     raw_harvest.extend(socrata_records)
     
-    for feed in DIRECT_FEEDS:
+    for feed in PUBLIC_SURPLUS_FEEDS:
         if feed["type"] == "pdf":
             raw_harvest.extend(harvest_pdf_feed(feed))
 
@@ -422,12 +422,17 @@ def skip_trace_and_purge(leads):
     return contactable_leads
 
 # =====================================================================
-# 5. CHUNKED BATCH WORKER INGESTION
+# 5. CHUNKED BATCH INGESTION & LOCAL CSV ARTIFACT EXPORT
 # =====================================================================
 def upload(leads, batch_size=50):
     if not leads:
-        logging.info("ℹ️ Zero actionable leads to upload this cycle.")
+        logging.info("ℹ️ Zero actionable leads to process.")
         return
+
+    # Always generate local CSV artifact in GitHub workspace
+    df = pd.DataFrame(leads)
+    df.to_csv("master_surplus_leads.csv", index=False)
+    logging.info(f"📁 MASTER CSV GENERATED: Saved {len(leads)} verified leads into 'master_surplus_leads.csv'!")
 
     if DRY_RUN:
         logging.info(f"🧪 [DRY RUN] Would write {len(leads)} leads to Cloudflare KV.")
@@ -448,14 +453,16 @@ def upload(leads, batch_size=50):
                 total_uploaded += len(batch)
                 logging.info(f"   ✅ Batch [{current_batch_num}/{total_batches}] Ingested ({len(batch)} leads).")
             else:
-                logging.error(f"   ❌ Batch [{current_batch_num}/{total_batches}] Failed [{res.status_code}]: {res.text}")
+                logging.warning(f"   ⚠️ KV write paused at Batch [{current_batch_num}/{total_batches}] (Status {res.status_code}). Full dataset safe in CSV artifact.")
+                break
         except Exception as e:
             logging.error(f"   ⚠️ Batch [{current_batch_num}/{total_batches}] Connection Error: {e}")
+            break
 
-    logging.info(f"🎉 FINAL INGESTION SUMMARY: Successfully uploaded {total_uploaded}/{len(leads)} leads into Executive Command Hub!")
+    logging.info(f"🎉 INGESTION SUMMARY: {total_uploaded}/{len(leads)} uploaded to KV. Complete dataset exported to master_surplus_leads.csv.")
 
 if __name__ == "__main__":
-    logging.info("🚀 Launching Uncapped Paginated Socrata Engine...")
+    logging.info("🚀 Launching Master 50-State Ingress Engine...")
     raw_data = collect_all_sources()
     clean_data = validate_and_normalize(raw_data)
     actionable_data = skip_trace_and_purge(clean_data)

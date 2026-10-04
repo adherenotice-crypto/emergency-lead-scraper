@@ -38,3 +38,13 @@ jobs:
           MIN_SURPLUS_THRESHOLD: 10000
           DRY_RUN: ${{ github.event.inputs.dry_run }}
         run: python ingress_engine.py
+
+      - name: Upload Batched Lead CSVs to GitHub Actions
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surplus-leads-batches
+          path: |
+            *.csv
+            batches/*.csv
+          retention-days: 14

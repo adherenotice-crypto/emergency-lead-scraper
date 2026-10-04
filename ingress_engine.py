@@ -4,12 +4,22 @@ import io
 import time
 import logging
 import requests
-import pdfplumber
 import pandas as pd
-from bs4 import BeautifulSoup
 from datetime import datetime
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+# Robust PDF Engine Fallback
+try:
+    import pdfplumber
+    PDF_ENGINE = "pdfplumber"
+except ImportError:
+    try:
+        import pypdf
+        PDF_ENGINE = "pypdf"
+    except ImportError:
+        import PyPDF2
+        PDF_ENGINE = "pypdf2"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -82,7 +92,7 @@ PUBLIC_SURPLUS_FEEDS = [
 ]
 
 def fetch_feed_data(url, name):
-    """Direct HTTP fetch with fallback to ScraperAPI proxy."""
+    """Direct HTTP fetch with automatic fallback to ScraperAPI proxy."""
     try:
         res = session.get(url, headers=BROWSER_HEADERS, timeout=20)
         if res.status_code == 200 and len(res.content) > 200:
@@ -122,44 +132,46 @@ def harvest_pdf_feed(feed):
         return records
 
     try:
-        with pdfplumber.open(io.BytesIO(content)) as pdf:
-            for page in pdf.pages:
-                tables = page.extract_tables() or []
-                for table in tables:
-                    for row in table:
-                        if not row:
-                            continue
-                        row_str = " ".join([str(c) for c in row if c])
-                        amounts = re.findall(r"\$?\b[\d,]{5,}(?:\.\d{2})?\b", row_str)
-                        for amt_text in amounts:
-                            amt_val = parse_amount(amt_text)
-                            if amt_val >= MIN_SURPLUS_THRESHOLD:
-                                records.append({
-                                    "owner_name": str(row[0]).strip().upper() if row[0] else "RECORDED CLAIMANT",
-                                    "situs_address": str(row[1]).strip().upper() if len(row) > 1 and row[1] else "RECORDED PROPERTY LOCATION",
-                                    "amount": amt_val,
-                                    "county": feed["county"],
-                                    "state": feed["state"]
-                                })
-                                break
-
-                if not records:
-                    text = page.extract_text() or ""
-                    for line in text.split("\n"):
-                        amounts = re.findall(r"\$?\b[\d,]{5,}(?:\.\d{2})?\b", line)
-                        for amt_text in amounts:
-                            amt_val = parse_amount(amt_text)
-                            if amt_val >= MIN_SURPLUS_THRESHOLD:
-                                clean_line = re.sub(r"\$?\b[\d,]{5,}(?:\.\d{2})?\b", "", line).strip()
-                                parts = [p.strip() for p in clean_line.split("  ") if p.strip()]
-                                records.append({
-                                    "owner_name": parts[0].upper() if parts else "RECORDED CLAIMANT",
-                                    "situs_address": parts[-1].upper() if len(parts) > 1 else "RECORDED PROPERTY LOCATION",
-                                    "amount": amt_val,
-                                    "county": feed["county"],
-                                    "state": feed["state"]
-                                })
-                                break
+        if PDF_ENGINE == "pdfplumber":
+            with pdfplumber.open(io.BytesIO(content)) as pdf:
+                for page in pdf.pages:
+                    tables = page.extract_tables() or []
+                    for table in tables:
+                        for row in table:
+                            if not row:
+                                continue
+                            row_str = " ".join([str(c) for c in row if c])
+                            amounts = re.findall(r"\$?\b[\d,]{5,}(?:\.\d{2})?\b", row_str)
+                            for amt_text in amounts:
+                                amt_val = parse_amount(amt_text)
+                                if amt_val >= MIN_SURPLUS_THRESHOLD:
+                                    records.append({
+                                        "owner_name": str(row[0]).strip().upper() if row[0] else "RECORDED CLAIMANT",
+                                        "situs_address": str(row[1]).strip().upper() if len(row) > 1 and row[1] else "RECORDED PROPERTY LOCATION",
+                                        "amount": amt_val,
+                                        "county": feed["county"],
+                                        "state": feed["state"]
+                                    })
+                                    break
+        else:
+            reader = pypdf.PdfReader(io.BytesIO(content))
+            for page in reader.pages:
+                text = page.extract_text() or ""
+                for line in text.split("\n"):
+                    amounts = re.findall(r"\$?\b[\d,]{5,}(?:\.\d{2})?\b", line)
+                    for amt_text in amounts:
+                        amt_val = parse_amount(amt_text)
+                        if amt_val >= MIN_SURPLUS_THRESHOLD:
+                            clean_line = re.sub(r"\$?\b[\d,]{5,}(?:\.\d{2})?\b", "", line).strip()
+                            parts = [p.strip() for p in clean_line.split("  ") if p.strip()]
+                            records.append({
+                                "owner_name": parts[0].upper() if parts else "RECORDED CLAIMANT",
+                                "situs_address": parts[-1].upper() if len(parts) > 1 else "RECORDED PROPERTY LOCATION",
+                                "amount": amt_val,
+                                "county": feed["county"],
+                                "state": feed["state"]
+                            })
+                            break
 
         logging.info(f"✅ Extracted {len(records)} record(s) from {feed['county']} PDF.")
     except Exception as e:
@@ -176,7 +188,7 @@ def harvest_csv_feed(feed):
 
     try:
         csv_text = content.decode("utf-8", errors="ignore")
-        df = pd.read_csv(io.StringIO(csv_text), errors="ignore")
+        df = pd.read_csv(io.StringIO(csv_text), on_bad_lines="skip")
         for _, row in df.iterrows():
             row_str = " ".join([str(val) for val in row.values])
             amounts = re.findall(r"\$?\b[\d,]{5,}(?:\.\d{2})?\b", row_str)
@@ -214,7 +226,7 @@ def clean_and_normalize(raw_items):
     clean = []
     seen = set()
 
-    for item in raw_items:
+    for idx, item in enumerate(raw_items):
         amt_val = float(item.get("amount") or 0.0)
         if amt_val < MIN_SURPLUS_THRESHOLD:
             continue
@@ -225,7 +237,7 @@ def clean_and_normalize(raw_items):
 
         state = str(item.get("state") or "CA").strip().upper()
         county = str(item.get("county") or "County").strip().title()
-        case_id = f"AUD-{state}-{county[:4].upper()}-{int(time.time())}"
+        case_id = f"AUD-{state}-{county[:4].upper()}-{int(time.time())}-{idx}"
 
         if case_id in seen:
             continue
@@ -269,6 +281,7 @@ def clean_and_normalize(raw_items):
 # =====================================================================
 def skip_trace(leads):
     if not TRACERFY_API_KEY or not leads:
+        logging.info("ℹ️️ Skipping Tracerfy unmask (No TRACERFY_API_KEY set or empty list).")
         return leads
 
     logging.info(f"⚡ Unmasking contacts for {len(leads)} verified lead(s)...")

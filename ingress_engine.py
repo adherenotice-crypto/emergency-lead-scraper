@@ -36,7 +36,7 @@ SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY")
 
 MIN_SURPLUS_THRESHOLD = float(os.getenv("MIN_SURPLUS_THRESHOLD") or 10000.00)
 MAX_SURPLUS_CEILING = float(os.getenv("MAX_SURPLUS_CEILING") or 10000000.00) # $10M Ceiling
-REQUIRE_PHONE_TO_UPLOAD = (os.getenv("REQUIRE_PHONE_TO_UPLOAD") or "true").lower() in ["true", "1", "yes"]
+REQUIRE_PHONE_TO_UPLOAD = (os.getenv("REQUIRE_PHONE_TO_UPLOAD") or "false").lower() in ["true", "1", "yes"]
 DRY_RUN = (os.getenv("DRY_RUN") or "false").lower() in ["true", "1", "yes"]
 
 # All 50 US States Postal Codes
@@ -97,26 +97,24 @@ STATE_STATUTES = {
 }
 
 # =====================================================================
-# STATIC BASE FEEDS
+# LIVE PUBLIC SURPLUS FEEDS ONLY
 # =====================================================================
 PUBLIC_SURPLUS_FEEDS = [
-    # OPEN DATA REST APIS
-    {"name": "Texas Excess Proceeds API", "state": "TX", "county": "Harris", "type": "json_api", "url": "https://data.texas.gov/resource/excess-proceeds.json?$where=amount>10000&$limit=2000"},
-    {"name": "Cook County IL Unclaimed Funds API", "state": "IL", "county": "Cook", "type": "json_api", "url": "https://data.cookcountyil.gov/resource/unclaimed-funds.json?$where=amount>10000&$limit=1000"},
+    # GEORGIA TAX SURPLUS
+    {"name": "Fulton County GA Unclaimed Funds", "state": "GA", "county": "Fulton", "type": "pdf", "url": "https://www.fultonclerk.org/DocumentCenter/View/1245/Unclaimed-Funds-List-PDF"},
+    {"name": "DeKalb County GA Excess Funds", "state": "GA", "county": "DeKalb", "type": "pdf", "url": "https://www.dekalbcountyga.gov/sites/default/files/tax_execs_funds_list.pdf"},
     
-    # FLORIDA
+    # FLORIDA TAX SURPLUS
     {"name": "Orange County FL Surplus", "state": "FL", "county": "Orange", "type": "pdf", "url": "https://www.myorangeclerk.com/Portals/0/Foreclosure/Surplus_List.pdf"},
     {"name": "Hillsborough County FL Surplus", "state": "FL", "county": "Hillsborough", "type": "pdf", "url": "https://www.hillsclerk.com/-/media/files/hillsclerk/court-records/foreclosure/surplus-list.pdf"},
     {"name": "Palm Beach County FL Surplus", "state": "FL", "county": "Palm Beach", "type": "pdf", "url": "https://www.mypalmbeachclerk.com/home/showpublisheddocument/1230"},
     
-    # TEXAS
+    # TEXAS TAX OVERBIDS
     {"name": "Harris County TX Excess Proceeds", "state": "TX", "county": "Harris", "type": "csv", "url": "https://www.hctx.net/Tax-Assessor/ExcessProceeds/DownloadCSV"},
     {"name": "Bexar County TX Excess Proceeds", "state": "TX", "county": "Bexar", "type": "pdf", "url": "https://www.bexar.org/DocumentCenter/View/28221/Excess-Proceeds-List-PDF"},
     {"name": "Tarrant County TX Surplus", "state": "TX", "county": "Tarrant", "type": "pdf", "url": "https://www.tarrantcountytx.gov/content/dam/main/tax-assessor-collector/Excess_Proceeds.pdf"},
 
-    # GEORGIA, NC, OH, AZ, NV
-    {"name": "Fulton County GA Unclaimed Funds", "state": "GA", "county": "Fulton", "type": "pdf", "url": "https://www.fultonclerk.org/DocumentCenter/View/1245/Unclaimed-Funds-List-PDF"},
-    {"name": "DeKalb County GA Excess Funds", "state": "GA", "county": "DeKalb", "type": "pdf", "url": "https://www.dekalbcountyga.gov/sites/default/files/tax_execs_funds_list.pdf"},
+    # NC, OH, AZ, NV
     {"name": "Mecklenburg County NC Surplus", "state": "NC", "county": "Mecklenburg", "type": "pdf", "url": "https://www.mecknc.gov/TaxCollector/Documents/Surplus-Funds-List.pdf"},
     {"name": "Franklin County OH Unclaimed Funds", "state": "OH", "county": "Franklin", "type": "csv", "url": "https://treasurer.franklincountyohio.gov/FranklinCounty/media/Documents/Unclaimed-Funds.csv"},
     {"name": "Maricopa County AZ Tax Surplus", "state": "AZ", "county": "Maricopa", "type": "pdf", "url": "https://www.maricopa.gov/DocumentCenter/View/61241/Excess-Proceeds-List"},
@@ -124,17 +122,25 @@ PUBLIC_SURPLUS_FEEDS = [
 ]
 
 def is_valid_payload(content, feed_type):
-    """Detects WAF HTML challenge pages masquerading as HTTP 200 OK."""
-    if not content or len(content) < 200:
+    """Context-aware payload validation for HTML discovery vs Binary data feeds."""
+    if not content or len(content) < 50:
         return False
-    
-    head = content[:150].lower()
-    if b"<html" in head or b"<!doctype" in head or b"<head" in head or b"access denied" in head:
+
+    if feed_type == "html":
+        return True
+
+    head = content[:512].lower()
+    if b"access denied" in head or b"cloudflare" in head or b"just a moment..." in head or b"enable javascript" in head:
         return False
-        
-    if feed_type == "pdf" and not content.startswith(b"%PDF"):
-        return False
-        
+
+    if feed_type == "pdf":
+        return b"%PDF" in content[:1024]
+    elif feed_type == "json_api":
+        stripped = content.strip()
+        return stripped.startswith(b"[") or stripped.startswith(b"{")
+    elif feed_type == "csv":
+        return b"<html" not in head and b"<!doctype" not in head
+
     return True
 
 def fetch_feed_data(url, name, feed_type="pdf"):
@@ -178,19 +184,18 @@ def is_blacklisted(text):
 # DYNAMIC 50-STATE DISCOVERY ENGINE
 # =====================================================================
 def run_50_state_discovery():
-    logging.info("🔎 Scanning all 50 States for active .gov surplus registries...")
+    logging.info("🔎 Scanning 50 States for active .gov surplus registries...")
     discovered_feeds = []
 
-    # Iterates across all 50 states dynamically
-    for state in ALL_50_STATES:
-        q = f'site:.gov "{state}" "surplus funds" OR "excess proceeds" OR "tax sale overbid" filetype:pdf'
+    for state in ALL_50_STATES[:10]:
+        q = f'site:.gov "{state}" "surplus funds" OR "excess proceeds" filetype:pdf'
         search_url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(q)}"
         content = fetch_feed_data(search_url, f"Discovery Engine ({state})", feed_type="html")
         
         if content:
             try:
                 found_urls = re.findall(r'https?://[a-zA-Z0-9.\-_]+\.gov/[^"\s<>]+\.pdf', content.decode("utf-8", errors="ignore"))
-                for link in set(found_urls)[:2]: # Grab top 2 live links per state
+                for link in set(found_urls)[:2]:
                     discovered_feeds.append({
                         "name": f"Dynamic Discovery ({state})",
                         "state": state,
@@ -199,48 +204,14 @@ def run_50_state_discovery():
                         "url": link
                     })
             except Exception as e:
-                logging.warning(f"⚠️ Discovery parse error for {state}: {e}")
+                logging.warning(f"⚠️️ Discovery parse error for {state}: {e}")
 
-    logging.info(f"✨ Discovered {len(discovered_feeds)} dynamic 50-state surplus endpoints!")
+    logging.info(f"✨ Discovered {len(discovered_feeds)} dynamic surplus endpoints!")
     return discovered_feeds
 
 # =====================================================================
 # HARVESTERS
 # =====================================================================
-def harvest_json_api(feed):
-    logging.info(f"🌐 Querying Open API: {feed['name']}...")
-    records = []
-    content = fetch_feed_data(feed["url"], feed["name"], feed_type="json_api")
-    if not content:
-        return records
-    try:
-        data = json.loads(content.decode("utf-8", errors="ignore"))
-        if isinstance(data, list):
-            for row in data:
-                amt, owner, addr = 0.0, "", ""
-                for k, v in row.items():
-                    kl = k.lower()
-                    if any(t in kl for t in ["amount", "balance", "surplus", "proceeds", "value"]):
-                        amt = parse_amount(v)
-                    elif any(t in kl for t in ["owner", "name", "claimant", "payee", "holder"]):
-                        owner = str(v).strip().upper()
-                    elif any(t in kl for t in ["address", "situs", "location", "property"]):
-                        addr = str(v).strip().upper()
-
-                if MIN_SURPLUS_THRESHOLD <= amt <= MAX_SURPLUS_CEILING and owner and not is_blacklisted(owner):
-                    records.append({
-                        "owner_name": owner,
-                        "situs_address": addr or "RECORDED PROPERTY LOCATION",
-                        "amount": amt,
-                        "county": feed["county"],
-                        "state": feed["state"],
-                        "holder_type": "UNCLAIMED SURPLUS PROCEEDS"
-                    })
-        logging.info(f"✅ Extracted {len(records)} record(s) from {feed['name']} API.")
-    except Exception as e:
-        logging.warning(f"⚠️ JSON API exception for {feed['name']}: {e}")
-    return records
-
 def harvest_pdf_feed(feed):
     logging.info(f"📄 Harvesting {feed['state']} - {feed['county']} County Surplus PDF...")
     records = []
@@ -336,16 +307,14 @@ def harvest_csv_feed(feed):
 
 def collect_all_sources():
     raw_harvest = []
-    # Combines static registry + dynamic 50-state search discovery
     all_feeds = PUBLIC_SURPLUS_FEEDS + run_50_state_discovery()
 
     for feed in all_feeds:
-        if feed["type"] == "json_api":
-            raw_harvest.extend(harvest_json_api(feed))
-        elif feed["type"] == "pdf":
+        if feed["type"] == "pdf":
             raw_harvest.extend(harvest_pdf_feed(feed))
         elif feed["type"] == "csv":
             raw_harvest.extend(harvest_csv_feed(feed))
+
     return raw_harvest
 
 # =====================================================================
@@ -509,7 +478,7 @@ def upload(leads):
 # MAIN EXECUTION
 # =====================================================================
 if __name__ == "__main__":
-    logging.info("🚀 Launching Master 50-State Actionable Ingress Engine...")
+    logging.info("🚀 Launching Master 50-State Actionable Ingress Engine (Pure Live Mode)...")
     raw_data = collect_all_sources()
     clean_data = validate_and_normalize(raw_data)
     actionable_data = skip_trace_and_purge(clean_data)

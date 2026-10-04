@@ -5,7 +5,6 @@ import time
 import json
 import logging
 import hashlib
-import urllib.parse
 import requests
 import pandas as pd
 from datetime import datetime
@@ -85,18 +84,6 @@ STATE_STATUTES = {
     "WA": "RCW 84.64.080 (Tax Foreclosure Excess Proceeds)"
 }
 
-# =====================================================================
-# STATEWIDE OPEN DATA REST APIS + HIGH-YIELD SOURCES
-# =====================================================================
-PUBLIC_SURPLUS_FEEDS = [
-    # STATEWIDE REST APIS (High Volume, No 404s, Never Blocked)
-    {"name": "Texas Excess Proceeds API", "state": "TX", "county": "Statewide", "type": "json_api", "url": "https://data.texas.gov/resource/excess-proceeds.json?$where=amount>10000&$limit=2000"},
-    {"name": "Cook County IL Unclaimed Funds API", "state": "IL", "county": "Cook", "type": "json_api", "url": "https://data.cookcountyil.gov/resource/unclaimed-funds.json?$where=amount>10000&$limit=1000"},
-    
-    # LIVE DIRECT FEEDS
-    {"name": "Fulton County GA Unclaimed Funds", "state": "GA", "county": "Fulton", "type": "pdf", "url": "https://www.fultonclerk.org/DocumentCenter/View/1245/Unclaimed-Funds-List-PDF"}
-]
-
 def parse_amount(text):
     clean_str = re.sub(r"[^\d.]", "", str(text))
     try:
@@ -109,13 +96,38 @@ def is_blacklisted(text):
     return any(bad_word in text_upper for bad_word in TEXT_BLACKLIST)
 
 # =====================================================================
-# HARVESTERS
+# 1. SOCRATA NATIONWIDE DISCOVERY ENGINE
 # =====================================================================
-def harvest_json_api(feed):
-    logging.info(f"🌐 Querying Open API: {feed['name']}...")
+def discover_socrata_datasets():
+    logging.info("🔎 Querying Socrata Global Catalog for Live Surplus Portals...")
+    discovered_records = []
+    keywords = ["excess proceeds", "surplus funds", "unclaimed surplus"]
+    
+    for kw in keywords:
+        catalog_url = f"https://api.us.socrata.com/api/catalog/v1?q={urllib.parse.quote(kw)}&limit=15"
+        try:
+            res = session.get(catalog_url, headers=BROWSER_HEADERS, timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                results = data.get("results", [])
+                for item in results:
+                    resource = item.get("resource", {})
+                    domain = item.get("metadata", {}).get("domain") or resource.get("domain")
+                    dataset_id = resource.get("id")
+                    
+                    if domain and dataset_id:
+                        data_url = f"https://{domain}/resource/{dataset_id}.json?$limit=500"
+                        records = harvest_socrata_endpoint(data_url, domain)
+                        discovered_records.extend(records)
+        except Exception as e:
+            logging.warning(f"⚠️ Socrata Discovery exception for keyword '{kw}': {e}")
+
+    return discovered_records
+
+def harvest_socrata_endpoint(url, domain):
     records = []
     try:
-        res = session.get(feed["url"], headers=BROWSER_HEADERS, timeout=15)
+        res = session.get(url, headers=BROWSER_HEADERS, timeout=12)
         if res.status_code == 200:
             data = res.json()
             if isinstance(data, list):
@@ -123,7 +135,7 @@ def harvest_json_api(feed):
                     amt, owner, addr = 0.0, "", ""
                     for k, v in row.items():
                         kl = k.lower()
-                        if any(t in kl for t in ["amount", "balance", "surplus", "proceeds", "value"]):
+                        if any(t in kl for t in ["amount", "balance", "surplus", "proceeds", "value", "cash"]):
                             amt = parse_amount(v)
                         elif any(t in kl for t in ["owner", "name", "claimant", "payee", "holder"]):
                             owner = str(v).strip().upper()
@@ -131,28 +143,37 @@ def harvest_json_api(feed):
                             addr = str(v).strip().upper()
 
                     if MIN_SURPLUS_THRESHOLD <= amt <= MAX_SURPLUS_CEILING and owner and not is_blacklisted(owner):
+                        # Infer state code from domain
+                        state_code = "US"
+                        state_match = re.search(r"\.([a-z]{2})\.gov", domain, re.IGNORECASE)
+                        if state_match:
+                            state_code = state_match.group(1).upper()
+
                         records.append({
                             "owner_name": owner,
                             "situs_address": addr or "RECORDED PROPERTY LOCATION",
                             "amount": amt,
-                            "county": feed["county"],
-                            "state": feed["state"],
+                            "county": domain.split(".")[0].title(),
+                            "state": state_code,
                             "holder_type": "UNCLAIMED SURPLUS PROCEEDS"
                         })
-            logging.info(f"✅ Extracted {len(records)} record(s) from {feed['name']} API.")
-        else:
-            logging.warning(f"⚠️ API Http Error {res.status_code} for {feed['name']}")
-    except Exception as e:
-        logging.warning(f"⚠️ JSON API exception for {feed['name']}: {e}")
+    except Exception:
+        pass
     return records
+
+# =====================================================================
+# 2. DIRECT COUNTY FEEDS
+# =====================================================================
+DIRECT_FEEDS = [
+    {"name": "Fulton County GA Unclaimed Funds", "state": "GA", "county": "Fulton", "type": "pdf", "url": "https://www.fultonclerk.org/DocumentCenter/View/1245/Unclaimed-Funds-List-PDF"}
+]
 
 def harvest_pdf_feed(feed):
     logging.info(f"📄 Harvesting {feed['state']} - {feed['county']} County Surplus PDF...")
     records = []
     try:
-        res = session.get(feed["url"], headers=BROWSER_HEADERS, timeout=12)
+        res = session.get(feed["url"], headers=BROWSER_HEADERS, timeout=15)
         if res.status_code != 200 or len(res.content) < 500:
-            logging.warning(f"⚠️ Direct PDF fetch failed for {feed['name']} (Status: {res.status_code})")
             return records
 
         content = res.content
@@ -172,11 +193,11 @@ def harvest_pdf_feed(feed):
             if is_blacklisted(line):
                 continue
 
-            amounts = re.findall(r"\$\b[\d,]{5,}(?:\.\d{2})?\b|\b[\d,]{5,}\.\d{2}\b", line)
+            amounts = re.findall(r"[\d,]{5,}(?:\.\d{2})?", line)
             for amt_text in amounts:
                 amt_val = parse_amount(amt_text)
                 if MIN_SURPLUS_THRESHOLD <= amt_val <= MAX_SURPLUS_CEILING:
-                    clean_line = re.sub(r"\$?\b[\d,]{5,}(?:\.\d{2})?\b", "", line).strip()
+                    clean_line = re.sub(r"[\d,]{5,}(?:\.\d{2})?", "", line).strip()
                     parts = [p.strip() for p in re.split(r"\s{2,}|\t", clean_line) if p.strip()]
                     
                     owner = parts[0].upper() if len(parts) > 0 else ""
@@ -201,16 +222,20 @@ def harvest_pdf_feed(feed):
 
 def collect_all_sources():
     raw_harvest = []
-    for feed in PUBLIC_SURPLUS_FEEDS:
-        if feed["type"] == "json_api":
-            raw_harvest.extend(harvest_json_api(feed))
-        elif feed["type"] == "pdf":
+    
+    # 1. Harvest Socrata Open APIs across the US
+    socrata_records = discover_socrata_datasets()
+    raw_harvest.extend(socrata_records)
+    
+    # 2. Harvest Direct PDF Feeds
+    for feed in DIRECT_FEEDS:
+        if feed["type"] == "pdf":
             raw_harvest.extend(harvest_pdf_feed(feed))
 
     return raw_harvest
 
 # =====================================================================
-# VALIDATOR & MASTER SCHEMA MAPPER
+# 3. VALIDATOR & MASTER SCHEMA MAPPER
 # =====================================================================
 def validate_and_normalize(raw_items):
     logging.info(f"🧹 Enforcing ${MIN_SURPLUS_THRESHOLD:,.2f} floor & ${MAX_SURPLUS_CEILING:,.2f} ceiling guardrails...")
@@ -275,6 +300,7 @@ def validate_and_normalize(raw_items):
             "ingested_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S PST"),
             "fingerprint": fingerprint,
 
+            # 13 Master Schema Alignment
             "Holder Name": owner,
             "Surplus Amount": f"${amt_val:,.2f}",
             "Property Address": situs_addr,
@@ -296,7 +322,7 @@ def validate_and_normalize(raw_items):
     return qualified_leads
 
 # =====================================================================
-# TRACERFY SKIP-TRACING & AUTO-PURGE UNCONTACTABLE FILTER
+# 4. TRACERFY SKIP-TRACING & AUTO-PURGE UNCONTACTABLE FILTER
 # =====================================================================
 def skip_trace_and_purge(leads):
     if not leads:
@@ -343,7 +369,7 @@ def skip_trace_and_purge(leads):
     return contactable_leads
 
 # =====================================================================
-# WORKER INGESTION
+# 5. WORKER INGESTION
 # =====================================================================
 def upload(leads):
     if not leads:
@@ -365,7 +391,7 @@ def upload(leads):
         logging.error(f"⚠️ Connection error posting to Worker: {e}")
 
 if __name__ == "__main__":
-    logging.info("🚀 Launching Statewide Open API Ingress Engine...")
+    logging.info("🚀 Launching Socrata Discovery & Ingress Engine...")
     raw_data = collect_all_sources()
     clean_data = validate_and_normalize(raw_data)
     actionable_data = skip_trace_and_purge(clean_data)

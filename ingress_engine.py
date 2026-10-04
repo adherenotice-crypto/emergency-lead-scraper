@@ -11,7 +11,7 @@ from datetime import datetime
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# Robust PDF Engine Fallback
+# PDF Engine Fallback
 try:
     import pdfplumber
     PDF_ENGINE = "pdfplumber"
@@ -73,9 +73,12 @@ STATE_STATUTES = {
 }
 
 # =====================================================================
-# EXPANDED NATIONWIDE PUBLIC SURPLUS FEEDS
+# NATIONWIDE PUBLIC SURPLUS FEEDS (PDF, CSV & OPEN JSON APIs)
 # =====================================================================
 PUBLIC_SURPLUS_FEEDS = [
+    # OPEN DATA JSON APIS (Bypasses Cloud Blocks)
+    {"name": "Texas Excess Proceeds API", "state": "TX", "county": "Harris", "type": "json_api", "url": "https://data.texas.gov/resource/excess-proceeds.json?$where=amount>10000&$limit=1000"},
+    {"name": "LA County Tax Surplus API", "state": "CA", "county": "Los Angeles", "type": "json_api", "url": "https://data.lacounty.gov/resource/tax-surplus.json?$where=amount>10000&$limit=1000"},
     # FLORIDA
     {"name": "Orange County FL Surplus", "state": "FL", "county": "Orange", "type": "pdf", "url": "https://www.myorangeclerk.com/Portals/0/Foreclosure/Surplus_List.pdf"},
     {"name": "Hillsborough County FL Surplus", "state": "FL", "county": "Hillsborough", "type": "pdf", "url": "https://www.hillsclerk.com/-/media/files/hillsclerk/court-records/foreclosure/surplus-list.pdf"},
@@ -87,17 +90,15 @@ PUBLIC_SURPLUS_FEEDS = [
     # GEORGIA
     {"name": "Fulton County GA Unclaimed Funds", "state": "GA", "county": "Fulton", "type": "pdf", "url": "https://www.fultonclerk.org/DocumentCenter/View/1245/Unclaimed-Funds-List-PDF"},
     {"name": "DeKalb County GA Excess Funds", "state": "GA", "county": "DeKalb", "type": "pdf", "url": "https://www.dekalbcountyga.gov/sites/default/files/tax_execs_funds_list.pdf"},
-    # OHIO
+    # OHIO & NC
     {"name": "Franklin County OH Unclaimed Funds", "state": "OH", "county": "Franklin", "type": "csv", "url": "https://treasurer.franklincountyohio.gov/FranklinCounty/media/Documents/Unclaimed-Funds.csv"},
-    {"name": "Cuyahoga County OH Unclaimed Funds", "state": "OH", "county": "Cuyahoga", "type": "pdf", "url": "https://treasurer.cuyahogacounty.us/pdf_treasurer/en-US/UnclaimedFundsList.pdf"},
-    # NORTH CAROLINA
     {"name": "Mecklenburg County NC Surplus", "state": "NC", "county": "Mecklenburg", "type": "pdf", "url": "https://www.mecknc.gov/TaxCollector/Documents/Surplus-Funds-List.pdf"}
 ]
 
 def fetch_feed_data(url, name):
-    """Direct HTTP fetch with automatic ScraperAPI residential proxy fallback."""
+    """Direct HTTP fetch with automatic ScraperAPI fallback."""
     try:
-        res = session.get(url, headers=BROWSER_HEADERS, timeout=15)
+        res = session.get(url, headers=BROWSER_HEADERS, timeout=12)
         if res.status_code == 200 and len(res.content) > 200:
             logging.info(f"   [Direct HTTP 200] {len(res.content)} bytes for {name}")
             return res.content
@@ -107,7 +108,7 @@ def fetch_feed_data(url, name):
     if SCRAPERAPI_KEY:
         proxy_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={url}&render=true&country_code=us"
         try:
-            res = session.get(proxy_url, timeout=30)
+            res = session.get(proxy_url, timeout=25)
             if res.status_code == 200 and len(res.content) > 200:
                 logging.info(f"   [ScraperAPI Residential 200] {len(res.content)} bytes for {name}")
                 return res.content
@@ -117,7 +118,6 @@ def fetch_feed_data(url, name):
     return None
 
 def parse_amount(text):
-    """Cleans currency text into float balance."""
     clean_str = re.sub(r"[^\d.]", "", str(text))
     try:
         return float(clean_str)
@@ -125,8 +125,42 @@ def parse_amount(text):
         return 0.0
 
 # =====================================================================
-# 1. HARVESTERS (JSON API, PDF, CSV)
+# 1. HARVESTERS
 # =====================================================================
+def harvest_json_api(feed):
+    logging.info(f"🌐 Querying Open API: {feed['name']}...")
+    records = []
+    content = fetch_feed_data(feed["url"], feed["name"])
+    if not content:
+        return records
+    try:
+        data = json.loads(content.decode("utf-8", errors="ignore"))
+        if isinstance(data, list):
+            for row in data:
+                amt, owner, addr = 0.0, "", ""
+                for k, v in row.items():
+                    kl = k.lower()
+                    if any(t in kl for t in ["amount", "balance", "surplus", "proceeds", "value"]):
+                        amt = parse_amount(v)
+                    elif any(t in kl for t in ["owner", "name", "claimant", "payee", "holder"]):
+                        owner = str(v).strip().upper()
+                    elif any(t in kl for t in ["address", "situs", "location", "property"]):
+                        addr = str(v).strip().upper()
+
+                if amt >= MIN_SURPLUS_THRESHOLD and owner:
+                    records.append({
+                        "owner_name": owner,
+                        "situs_address": addr or "RECORDED PROPERTY LOCATION",
+                        "amount": amt,
+                        "county": feed["county"],
+                        "state": feed["state"],
+                        "holder_type": "UNCLAIMED SURPLUS PROCEEDS"
+                    })
+        logging.info(f"✅ Extracted {len(records)} record(s) from {feed['name']} API.")
+    except Exception as e:
+        logging.warning(f"⚠️ JSON API exception for {feed['name']}: {e}")
+    return records
+
 def harvest_pdf_feed(feed):
     logging.info(f"📄 Harvesting {feed['state']} - {feed['county']} County Surplus PDF...")
     records = []
@@ -153,10 +187,11 @@ def harvest_pdf_feed(feed):
                 amt_val = parse_amount(amt_text)
                 if amt_val >= MIN_SURPLUS_THRESHOLD:
                     clean_line = re.sub(r"\$?\b[\d,]{5,}(?:\.\d{2})?\b", "", line).strip()
-                    parts = [p.strip() for p in re.split(r"\s{2,}|\t|,", clean_line) if p.strip()]
+                    # Safe split on 2+ spaces or tabs (NOT commas)
+                    parts = [p.strip() for p in re.split(r"\s{2,}|\t", clean_line) if p.strip()]
                     
                     owner = parts[0].upper() if len(parts) > 0 else "RECORDED CLAIMANT"
-                    address = parts[1].upper() if len(parts) > 1 else (parts[0].upper() if len(parts) > 0 else "RECORDED PROPERTY LOCATION")
+                    address = parts[1].upper() if len(parts) > 1 else "RECORDED PROPERTY LOCATION"
 
                     records.append({
                         "owner_name": owner,
@@ -164,7 +199,6 @@ def harvest_pdf_feed(feed):
                         "amount": amt_val,
                         "county": feed["county"],
                         "state": feed["state"],
-                        "case_number": f"CS-{feed['state']}-{int(time.time())}",
                         "holder_type": "TAX DEED OVERBID / SURPLUS PROCEEDS"
                     })
                     break
@@ -185,89 +219,91 @@ def harvest_csv_feed(feed):
     try:
         csv_text = content.decode("utf-8", errors="ignore")
         df = pd.read_csv(io.StringIO(csv_text), on_bad_lines="skip")
+        
+        # Smart column finder
+        cols = [str(c).lower() for c in df.columns]
+        owner_col = next((c for c in df.columns if any(t in str(c).lower() for t in ["owner", "name", "claimant", "payee"])), None)
+        addr_col = next((c for c in df.columns if any(t in str(c).lower() for t in ["address", "situs", "location", "property"])), None)
+
         for _, row in df.iterrows():
             row_str = " ".join([str(val) for val in row.values])
             amounts = re.findall(r"\$?\b[\d,]{5,}(?:\.\d{2})?\b", row_str)
             for amt_text in amounts:
                 amt_val = parse_amount(amt_text)
                 if amt_val >= MIN_SURPLUS_THRESHOLD:
+                    owner_val = str(row[owner_col]).strip().upper() if owner_col else str(row.iloc[0]).strip().upper()
+                    addr_val = str(row[addr_col]).strip().upper() if addr_col else "RECORDED PROPERTY LOCATION"
+                    
                     records.append({
-                        "owner_name": str(row.iloc[0]).strip().upper(),
-                        "situs_address": str(row.iloc[1]).strip().upper() if len(row) > 1 else "RECORDED PROPERTY LOCATION",
+                        "owner_name": owner_val,
+                        "situs_address": addr_val,
                         "amount": amt_val,
                         "county": feed["county"],
                         "state": feed["state"],
-                        "case_number": f"CS-{feed['state']}-{int(time.time())}",
                         "holder_type": "UNCLAIMED PROPERTY / EXCESS PROCEEDS"
                     })
                     break
         logging.info(f"✅ Extracted {len(records)} raw record(s) from {feed['county']} CSV.")
     except Exception as e:
-        logging.warning(f"⚠️ CSV parse exception for {feed['county']}: {e}")
+        logging.warning(f"⚠️️ CSV parse exception for {feed['county']}: {e}")
 
     return records
 
 def collect_all_sources():
     raw_harvest = []
     for feed in PUBLIC_SURPLUS_FEEDS:
-        if feed["type"] == "pdf":
+        if feed["type"] == "json_api":
+            raw_harvest.extend(harvest_json_api(feed))
+        elif feed["type"] == "pdf":
             raw_harvest.extend(harvest_pdf_feed(feed))
         elif feed["type"] == "csv":
             raw_harvest.extend(harvest_csv_feed(feed))
     return raw_harvest
 
 # =====================================================================
-# 2. VALIDATOR, NORMALIZER & 13-HEADER MASTER SCHEMA MAPPER
+# 2. VALIDATOR & 13-HEADER MASTER SCHEMA MAPPER
 # =====================================================================
 def validate_and_normalize(raw_items):
-    logging.info(f"🧹 Enforcing strict ${MIN_SURPLUS_THRESHOLD:,.2f} minimum floor & quality guardrails...")
+    logging.info(f"🧹 Enforcing strict ${MIN_SURPLUS_THRESHOLD:,.2f} floor & quality guardrails...")
     qualified_leads = []
     rejected_count = 0
     seen_fingerprints = set()
 
+    invalid_names = ["N/A", "UNKNOWN", "NONE", "NULL", "RECORDED CLAIMANT", "COUNTY CLERK", "TREASURER"]
+
     for idx, item in enumerate(raw_items):
         amt_val = float(item.get("amount") or 0.0)
-        
-        # Guardrail 1: Minimum Surplus Floor
         if amt_val < MIN_SURPLUS_THRESHOLD:
             rejected_count += 1
-            logging.debug(f"❌ REJECTED [Under Floor]: ${amt_val:,.2f}")
             continue
 
         owner = str(item.get("owner_name") or "").strip().upper()
-        # Guardrail 2: Valid Owner Name
-        invalid_names = ["N/A", "UNKNOWN", "NONE", "NULL", "RECORDED CLAIMANT", "COUNTY CLERK", "TREASURER"]
-        if not owner or len(owner) < 3 or any(inv in owner for inv in invalid_names):
+        # Filter out numbers/APNs placed into owner field
+        if not owner or len(owner) < 3 or re.match(r"^[\d\-\.]+$", owner) or any(inv in owner for inv in invalid_names):
             rejected_count += 1
-            logging.info(f"❌ REJECTED [Invalid Owner Name]: '{owner}'")
             continue
 
         situs_addr = str(item.get("situs_address") or "").strip().upper()
-        # Guardrail 3: Address Requirements
         if not situs_addr or len(situs_addr) < 4:
             situs_addr = "RECORDED PROPERTY LOCATION"
 
         state = str(item.get("state") or "CA").strip().upper()
         county = str(item.get("county") or "County").strip().title()
-        case_num = str(item.get("case_number") or f"CS-{int(time.time())}-{idx}")
+        case_num = f"CS-{state}-{int(time.time())}-{idx}"
 
-        # Guardrail 4: Deduplication Fingerprinting
+        # Fingerprint Deduplication
         fp_str = f"{owner}|{situs_addr}|{amt_val:.2f}|{state}|{county}"
         fingerprint = hashlib.md5(fp_str.encode("utf-8")).hexdigest()[:12]
         
         if fingerprint in seen_fingerprints:
-            logging.info(f"⚠️ SKIPPED [Duplicate Lead]: {owner} - ${amt_val:,.2f}")
             continue
         seen_fingerprints.add(fingerprint)
 
         case_id = f"AUD-{state}-{county[:4].upper()}-{fingerprint}"
         tier = "TIER 1 GOLD ($50k+)" if amt_val >= 50000 else ("TIER 2 SILVER ($25k+)" if amt_val >= 25000 else "TIER 3 BRONZE ($10k+)")
         city = f"{county} Area"
-        zip_code = "00000"
 
-        # Construct Payload Mapping Both Worker API & 13 Master Schema Headings
         lead_record = {
-            # Worker API Keys
             "record_id": case_id,
             "caseId": case_id,
             "citation_id": case_id,
@@ -280,7 +316,7 @@ def validate_and_normalize(raw_items):
             "city": city,
             "county": county,
             "state": state,
-            "zip": zip_code,
+            "zip": "00000",
             "apn": "PENDING VERIFICATION",
             "holding_agency": f"{county} County Clerk / Treasurer",
             "exactAmount": amt_val,
@@ -294,11 +330,11 @@ def validate_and_normalize(raw_items):
             "ingested_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S PST"),
             "fingerprint": fingerprint,
 
-            # 13 Master Schema Headings
+            # 13 Master Schema Alignment
             "Holder Name": owner,
             "Surplus Amount": f"${amt_val:,.2f}",
             "Property Address": situs_addr,
-            "City State Zip": f"{city}, {state} {zip_code}",
+            "City State Zip": f"{city}, {state} 00000",
             "County Source": f"{county} County, {state}",
             "Case Number": case_num,
             "Holder Type": str(item.get("holder_type") or "TAX DEED OVERBID / SURPLUS PROCEEDS"),
@@ -312,15 +348,15 @@ def validate_and_normalize(raw_items):
 
         qualified_leads.append(lead_record)
 
-    logging.info(f"📊 Audit Summary: Harvested={len(raw_items)} | Validated={len(qualified_leads)} | Rejected/Quarantined={rejected_count}")
+    logging.info(f"📊 Summary: Harvested={len(raw_items)} | Validated={len(qualified_leads)} | Rejected={rejected_count}")
     return qualified_leads
 
 # =====================================================================
-# 3. TRACERFY SKIP-TRACING ENGINE (NON-BLOCKING)
+# 3. TRACERFY SKIP-TRACING
 # =====================================================================
 def skip_trace(leads):
     if not TRACERFY_API_KEY or not leads:
-        logging.info("ℹ️ Skipping Tracerfy unmask (TRACERFY_API_KEY not configured or empty lead list).")
+        logging.info("ℹ️ Skipping Tracerfy unmask (TRACERFY_API_KEY not set).")
         return leads
 
     logging.info(f"⚡ Unmasking contacts for {len(leads)} verified lead(s)...")
@@ -346,7 +382,7 @@ def skip_trace(leads):
     return leads
 
 # =====================================================================
-# 4. WORKER INGESTION ENGINE
+# 4. WORKER INGESTION
 # =====================================================================
 def upload(leads):
     if not leads:

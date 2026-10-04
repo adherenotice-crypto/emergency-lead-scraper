@@ -11,7 +11,7 @@ from datetime import datetime
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# PDF Engine Fallback
+# Robust PDF Engine Fallback
 try:
     import pdfplumber
     PDF_ENGINE = "pdfplumber"
@@ -34,7 +34,16 @@ TRACERFY_API_KEY = os.getenv("TRACERFY_API_KEY")
 SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY")
 
 MIN_SURPLUS_THRESHOLD = float(os.getenv("MIN_SURPLUS_THRESHOLD") or 10000.00)
+MAX_SURPLUS_CEILING = 10000000.00  # $10M Ceiling prevents concatenated case numbers
 DRY_RUN = (os.getenv("DRY_RUN") or "false").lower() in ["true", "1", "yes"]
+
+# Criminal Court Docket & Bad Row Blacklist
+TEXT_BLACKLIST = [
+    "COUNT(S)", "CONVICTED", "FELONY", "FELON", "CRIMINAL", "HIJACKING", "CLERK NO",
+    "HAVING BEEN", "COMMISSION", "PARTICIPATION", "DOCKET", "JUDGMENT", "O.C.G.A",
+    "ROBBERY", "MURDER", "ATTEMPTED", "VIOLATION", "STATUTE", "COURT", "SUPERIOR",
+    "UNKNOWN", "RECORDED CLAIMANT", "COUNTY CLERK", "TREASURER", "N/A", "NULL"
+]
 
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -73,30 +82,25 @@ STATE_STATUTES = {
 }
 
 # =====================================================================
-# NATIONWIDE PUBLIC SURPLUS FEEDS (PDF, CSV & OPEN JSON APIs)
+# VERIFIED SURPLUS FEEDS ONLY (PDF, CSV & OPEN JSON APIs)
 # =====================================================================
 PUBLIC_SURPLUS_FEEDS = [
-    # OPEN DATA JSON APIS (Bypasses Cloud Blocks)
+    # OPEN DATA JSON APIS (Fast, Clean, No Block)
     {"name": "Texas Excess Proceeds API", "state": "TX", "county": "Harris", "type": "json_api", "url": "https://data.texas.gov/resource/excess-proceeds.json?$where=amount>10000&$limit=1000"},
-    {"name": "LA County Tax Surplus API", "state": "CA", "county": "Los Angeles", "type": "json_api", "url": "https://data.lacounty.gov/resource/tax-surplus.json?$where=amount>10000&$limit=1000"},
-    # FLORIDA
+    # FLORIDA TAX SURPLUS
     {"name": "Orange County FL Surplus", "state": "FL", "county": "Orange", "type": "pdf", "url": "https://www.myorangeclerk.com/Portals/0/Foreclosure/Surplus_List.pdf"},
     {"name": "Hillsborough County FL Surplus", "state": "FL", "county": "Hillsborough", "type": "pdf", "url": "https://www.hillsclerk.com/-/media/files/hillsclerk/court-records/foreclosure/surplus-list.pdf"},
     {"name": "Palm Beach County FL Surplus", "state": "FL", "county": "Palm Beach", "type": "pdf", "url": "https://www.mypalmbeachclerk.com/home/showpublisheddocument/1230"},
-    # TEXAS
+    # TEXAS TAX OVERBIDS
     {"name": "Harris County TX Excess Proceeds", "state": "TX", "county": "Harris", "type": "csv", "url": "https://www.hctx.net/Tax-Assessor/ExcessProceeds/DownloadCSV"},
     {"name": "Bexar County TX Excess Proceeds", "state": "TX", "county": "Bexar", "type": "pdf", "url": "https://www.bexar.org/DocumentCenter/View/28221/Excess-Proceeds-List-PDF"},
     {"name": "Tarrant County TX Surplus", "state": "TX", "county": "Tarrant", "type": "pdf", "url": "https://www.tarrantcountytx.gov/content/dam/main/tax-assessor-collector/Excess_Proceeds.pdf"},
-    # GEORGIA
-    {"name": "Fulton County GA Unclaimed Funds", "state": "GA", "county": "Fulton", "type": "pdf", "url": "https://www.fultonclerk.org/DocumentCenter/View/1245/Unclaimed-Funds-List-PDF"},
-    {"name": "DeKalb County GA Excess Funds", "state": "GA", "county": "DeKalb", "type": "pdf", "url": "https://www.dekalbcountyga.gov/sites/default/files/tax_execs_funds_list.pdf"},
-    # OHIO & NC
+    # OHIO & NC TAX SURPLUS
     {"name": "Franklin County OH Unclaimed Funds", "state": "OH", "county": "Franklin", "type": "csv", "url": "https://treasurer.franklincountyohio.gov/FranklinCounty/media/Documents/Unclaimed-Funds.csv"},
     {"name": "Mecklenburg County NC Surplus", "state": "NC", "county": "Mecklenburg", "type": "pdf", "url": "https://www.mecknc.gov/TaxCollector/Documents/Surplus-Funds-List.pdf"}
 ]
 
 def fetch_feed_data(url, name):
-    """Direct HTTP fetch with automatic ScraperAPI fallback."""
     try:
         res = session.get(url, headers=BROWSER_HEADERS, timeout=12)
         if res.status_code == 200 and len(res.content) > 200:
@@ -124,6 +128,10 @@ def parse_amount(text):
     except ValueError:
         return 0.0
 
+def is_blacklisted(text):
+    text_upper = str(text).upper()
+    return any(bad_word in text_upper for bad_word in TEXT_BLACKLIST)
+
 # =====================================================================
 # 1. HARVESTERS
 # =====================================================================
@@ -147,7 +155,7 @@ def harvest_json_api(feed):
                     elif any(t in kl for t in ["address", "situs", "location", "property"]):
                         addr = str(v).strip().upper()
 
-                if amt >= MIN_SURPLUS_THRESHOLD and owner:
+                if MIN_SURPLUS_THRESHOLD <= amt <= MAX_SURPLUS_CEILING and owner and not is_blacklisted(owner):
                     records.append({
                         "owner_name": owner,
                         "situs_address": addr or "RECORDED PROPERTY LOCATION",
@@ -182,25 +190,29 @@ def harvest_pdf_feed(feed):
                     lines.extend(page_text.split("\n"))
 
         for line in lines:
-            amounts = re.findall(r"\$?\b[\d,]{5,}(?:\.\d{2})?\b", line)
+            if is_blacklisted(line):
+                continue
+
+            # Strict Currency Pattern Match ($XX,XXX.XX)
+            amounts = re.findall(r"\$\b[\d,]{5,}(?:\.\d{2})?\b|\b[\d,]{5,}\.\d{2}\b", line)
             for amt_text in amounts:
                 amt_val = parse_amount(amt_text)
-                if amt_val >= MIN_SURPLUS_THRESHOLD:
+                if MIN_SURPLUS_THRESHOLD <= amt_val <= MAX_SURPLUS_CEILING:
                     clean_line = re.sub(r"\$?\b[\d,]{5,}(?:\.\d{2})?\b", "", line).strip()
-                    # Safe split on 2+ spaces or tabs (NOT commas)
                     parts = [p.strip() for p in re.split(r"\s{2,}|\t", clean_line) if p.strip()]
                     
-                    owner = parts[0].upper() if len(parts) > 0 else "RECORDED CLAIMANT"
+                    owner = parts[0].upper() if len(parts) > 0 else ""
                     address = parts[1].upper() if len(parts) > 1 else "RECORDED PROPERTY LOCATION"
 
-                    records.append({
-                        "owner_name": owner,
-                        "situs_address": address,
-                        "amount": amt_val,
-                        "county": feed["county"],
-                        "state": feed["state"],
-                        "holder_type": "TAX DEED OVERBID / SURPLUS PROCEEDS"
-                    })
+                    if owner and not is_blacklisted(owner) and not is_blacklisted(address):
+                        records.append({
+                            "owner_name": owner,
+                            "situs_address": address,
+                            "amount": amt_val,
+                            "county": feed["county"],
+                            "state": feed["state"],
+                            "holder_type": "TAX DEED OVERBID / SURPLUS PROCEEDS"
+                        })
                     break
 
         logging.info(f"✅ Extracted {len(records)} raw record(s) from {feed['county']} PDF.")
@@ -220,32 +232,34 @@ def harvest_csv_feed(feed):
         csv_text = content.decode("utf-8", errors="ignore")
         df = pd.read_csv(io.StringIO(csv_text), on_bad_lines="skip")
         
-        # Smart column finder
-        cols = [str(c).lower() for c in df.columns]
         owner_col = next((c for c in df.columns if any(t in str(c).lower() for t in ["owner", "name", "claimant", "payee"])), None)
         addr_col = next((c for c in df.columns if any(t in str(c).lower() for t in ["address", "situs", "location", "property"])), None)
 
         for _, row in df.iterrows():
             row_str = " ".join([str(val) for val in row.values])
-            amounts = re.findall(r"\$?\b[\d,]{5,}(?:\.\d{2})?\b", row_str)
+            if is_blacklisted(row_str):
+                continue
+
+            amounts = re.findall(r"\$\b[\d,]{5,}(?:\.\d{2})?\b|\b[\d,]{5,}\.\d{2}\b", row_str)
             for amt_text in amounts:
                 amt_val = parse_amount(amt_text)
-                if amt_val >= MIN_SURPLUS_THRESHOLD:
+                if MIN_SURPLUS_THRESHOLD <= amt_val <= MAX_SURPLUS_CEILING:
                     owner_val = str(row[owner_col]).strip().upper() if owner_col else str(row.iloc[0]).strip().upper()
                     addr_val = str(row[addr_col]).strip().upper() if addr_col else "RECORDED PROPERTY LOCATION"
                     
-                    records.append({
-                        "owner_name": owner_val,
-                        "situs_address": addr_val,
-                        "amount": amt_val,
-                        "county": feed["county"],
-                        "state": feed["state"],
-                        "holder_type": "UNCLAIMED PROPERTY / EXCESS PROCEEDS"
-                    })
+                    if owner_val and not is_blacklisted(owner_val):
+                        records.append({
+                            "owner_name": owner_val,
+                            "situs_address": addr_val,
+                            "amount": amt_val,
+                            "county": feed["county"],
+                            "state": feed["state"],
+                            "holder_type": "UNCLAIMED PROPERTY / EXCESS PROCEEDS"
+                        })
                     break
         logging.info(f"✅ Extracted {len(records)} raw record(s) from {feed['county']} CSV.")
     except Exception as e:
-        logging.warning(f"⚠️️ CSV parse exception for {feed['county']}: {e}")
+        logging.warning(f"⚠️ CSV parse exception for {feed['county']}: {e}")
 
     return records
 
@@ -264,27 +278,24 @@ def collect_all_sources():
 # 2. VALIDATOR & 13-HEADER MASTER SCHEMA MAPPER
 # =====================================================================
 def validate_and_normalize(raw_items):
-    logging.info(f"🧹 Enforcing strict ${MIN_SURPLUS_THRESHOLD:,.2f} floor & quality guardrails...")
+    logging.info(f"🧹 Enforcing ${MIN_SURPLUS_THRESHOLD:,.2f} floor & ${MAX_SURPLUS_CEILING:,.2f} ceiling guardrails...")
     qualified_leads = []
     rejected_count = 0
     seen_fingerprints = set()
 
-    invalid_names = ["N/A", "UNKNOWN", "NONE", "NULL", "RECORDED CLAIMANT", "COUNTY CLERK", "TREASURER"]
-
     for idx, item in enumerate(raw_items):
         amt_val = float(item.get("amount") or 0.0)
-        if amt_val < MIN_SURPLUS_THRESHOLD:
+        if not (MIN_SURPLUS_THRESHOLD <= amt_val <= MAX_SURPLUS_CEILING):
             rejected_count += 1
             continue
 
         owner = str(item.get("owner_name") or "").strip().upper()
-        # Filter out numbers/APNs placed into owner field
-        if not owner or len(owner) < 3 or re.match(r"^[\d\-\.]+$", owner) or any(inv in owner for inv in invalid_names):
+        if not owner or len(owner) < 3 or re.match(r"^[\d\-\.]+$", owner) or is_blacklisted(owner):
             rejected_count += 1
             continue
 
         situs_addr = str(item.get("situs_address") or "").strip().upper()
-        if not situs_addr or len(situs_addr) < 4:
+        if not situs_addr or len(situs_addr) < 4 or is_blacklisted(situs_addr):
             situs_addr = "RECORDED PROPERTY LOCATION"
 
         state = str(item.get("state") or "CA").strip().upper()
@@ -348,7 +359,7 @@ def validate_and_normalize(raw_items):
 
         qualified_leads.append(lead_record)
 
-    logging.info(f"📊 Summary: Harvested={len(raw_items)} | Validated={len(qualified_leads)} | Rejected={rejected_count}")
+    logging.info(f"📊 Audit Summary: Harvested={len(raw_items)} | Validated={len(qualified_leads)} | Rejected={rejected_count}")
     return qualified_leads
 
 # =====================================================================

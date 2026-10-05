@@ -37,7 +37,9 @@ TRACERFY_API_KEY = os.getenv("TRACERFY_API_KEY")
 MIN_SURPLUS_THRESHOLD = float(os.getenv("MIN_SURPLUS_THRESHOLD") or 10000.00)
 MAX_SURPLUS_CEILING = float(os.getenv("MAX_SURPLUS_CEILING") or 10000000.00)
 REQUIRE_PHONE_TO_UPLOAD = (os.getenv("REQUIRE_PHONE_TO_UPLOAD") or "false").lower() in ["true", "1", "yes"]
-DRY_RUN = (os.getenv("DRY_RUN") or "false").lower() in ["true", "1", "yes"]
+
+# SAFETY-FIRST REVIEW MODE: Defaults to "true" to save local CSV files first and preserve Cloudflare KV daily quota
+DRY_RUN = (os.getenv("DRY_RUN") or "true").lower() in ["true", "1", "yes"]
 
 # Expanded blacklist to reject government departments, budget line items, and non-individual/non-property entities
 TEXT_BLACKLIST = [
@@ -154,7 +156,6 @@ def is_valid_address(address):
     clean_addr = address.strip().upper()
     if clean_addr in ["RECORDED PROPERTY LOCATION", "N/A", "NONE", "UNKNOWN", "PENDING VERIFICATION"]:
         return False
-    # Check for at least one number (house/building number) and text (street name)
     has_digit = bool(re.search(r"\d+", clean_addr))
     has_letter = bool(re.search(r"[A-Z]+", clean_addr))
     return len(clean_addr) >= 5 and has_digit and has_letter
@@ -167,7 +168,6 @@ def discover_socrata_datasets():
     discovered_records = []
     seen_datasets = set()
 
-    # Narrowed search terms specifically targeting tax foreclosure / overbid funds
     keywords = [
         "tax sale excess proceeds",
         "tax deed overbid surplus",
@@ -188,7 +188,6 @@ def discover_socrata_datasets():
                     domain = item.get("metadata", {}).get("domain") or resource.get("domain")
                     dataset_id = resource.get("id")
 
-                    # Skip blocked non-county state financial comptroller portals
                     if domain in BLOCKED_DOMAINS or "cthru" in str(domain).lower():
                         continue
 
@@ -237,7 +236,6 @@ def harvest_socrata_paginated(domain, dataset_id):
                     elif any(t in kl for t in ["case", "cause", "docket", "tax_sale_no"]):
                         case_no = str(v).strip().upper()
 
-                # STRICT FILTERING: Require valid surplus amount, non-blacklisted owner, and a REAL physical property address
                 if MIN_SURPLUS_THRESHOLD <= amt <= MAX_SURPLUS_CEILING and owner and not is_blacklisted(owner):
                     if is_valid_address(addr):
                         records.append({
@@ -255,7 +253,7 @@ def harvest_socrata_paginated(domain, dataset_id):
                 break
             offset += limit
         except Exception as e:
-            logging.warning(f"⚠️️ Pagination error on {domain}/{dataset_id} at offset {offset}: {e}")
+            logging.warning(f"⚠️ Pagination error on {domain}/{dataset_id} at offset {offset}: {e}")
             break
 
     return records
@@ -356,7 +354,6 @@ def validate_and_normalize(raw_items):
         state = str(item.get("state") or "CA").strip().upper()
         county = str(item.get("county") or "County").strip().title()
         
-        # Use existing case number or construct standard format
         case_num = str(item.get("case_number") or f"CS-{state}-{int(time.time())}-{idx}")
         apn_val = str(item.get("apn") or "PENDING VERIFICATION")
 
@@ -477,4 +474,69 @@ def export_and_batch_csv(leads, batch_size=2000):
 
     # 1. Master CSV Export
     df.to_csv("master_surplus_leads.csv", index=False)
-    logging.info(f"📁 MASTER CSV GENERATED: Saved
+    logging.info(f"📁 MASTER CSV GENERATED: Saved {len(leads)} verified leads into 'master_surplus_leads.csv'!")
+
+    # 2. 2,000-Lead Batch CSV Exports
+    os.makedirs("batches", exist_ok=True)
+    total_batches = math.ceil(len(leads) / batch_size)
+
+    for i in range(total_batches):
+        start_idx = i * batch_size
+        end_idx = min(start_idx + batch_size, len(leads))
+
+        batch_df = df.iloc[start_idx:end_idx]
+        batch_filename = f"batches/surplus_batch_{i+1}_leads_{start_idx+1}_to_{end_idx}.csv"
+
+        batch_df.to_csv(batch_filename, index=False)
+        logging.info(f"📦 BATCH CSV EXPORTED [{i+1}/{total_batches}]: Saved {len(batch_df)} leads to '{batch_filename}'")
+
+def upload(leads, kv_batch_size=50, csv_batch_size=2000):
+    if not leads:
+        logging.info("ℹ️ Zero actionable leads to process.")
+        return
+
+    # Step 1: Always save local files for review first
+    export_and_batch_csv(leads, batch_size=csv_batch_size)
+    logging.info(f"💾 LOCAL REVIEW FILE READY: {len(leads)} lead(s) saved to master_surplus_leads.csv and batches/ directory.")
+
+    # Step 2: Safety Gateway for Cloudflare KV usage
+    if DRY_RUN:
+        logging.info("🛡️ [REVIEW MODE / DRY RUN ACTIVE]: Saved files locally. Bypassing Cloudflare KV upload to save usage quota.")
+        return
+
+    # Step 3: Only executes if DRY_RUN is explicitly set to false
+    endpoint = f"{WORKER_URL}/api/inbound-lead-hook"
+    total_uploaded = 0
+    total_batches = (len(leads) + kv_batch_size - 1) // kv_batch_size
+
+    logging.info(f"🚀 Uploading {len(leads)} leads in {total_batches} chunked batch(es)...")
+
+    for idx in range(0, len(leads), kv_batch_size):
+        batch = leads[idx:idx + kv_batch_size]
+        current_batch_num = (idx // kv_batch_size) + 1
+        try:
+            res = session.post(endpoint, json=batch, headers=WORKER_HEADERS, timeout=25)
+            if res.status_code == 200:
+                total_uploaded += len(batch)
+                logging.info(f"    ✅ Batch [{current_batch_num}/{total_batches}] Ingested ({len(batch)} leads).")
+            else:
+                logging.warning(f"    ⚠️ KV write paused at Batch [{current_batch_num}/{total_batches}] (Status {res.status_code}).")
+                break
+        except Exception as e:
+            logging.error(f"    ⚠️ Batch [{current_batch_num}/{total_batches}] Connection Error: {e}")
+            break
+
+    logging.info(f"🎉 INGESTION SUMMARY: {total_uploaded}/{len(leads)} uploaded to KV.")
+
+if __name__ == "__main__":
+    logging.info("🚀 Launching Master 50-State Ingress Engine...")
+    raw_data = collect_all_sources()
+    clean_data = validate_and_normalize(raw_data)
+    actionable_data = skip_trace_and_purge(clean_data)
+
+    actionable_data.sort(key=lambda x: float(x.get("exactAmount") or 0.0), reverse=True)
+    if actionable_data:
+        top_val = float(actionable_data[0].get("exactAmount") or 0.0)
+        logging.info(f"📊 Dataset sorted by highest surplus value! Top lead: ${top_val:,.2f}")
+
+    upload(actionable_data)

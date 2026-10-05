@@ -490,4 +490,11 @@ if __name__ == "__main__":
     raw_data = collect_all_sources()
     clean_data = validate_and_normalize(raw_data)
     actionable_data = skip_trace_and_purge(clean_data)
+
+    # AUTOMATED SORTING: Sort nationwide leads by highest surplus dollar amount descending
+    actionable_data.sort(key=lambda x: float(x.get("exactAmount") or 0.0), reverse=True)
+    if actionable_data:
+        top_val = float(actionable_data[0].get("exactAmount") or 0.0)
+        logging.info(f"📊 Dataset sorted by highest surplus value! Top lead: ${top_val:,.2f}")
+
     upload(actionable_data)

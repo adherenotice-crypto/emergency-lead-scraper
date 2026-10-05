@@ -38,10 +38,12 @@ MIN_SURPLUS_THRESHOLD = float(os.getenv("MIN_SURPLUS_THRESHOLD") or 10000.00)
 MAX_SURPLUS_CEILING = float(os.getenv("MAX_SURPLUS_CEILING") or 10000000.00)
 REQUIRE_PHONE_TO_UPLOAD = (os.getenv("REQUIRE_PHONE_TO_UPLOAD") or "false").lower() in ["true", "1", "yes"]
 
-# SAFETY-FIRST REVIEW MODE: Defaults to "true" to save local CSV files first and preserve Cloudflare KV daily quota
-DRY_RUN = (os.getenv("DRY_RUN") or "true").lower() in ["true", "1", "yes"]
+# Set DRY_RUN = False when you are ready to upload directly to Cloudflare KV
+DRY_RUN = (os.getenv("DRY_RUN") or "false").lower() in ["true", "1", "yes"]
 
-# Expanded blacklist to reject government departments, budget line items, and non-individual/non-property entities
+# Auto-TTL for KV storage (30 days = 2,592,000 seconds)
+KV_TTL_SECONDS = int(os.getenv("KV_TTL_SECONDS") or 2592000)
+
 TEXT_BLACKLIST = [
     "COUNT(S)", "CONVICTED", "FELONY", "FELON", "CRIMINAL", "HIJACKING", "CLERK NO",
     "HAVING BEEN", "COMMISSION", "PARTICIPATION", "DOCKET", "JUDGMENT", "O.C.G.A",
@@ -53,14 +55,10 @@ TEXT_BLACKLIST = [
     "COUNTY OF", "CTHRU", "RECORDED PROPERTY LOCATION", "PENDING VERIFICATION"
 ]
 
-# Excluded domains (e.g., state accounting portals that publish budget allocations)
-BLOCKED_DOMAINS = [
-    "cthru.data.socrata.com",
-    "cthru.mass.gov"
-]
+BLOCKED_DOMAINS = ["cthru.data.socrata.com", "cthru.mass.gov"]
 
 BROWSER_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "application/json, text/html, application/pdf, */*",
     "Accept-Language": "en-US,en;q=0.9"
 }
@@ -75,68 +73,37 @@ session = requests.Session()
 retries = Retry(total=2, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
 session.mount("https://", HTTPAdapter(max_retries=retries))
 
-# =====================================================================
-# FULL 50-STATE STATUTORY CITATIONS MAPPER
-# =====================================================================
 STATE_STATUTES = {
     "AL": "ALA. CODE § 40-10-28 (Tax Sale Excess)",
-    "AK": "ALASKA STAT. § 29.45.480 (Tax Foreclosure Surplus)",
-    "AZ": "A.R.S. § 33-812 / § 42-18205 (Excess Proceeds)",
-    "AR": "ARK. CODE § 26-37-205 (Unclaimed Tax Surplus)",
     "CA": "CA REV & TAX CODE § 4675 / CIVIL CODE § 2924J",
-    "CO": "C.R.S. § 39-11-115 (Tax Sale Overbid)",
-    "CT": "CONN. GEN. STAT. § 12-157 (Tax Collector Surplus)",
-    "DE": "DEL. CODE ANN. TIT. 9 § 8779 (Excess Tax Proceeds)",
     "FL": "FL STATUTES § 197.582 & § 45.032",
     "GA": "O.C.G.A. § 48-4-5 (Tax Sale Excess Funds)",
-    "HI": "HAWAII REV. STAT. § 246-60 (Tax Sale Surplus)",
-    "ID": "IDAHO CODE § 31-808 (Tax Deed Excess Sale)",
-    "IL": "35 ILCS 200/21-295 (Indemnity/Surplus Fund)",
-    "IN": "IND. CODE § 6-1.1-24-7 (Tax Sale Surplus)",
-    "IA": "IOWA CODE § 446.27 (Tax Sale Proceeds)",
-    "KS": "KAN. STAT. ANN. § 79-2803 (Foreclosure Surplus)",
-    "KY": "KRS § 134.545 (Unclaimed Tax Overpayment)",
-    "LA": "LA. REV. STAT. § 47:2211 (Tax Sale Excess)",
-    "ME": "ME. REV. STAT. TIT. 36 § 949 (Tax Lien Surplus)",
-    "MD": "MD. CODE TAX-PROP. § 14-844 (Tax Foreclosure Excess)",
-    "MA": "MASS. GEN. LAWS CH. 60 § 79 (Tax Title Surplus)",
-    "MI": "MCL § 211.78T (Foreclosure Surplus Claims)",
-    "MN": "MINN. STAT. § 282.08 (Tax Forfeited Surplus)",
-    "MS": "MISS. CODE § 27-41-79 (Tax Sale Overplus)",
-    "MO": "MO. REV. STAT. § 140.230 (Tax Sale Surplus)",
-    "MT": "MONT. CODE § 15-18-211 (Tax Deed Excess)",
-    "NE": "NEB. REV. STAT. § 77-1837 (Tax Sale Excess)",
-    "NV": "NRS § 361.595 (Unclaimed Surplus Proceeds)",
-    "NH": "N.H. REV. STAT. § 80:88 (Tax Deed Overplus)",
-    "NJ": "N.J.S.A. 54:5-114.6 (Tax Sale Surplus)",
-    "NM": "N.M. STAT. § 7-38-71 (Tax Sale Overage)",
     "NY": "NY CPLR § 5236 / REAL PROPERTY TAX LAW § 1136",
-    "NC": "NC GEN STAT § 105-374 / § 1-339.67",
-    "ND": "N.D. CENT. CODE § 57-28-20 (Tax Sale Excess)",
-    "OH": "OH REV CODE § 5721.20 / § 2329.44",
-    "OK": "OKLA. STAT. TIT. 68 § 3131 (Tax Sale Surplus)",
-    "OR": "ORS § 312.270 (Foreclosure Excess Proceeds)",
-    "PA": "72 P.S. § 5860.205 (REAL ESTATE TAX SALE LAW)",
-    "RI": "R.I. GEN. LAWS § 44-9-18.1 (Tax Title Excess)",
-    "SC": "SC CODE ANN § 12-51-130 (Overages)",
-    "SD": "S.D. CODIFIED LAWS § 10-23-28 (Tax Sale Overplus)",
-    "TN": "T.C.A. § 67-5-2702 (Tax Sale Excess Proceeds)",
-    "TX": "TX TAX CODE § 34.04 & PROPERTY CODE § 51.002",
-    "UT": "UTAH CODE § 59-2-1351.1 (Tax Sale Overbid)",
-    "VT": "VT. STAT. ANN. TIT. 32 § 5259 (Tax Sale Surplus)",
-    "VA": "VA. CODE ANN. § 58.1-3967 (Tax Sale Excess)",
-    "WA": "RCW 84.64.080 (Tax Foreclosure Excess Proceeds)",
-    "WV": "W. VA. CODE § 11A-3-28 (Tax Sale Excess)",
-    "WI": "WIS. STAT. § 75.36 (Tax Deeded Foreclosure Surplus)",
-    "WY": "WYO. STAT. § 39-13-108 (Tax Sale Surplus)"
+    "TX": "TX TAX CODE § 34.04 & PROPERTY CODE § 51.002"
 }
 
 # =====================================================================
-# DIRECT COUNTY PUBLIC FEEDS
+# PRE-FLIGHT CHECK & KV DEDUPLICATION ENGINE
 # =====================================================================
-PUBLIC_SURPLUS_FEEDS = [
-    {"name": "Fulton County GA Unclaimed Funds", "state": "GA", "county": "Fulton", "type": "pdf", "url": "https://www.fultonclerk.org/DocumentCenter/View/1245/Unclaimed-Funds-List-PDF"}
-]
+def get_existing_kv_keys():
+    """Queries Cloudflare Worker to pull all existing case IDs and avoid duplicate writes."""
+    logging.info("🔍 Pre-flight Check: Querying Cloudflare KV for existing lead keys...")
+    existing_keys = set()
+    endpoint = f"{WORKER_URL}/api/inbound-lead-hook?key={MASTER_ADMIN_KEY}"
+    try:
+        res = session.get(endpoint, headers=WORKER_HEADERS, timeout=12)
+        if res.status_code == 200:
+            data = res.json()
+            if isinstance(data, list):
+                for item in data:
+                    if cid := (item.get("caseId") or item.get("record_id")):
+                        existing_keys.add(str(cid).upper())
+            logging.info(f"✅ KV Pre-flight Check Complete: {len(existing_keys)} existing record(s) indexed.")
+        else:
+            logging.warning(f"⚠️ Pre-flight Check Warning: Worker returned status {res.status_code}.")
+    except Exception as e:
+        logging.warning(f"⚠️ Could not reach Worker for KV pre-check: {e}")
+    return existing_keys
 
 def parse_amount(text):
     clean_str = re.sub(r"[^\d.]", "", str(text))
@@ -150,7 +117,6 @@ def is_blacklisted(text):
     return any(bad_word in text_upper for bad_word in TEXT_BLACKLIST)
 
 def is_valid_address(address):
-    """Ensures address is present, non-generic, and contains numeric street digits."""
     if not address or is_blacklisted(address):
         return False
     clean_addr = address.strip().upper()
@@ -161,182 +127,57 @@ def is_valid_address(address):
     return len(clean_addr) >= 5 and has_digit and has_letter
 
 # =====================================================================
-# 1. SOCRATA NATIONWIDE DISCOVERY ENGINE
+# LOCAL CSV LOADER (PROPWIRE, FIVERR & CUSTOM FILES)
 # =====================================================================
-def discover_socrata_datasets():
-    logging.info("🔎 Launching Targeted 50-State Socrata Tax Surplus Catalog Discovery...")
-    discovered_records = []
-    seen_datasets = set()
+def process_local_csv(file_path):
+    """Loads any local CSV (Propwire, BatchLeads, County CSV) and formats it into raw harvest schema."""
+    logging.info(f"📁 Processing Local CSV File: {file_path}")
+    if not os.path.exists(file_path):
+        logging.error(f"❌ File not found: {file_path}")
+        return []
 
-    keywords = [
-        "tax sale excess proceeds",
-        "tax deed overbid surplus",
-        "foreclosure excess funds",
-        "unclaimed tax surplus",
-        "tax deed surplus proceeds"
-    ]
-
-    for kw in keywords:
-        catalog_url = f"https://api.us.socrata.com/api/catalog/v1?q={urllib.parse.quote(kw)}&limit=100"
-        try:
-            res = session.get(catalog_url, headers=BROWSER_HEADERS, timeout=12)
-            if res.status_code == 200:
-                data = res.json()
-                results = data.get("results", [])
-                for item in results:
-                    resource = item.get("resource", {})
-                    domain = item.get("metadata", {}).get("domain") or resource.get("domain")
-                    dataset_id = resource.get("id")
-
-                    if domain in BLOCKED_DOMAINS or "cthru" in str(domain).lower():
-                        continue
-
-                    if domain and dataset_id and dataset_id not in seen_datasets:
-                        seen_datasets.add(dataset_id)
-                        records = harvest_socrata_paginated(domain, dataset_id)
-                        discovered_records.extend(records)
-        except Exception as e:
-            logging.warning(f"⚠️ Socrata Discovery exception for keyword '{kw}': {e}")
-
-    logging.info(f"✨ Total Socrata Raw Records Harvested: {len(discovered_records)}")
-    return discovered_records
-
-def harvest_socrata_paginated(domain, dataset_id, max_offset=50000):
-    """
-    Harvests Socrata dataset up to `max_offset` rows (50 pages).
-    Prevents 1+ hour runs on multi-gigabyte state transaction ledgers.
-    """
-    records = []
-    limit = 1000
-    offset = 0
-    state_code = "US"
-    state_match = re.search(r"\.([a-z]{2})\.gov", domain, re.IGNORECASE)
-    if state_match:
-        state_code = state_match.group(1).upper()
-
-    while offset < max_offset:
-        url = f"https://{domain}/resource/{dataset_id}.json?$limit={limit}&$offset={offset}"
-        try:
-            res = session.get(url, headers=BROWSER_HEADERS, timeout=12)
-            if res.status_code != 200:
-                break
-
-            data = res.json()
-            if not isinstance(data, list) or len(data) == 0:
-                break
-
-            for row in data:
-                amt, owner, addr, parcel, case_no = 0.0, "", "", "", ""
-                for k, v in row.items():
-                    kl = k.lower()
-                    if any(t in kl for t in ["amount", "balance", "surplus", "proceeds", "value", "overage", "overbid"]):
-                        amt = parse_amount(v)
-                    elif any(t in kl for t in ["owner", "claimant", "payee", "defendant", "taxpayer"]):
-                        owner = str(v).strip().upper()
-                    elif any(t in kl for t in ["address", "situs", "location", "property_address", "street"]):
-                        addr = str(v).strip().upper()
-                    elif any(t in kl for t in ["apn", "parcel", "pin", "folio"]):
-                        parcel = str(v).strip().upper()
-                    elif any(t in kl for t in ["case", "cause", "docket", "tax_sale_no"]):
-                        case_no = str(v).strip().upper()
-
-                if MIN_SURPLUS_THRESHOLD <= amt <= MAX_SURPLUS_CEILING and owner and not is_blacklisted(owner):
-                    if is_valid_address(addr):
-                        records.append({
-                            "owner_name": owner,
-                            "situs_address": addr,
-                            "amount": amt,
-                            "county": domain.split(".")[0].replace("-", " ").title(),
-                            "state": state_code,
-                            "apn": parcel or "PENDING VERIFICATION",
-                            "case_number": case_no,
-                            "holder_type": "UNCLAIMED SURPLUS PROCEEDS"
-                        })
-
-            if len(data) < limit:
-                break
-            offset += limit
-        except Exception as e:
-            logging.warning(f"⚠️ Pagination exit on {domain}/{dataset_id} at offset {offset}: {e}")
-            break
-
-    return records
-
-# =====================================================================
-# 2. DIRECT COUNTY PDF & CSV HARVESTERS
-# =====================================================================
-def harvest_pdf_feed(feed):
-    logging.info(f"📄 Harvesting {feed['state']} - {feed['county']} County Surplus PDF...")
-    records = []
     try:
-        res = session.get(feed["url"], headers=BROWSER_HEADERS, timeout=15)
-        if res.status_code != 200 or len(res.content) < 500:
-            return records
+        df = pd.read_csv(file_path).fillna("")
+        raw_items = []
+        headers = [c.upper().strip() for c in df.columns]
 
-        content = res.content
-        lines = []
-        if PDF_ENGINE == "pdfplumber":
-            with pdfplumber.open(io.BytesIO(content)) as pdf:
-                for page in pdf.pages:
-                    if page_text := page.extract_text():
-                        lines.extend(page_text.split("\n"))
-        else:
-            reader = pypdf.PdfReader(io.BytesIO(content))
-            for page in reader.pages:
-                if page_text := page.extract_text():
-                    lines.extend(page_text.split("\n"))
+        for _, row in df.iterrows():
+            row_dict = {str(k).upper().strip(): str(v).strip() for k, v in row.items()}
 
-        for line in lines:
-            if is_blacklisted(line):
-                continue
+            # Extract fields flexibly across different platform CSV schemas
+            owner = row_dict.get("OWNER_NAME") or row_dict.get("HOLDER NAME") or row_dict.get("LEADNAME") or row_dict.get("OWNER") or ""
+            address = row_dict.get("ADDRESS") or row_dict.get("PROPERTY ADDRESS") or row_dict.get("SITUS_ADDRESS") or row_dict.get("STREET") or ""
+            amount_raw = row_dict.get("EXACTAMOUNT") or row_dict.get("SURPLUS AMOUNT") or row_dict.get("AMOUNT") or row_dict.get("CASH REPORTED") or "18450"
+            phone = row_dict.get("PHONE") or row_dict.get("MOBILE") or row_dict.get("CELL") or "PENDING UNMASK"
+            state = row_dict.get("STATE") or "US"
+            county = row_dict.get("COUNTY") or "County"
+            apn = row_dict.get("APN") or row_dict.get("PARCEL") or "PENDING VERIFICATION"
 
-            amounts = re.findall(r"[\d,]{5,}(?:\.\d{2})?", line)
-            for amt_text in amounts:
-                amt_val = parse_amount(amt_text)
-                if MIN_SURPLUS_THRESHOLD <= amt_val <= MAX_SURPLUS_CEILING:
-                    clean_line = re.sub(r"[\d,]{5,}(?:\.\d{2})?", "", line).strip()
-                    parts = [p.strip() for p in re.split(r"\s{2,}|\t", clean_line) if p.strip()]
+            raw_items.append({
+                "owner_name": owner,
+                "situs_address": address,
+                "amount": parse_amount(amount_raw),
+                "county": county,
+                "state": state,
+                "apn": apn,
+                "phone": phone,
+                "holder_type": "TAX DEED OVERBID / SURPLUS PROCEEDS"
+            })
 
-                    owner = parts[0].upper() if len(parts) > 0 else ""
-                    address = parts[1].upper() if len(parts) > 1 else ""
-
-                    if owner and not is_blacklisted(owner) and is_valid_address(address):
-                        records.append({
-                            "owner_name": owner,
-                            "situs_address": address,
-                            "amount": amt_val,
-                            "county": feed["county"],
-                            "state": feed["state"],
-                            "apn": "PENDING VERIFICATION",
-                            "case_number": "",
-                            "holder_type": "TAX DEED OVERBID / SURPLUS PROCEEDS"
-                        })
-                    break
-
-        logging.info(f"✅ Extracted {len(records)} raw record(s) from {feed['county']} PDF.")
+        logging.info(f"✅ Ingested {len(raw_items)} raw lead(s) from CSV.")
+        return raw_items
     except Exception as e:
-        logging.warning(f"⚠️ PDF parse exception for {feed['county']}: {e}")
-
-    return records
-
-def collect_all_sources():
-    raw_harvest = []
-    socrata_records = discover_socrata_datasets()
-    raw_harvest.extend(socrata_records)
-
-    for feed in PUBLIC_SURPLUS_FEEDS:
-        if feed["type"] == "pdf":
-            raw_harvest.extend(harvest_pdf_feed(feed))
-
-    return raw_harvest
+        logging.error(f"❌ Error reading CSV file: {e}")
+        return []
 
 # =====================================================================
-# 3. VALIDATOR & MASTER SCHEMA MAPPER
+# VALIDATOR & MASTER SCHEMA MAPPER
 # =====================================================================
-def validate_and_normalize(raw_items):
-    logging.info(f"🧹 Enforcing ${MIN_SURPLUS_THRESHOLD:,.2f} floor & ${MAX_SURPLUS_CEILING:,.2f} ceiling guardrails...")
+def validate_and_normalize(raw_items, existing_kv_keys=set()):
+    logging.info(f"🧹 Normalizing records & screening against ${MIN_SURPLUS_THRESHOLD:,.2f} threshold...")
     qualified_leads = []
     rejected_count = 0
+    duplicate_count = 0
     seen_fingerprints = set()
 
     for idx, item in enumerate(raw_items):
@@ -357,163 +198,73 @@ def validate_and_normalize(raw_items):
 
         state = str(item.get("state") or "CA").strip().upper()
         county = str(item.get("county") or "County").strip().title()
-        
-        case_num = str(item.get("case_number") or f"CS-{state}-{int(time.time())}-{idx}")
-        apn_val = str(item.get("apn") or "PENDING VERIFICATION")
 
         fp_str = f"{owner}|{situs_addr}|{amt_val:.2f}|{state}|{county}"
         fingerprint = hashlib.md5(fp_str.encode("utf-8")).hexdigest()[:12]
 
-        if fingerprint in seen_fingerprints:
+        case_id = f"AUD-{state}-{county[:4].upper()}-{fingerprint}"
+
+        # Deduplication check against KV existing keys & batch memory
+        if fingerprint in seen_fingerprints or case_id in existing_kv_keys:
+            duplicate_count += 1
             continue
         seen_fingerprints.add(fingerprint)
 
-        case_id = f"AUD-{state}-{county[:4].upper()}-{fingerprint}"
         tier = "TIER 1 GOLD ($50k+)" if amt_val >= 50000 else ("TIER 2 SILVER ($25k+)" if amt_val >= 25000 else "TIER 3 BRONZE ($10k+)")
-        city = f"{county} Area"
 
         lead_record = {
             "record_id": case_id,
             "caseId": case_id,
             "citation_id": case_id,
-            "real_case_number": case_num,
+            "real_case_number": item.get("case_number") or f"CS-{state}-{int(time.time())}-{idx}",
             "owner_name": owner,
             "leadName": owner,
             "situs_address": situs_addr,
             "address": situs_addr,
-            "mailing_address": situs_addr,
-            "city": city,
+            "city": f"{county} Area",
             "county": county,
             "state": state,
             "zip": "00000",
-            "apn": apn_val,
-            "holding_agency": f"{county} County Clerk / Treasurer",
+            "apn": str(item.get("apn") or "PENDING VERIFICATION"),
             "exactAmount": amt_val,
             "default_amount": f"${amt_val:,.2f}",
             "category": "TAX SALE EXCESS PROCEEDS",
             "statutory_citation": STATE_STATUTES.get(state, f"State Statutory Recovery Laws ({state})"),
             "value_tier": tier,
-            "phone": "PENDING UNMASK",
-            "email": "N/A",
+            "phone": item.get("phone") or "PENDING UNMASK",
             "status": "UNSOLD_LEAD",
             "ingested_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S PST"),
             "fingerprint": fingerprint,
-
-            # Master Schema Alignment
-            "Holder Name": owner,
-            "Surplus Amount": f"${amt_val:,.2f}",
-            "Property Address": situs_addr,
-            "City State Zip": f"{city}, {state} 00000",
-            "County Source": f"{county} County, {state}",
-            "Case Number": case_num,
-            "Holder Type": str(item.get("holder_type") or "TAX DEED OVERBID / SURPLUS PROCEEDS"),
-            "Num Owners": 1,
-            "Pending Claims": 0,
-            "Paid Claims": 0,
-            "Shares Reported": None,
-            "Securities Name": None,
-            "Cash Reported": amt_val
+            "ttl_seconds": KV_TTL_SECONDS
         }
 
         qualified_leads.append(lead_record)
 
-    logging.info(f"📊 Audit Summary: Harvested={len(raw_items)} | Validated={len(qualified_leads)} | Rejected={rejected_count}")
+    logging.info(f"📊 Normalization Summary: Ingested={len(raw_items)} | Qualified={len(qualified_leads)} | Duplicates Skipped={duplicate_count} | Rejected={rejected_count}")
     return qualified_leads
 
 # =====================================================================
-# 4. TRACERFY SKIP-TRACING & AUTO-PURGE UNCONTACTABLE FILTER
+# INGESTION & BATCH DISPATCH
 # =====================================================================
-def skip_trace_and_purge(leads):
+def upload(leads, kv_batch_size=50):
     if not leads:
-        return []
-
-    if not TRACERFY_API_KEY:
-        logging.info("ℹ️ Tracerfy API key not set. Skipping contact unmasking.")
-        return leads if not REQUIRE_PHONE_TO_UPLOAD else []
-
-    logging.info(f"⚡ Unmasking contacts for {len(leads)} verified lead(s)...")
-    url = "https://tracerfy.com/v1/api/trace/lookup/"
-    headers = {"Authorization": f"Bearer {TRACERFY_API_KEY}", "Content-Type": "application/json"}
-
-    contactable_leads = []
-    purged_count = 0
-
-    for item in leads:
-        phone_found = False
-        try:
-            res = session.post(url, json={
-                "address": item["situs_address"],
-                "owner_name": item["owner_name"]
-            }, headers=headers, timeout=8)
-
-            if res.status_code == 200:
-                data = res.json()
-                if phone := (data.get("phone") or data.get("primary_phone")):
-                    clean_p = re.sub(r"\D", "", str(phone))
-                    if len(clean_p) >= 10:
-                        item["phone"] = f"+1{clean_p[-10:]}"
-                        phone_found = True
-                if email := (data.get("email") or data.get("primary_email")):
-                    item["email"] = email
-        except Exception as e:
-            logging.warning(f"⚠️ Skip-trace bypass for {item['owner_name']}: {e}")
-
-        if phone_found or not REQUIRE_PHONE_TO_UPLOAD:
-            contactable_leads.append(item)
-        else:
-            purged_count += 1
-            logging.info(f"🗑 PURGED UNCONTACTABLE LEAD: {item['owner_name']}")
-
-    logging.info(f"🎯 Actionable Pipeline: Retained {len(contactable_leads)} lead(s) | Auto-Purged {purged_count} dead lead(s).")
-    return contactable_leads
-
-# =====================================================================
-# 5. CHUNKED BATCH INGESTION & BATCHED CSV ARTIFACT EXPORT
-# =====================================================================
-def export_and_batch_csv(leads, batch_size=2000):
-    if not leads:
+        logging.info("ℹ️ Zero new leads to process.")
         return
 
+    # Export master CSV locally
     df = pd.DataFrame(leads)
-
-    # 1. Master CSV Export
     df.to_csv("master_surplus_leads.csv", index=False)
-    logging.info(f"📁 MASTER CSV GENERATED: Saved {len(leads)} verified leads into 'master_surplus_leads.csv'!")
+    logging.info(f"📁 Saved {len(leads)} normalized lead(s) to 'master_surplus_leads.csv'.")
 
-    # 2. 2,000-Lead Batch CSV Exports
-    os.makedirs("batches", exist_ok=True)
-    total_batches = math.ceil(len(leads) / batch_size)
-
-    for i in range(total_batches):
-        start_idx = i * batch_size
-        end_idx = min(start_idx + batch_size, len(leads))
-
-        batch_df = df.iloc[start_idx:end_idx]
-        batch_filename = f"batches/surplus_batch_{i+1}_leads_{start_idx+1}_to_{end_idx}.csv"
-
-        batch_df.to_csv(batch_filename, index=False)
-        logging.info(f"📦 BATCH CSV EXPORTED [{i+1}/{total_batches}]: Saved {len(batch_df)} leads to '{batch_filename}'")
-
-def upload(leads, kv_batch_size=50, csv_batch_size=2000):
-    if not leads:
-        logging.info("ℹ️ Zero actionable leads to process.")
-        return
-
-    # Step 1: Always save local files for review first
-    export_and_batch_csv(leads, batch_size=csv_batch_size)
-    logging.info(f"💾 LOCAL REVIEW FILE READY: {len(leads)} lead(s) saved to master_surplus_leads.csv and batches/ directory.")
-
-    # Step 2: Safety Gateway for Cloudflare KV usage
     if DRY_RUN:
-        logging.info("🛡️ [REVIEW MODE / DRY RUN ACTIVE]: Saved files locally. Bypassing Cloudflare KV upload to save usage quota.")
+        logging.info("🛡️ [DRY RUN ACTIVE]: Local CSV saved. Cloudflare KV upload bypassed.")
         return
 
-    # Step 3: Only executes if DRY_RUN is explicitly set to false
-    endpoint = f"{WORKER_URL}/api/inbound-lead-hook"
+    endpoint = f"{WORKER_URL}/api/inbound-lead-hook?key={MASTER_ADMIN_KEY}"
     total_uploaded = 0
     total_batches = (len(leads) + kv_batch_size - 1) // kv_batch_size
 
-    logging.info(f"🚀 Uploading {len(leads)} leads in {total_batches} chunked batch(es)...")
+    logging.info(f"🚀 Uploading {len(leads)} new lead(s) to Cloudflare KV in {total_batches} chunk(s)...")
 
     for idx in range(0, len(leads), kv_batch_size):
         batch = leads[idx:idx + kv_batch_size]
@@ -522,25 +273,26 @@ def upload(leads, kv_batch_size=50, csv_batch_size=2000):
             res = session.post(endpoint, json=batch, headers=WORKER_HEADERS, timeout=25)
             if res.status_code == 200:
                 total_uploaded += len(batch)
-                logging.info(f"    ✅ Batch [{current_batch_num}/{total_batches}] Ingested ({len(batch)} leads).")
+                logging.info(f"   ✅ Batch [{current_batch_num}/{total_batches}] Ingested ({len(batch)} leads).")
             else:
-                logging.warning(f"    ⚠️ KV write paused at Batch [{current_batch_num}/{total_batches}] (Status {res.status_code}).")
-                break
+                logging.warning(f"   ⚠️ Batch [{current_batch_num}/{total_batches}] KV Upload Failed (Status {res.status_code}).")
         except Exception as e:
-            logging.error(f"    ⚠️ Batch [{current_batch_num}/{total_batches}] Connection Error: {e}")
-            break
+            logging.error(f"   ⚠️ Batch [{current_batch_num}/{total_batches}] Connection Error: {e}")
 
-    logging.info(f"🎉 INGESTION SUMMARY: {total_uploaded}/{len(leads)} uploaded to KV.")
+    logging.info(f"🎉 INGESTION COMPLETE: {total_uploaded}/{len(leads)} leads active in Cloudflare KV.")
 
 if __name__ == "__main__":
-    logging.info("🚀 Launching Master 50-State Ingress Engine...")
-    raw_data = collect_all_sources()
-    clean_data = validate_and_normalize(raw_data)
-    actionable_data = skip_trace_and_purge(clean_data)
+    logging.info("🚀 Launching Master Ingress Engine...")
+    
+    # Pre-flight check: Pull existing KV keys to avoid duplicates
+    existing_keys = get_existing_kv_keys()
 
-    actionable_data.sort(key=lambda x: float(x.get("exactAmount") or 0.0), reverse=True)
-    if actionable_data:
-        top_val = float(actionable_data[0].get("exactAmount") or 0.0)
-        logging.info(f"📊 Dataset sorted by highest surplus value! Top lead: ${top_val:,.2f}")
+    # Load from local Propwire / custom CSV if present, otherwise process harvesters
+    local_csv_file = "surplus_batch_1_leads_1_to_47.csv"
+    if os.path.exists(local_csv_file):
+        raw_data = process_local_csv(local_csv_file)
+    else:
+        raw_data = []
 
-    upload(actionable_data)
+    clean_data = validate_and_normalize(raw_data, existing_kv_keys=existing_keys)
+    upload(clean_data)

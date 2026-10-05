@@ -201,19 +201,23 @@ def discover_socrata_datasets():
     logging.info(f"✨ Total Socrata Raw Records Harvested: {len(discovered_records)}")
     return discovered_records
 
-def harvest_socrata_paginated(domain, dataset_id):
+def harvest_socrata_paginated(domain, dataset_id, max_offset=50000):
+    """
+    Harvests Socrata dataset up to `max_offset` rows (50 pages).
+    Prevents 1+ hour runs on multi-gigabyte state transaction ledgers.
+    """
     records = []
-    limit = 10000
+    limit = 1000
     offset = 0
     state_code = "US"
     state_match = re.search(r"\.([a-z]{2})\.gov", domain, re.IGNORECASE)
     if state_match:
         state_code = state_match.group(1).upper()
 
-    while True:
+    while offset < max_offset:
         url = f"https://{domain}/resource/{dataset_id}.json?$limit={limit}&$offset={offset}"
         try:
-            res = session.get(url, headers=BROWSER_HEADERS, timeout=20)
+            res = session.get(url, headers=BROWSER_HEADERS, timeout=12)
             if res.status_code != 200:
                 break
 
@@ -253,7 +257,7 @@ def harvest_socrata_paginated(domain, dataset_id):
                 break
             offset += limit
         except Exception as e:
-            logging.warning(f"⚠️ Pagination error on {domain}/{dataset_id} at offset {offset}: {e}")
+            logging.warning(f"⚠️ Pagination exit on {domain}/{dataset_id} at offset {offset}: {e}")
             break
 
     return records

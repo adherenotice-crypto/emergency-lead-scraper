@@ -9,7 +9,7 @@ on:
         type: boolean
         default: false
   schedule:
-    - cron: '0 */6 * * *'  # Runs automatically every 6 hours
+    - cron: '0 */6 * * *'  # Automatically executes every 6 hours
 
 jobs:
   run-ingress-engine:
@@ -28,9 +28,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Install Playwright Browsers
+      - name: Install Playwright Chromium Browser
         run: |
-          playwright install --with-deps
+          playwright install --with-deps chromium
+
+      - name: Auto-Fetch Fresh Leads from Propwire
+        env:
+          PROPWIRE_EMAIL: ${{ secrets.PROPWIRE_EMAIL }}
+          PROPWIRE_PASSWORD: ${{ secrets.PROPWIRE_PASSWORD }}
+        run: python propwire_scraper.py
 
       - name: Execute Surplus Lead Ingress Engine
         env:

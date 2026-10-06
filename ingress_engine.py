@@ -3,6 +3,7 @@ import re
 import io
 import time
 import json
+import glob
 import math
 import logging
 import hashlib
@@ -38,10 +39,7 @@ MIN_SURPLUS_THRESHOLD = float(os.getenv("MIN_SURPLUS_THRESHOLD") or 10000.00)
 MAX_SURPLUS_CEILING = float(os.getenv("MAX_SURPLUS_CEILING") or 10000000.00)
 REQUIRE_PHONE_TO_UPLOAD = (os.getenv("REQUIRE_PHONE_TO_UPLOAD") or "false").lower() in ["true", "1", "yes"]
 
-# Set DRY_RUN = False when you are ready to upload directly to Cloudflare KV
 DRY_RUN = (os.getenv("DRY_RUN") or "false").lower() in ["true", "1", "yes"]
-
-# Auto-TTL for KV storage (30 days = 2,592,000 seconds)
 KV_TTL_SECONDS = int(os.getenv("KV_TTL_SECONDS") or 2592000)
 
 TEXT_BLACKLIST = [
@@ -55,16 +53,8 @@ TEXT_BLACKLIST = [
     "COUNTY OF", "CTHRU", "RECORDED PROPERTY LOCATION", "PENDING VERIFICATION"
 ]
 
-BLOCKED_DOMAINS = ["cthru.data.socrata.com", "cthru.mass.gov"]
-
-BROWSER_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/html, application/pdf, */*",
-    "Accept-Language": "en-US,en;q=0.9"
-}
-
 WORKER_HEADERS = {
-    "User-Agent": "EmergencyAudit Ingress Engine v25.2",
+    "User-Agent": "EmergencyAudit Ingress Engine v25.3",
     "X-Emergency-Key": MASTER_ADMIN_KEY,
     "Content-Type": "application/json"
 }
@@ -82,9 +72,6 @@ STATE_STATUTES = {
     "TX": "TX TAX CODE § 34.04 & PROPERTY CODE § 51.002"
 }
 
-# =====================================================================
-# PRE-FLIGHT CHECK & KV DEDUPLICATION ENGINE
-# =====================================================================
 def get_existing_kv_keys():
     """Queries Cloudflare Worker to pull all existing case IDs and avoid duplicate writes."""
     logging.info("🔍 Pre-flight Check: Querying Cloudflare KV for existing lead keys...")
@@ -127,31 +114,66 @@ def is_valid_address(address):
     return len(clean_addr) >= 5 and has_digit and has_letter
 
 # =====================================================================
-# LOCAL CSV LOADER (PROPWIRE, FIVERR & CUSTOM FILES)
+# MULTI-PROVIDER CSV LOADER (PROPSTREAM, PROPWIRE, BATCHLEADS & CUSTOM)
 # =====================================================================
 def process_local_csv(file_path):
-    """Loads any local CSV (Propwire, BatchLeads, County CSV) and formats it into raw harvest schema."""
-    logging.info(f"📁 Processing Local CSV File: {file_path}")
+    """Parses local CSV exports across PropStream, Propwire, and county lists into standardized schema."""
+    logging.info(f"📁 Processing CSV File: {file_path}")
     if not os.path.exists(file_path):
-        logging.error(f"❌ File not found: {file_path}")
         return []
 
     try:
         df = pd.read_csv(file_path).fillna("")
         raw_items = []
-        headers = [c.upper().strip() for c in df.columns]
 
         for _, row in df.iterrows():
             row_dict = {str(k).upper().strip(): str(v).strip() for k, v in row.items()}
 
-            # Extract fields flexibly across different platform CSV schemas
-            owner = row_dict.get("OWNER_NAME") or row_dict.get("HOLDER NAME") or row_dict.get("LEADNAME") or row_dict.get("OWNER") or ""
-            address = row_dict.get("ADDRESS") or row_dict.get("PROPERTY ADDRESS") or row_dict.get("SITUS_ADDRESS") or row_dict.get("STREET") or ""
-            amount_raw = row_dict.get("EXACTAMOUNT") or row_dict.get("SURPLUS AMOUNT") or row_dict.get("AMOUNT") or row_dict.get("CASH REPORTED") or "18450"
-            phone = row_dict.get("PHONE") or row_dict.get("MOBILE") or row_dict.get("CELL") or "PENDING UNMASK"
-            state = row_dict.get("STATE") or "US"
-            county = row_dict.get("COUNTY") or "County"
-            apn = row_dict.get("APN") or row_dict.get("PARCEL") or "PENDING VERIFICATION"
+            # PropStream split-name reconstruction vs single name field
+            fn = row_dict.get("OWNER 1 FIRST NAME") or row_dict.get("FIRST NAME") or ""
+            ln = row_dict.get("OWNER 1 LAST NAME") or row_dict.get("LAST NAME") or ""
+            combined_name = f"{fn} {ln}".strip()
+
+            owner = (
+                row_dict.get("OWNER_NAME") or
+                row_dict.get("OWNER NAME") or
+                row_dict.get("LEADNAME") or
+                row_dict.get("HOLDER NAME") or
+                row_dict.get("OWNER") or
+                combined_name
+            )
+
+            # Property address matching across schemas
+            address = (
+                row_dict.get("PROPERTY ADDRESS") or
+                row_dict.get("ADDRESS") or
+                row_dict.get("SITUS_ADDRESS") or
+                row_dict.get("PROPERTY_ADDRESS") or
+                row_dict.get("STREET") or ""
+            )
+
+            # Value / Surplus amount parsing
+            amount_raw = (
+                row_dict.get("ESTIMATED EQUITY") or
+                row_dict.get("EXACTAMOUNT") or
+                row_dict.get("SURPLUS AMOUNT") or
+                row_dict.get("AMOUNT") or
+                row_dict.get("ESTIMATED VALUE") or
+                "18450"
+            )
+
+            # Contact details
+            phone = (
+                row_dict.get("PHONE 1") or
+                row_dict.get("PHONE") or
+                row_dict.get("MOBILE") or
+                row_dict.get("CELL") or
+                "PENDING UNMASK"
+            )
+
+            state = row_dict.get("PROPERTY STATE") or row_dict.get("STATE") or "US"
+            county = row_dict.get("PROPERTY COUNTY") or row_dict.get("COUNTY") or "County"
+            apn = row_dict.get("APN - FORMATTED") or row_dict.get("APN") or row_dict.get("PARCEL ID") or row_dict.get("PARCEL") or "PENDING VERIFICATION"
 
             raw_items.append({
                 "owner_name": owner,
@@ -161,18 +183,15 @@ def process_local_csv(file_path):
                 "state": state,
                 "apn": apn,
                 "phone": phone,
-                "holder_type": "TAX DEED OVERBID / SURPLUS PROCEEDS"
+                "holder_type": "PROPSTREAM / SURPLUS PROCEEDS"
             })
 
-        logging.info(f"✅ Ingested {len(raw_items)} raw lead(s) from CSV.")
+        logging.info(f"✅ Ingested {len(raw_items)} record(s) from {file_path}")
         return raw_items
     except Exception as e:
-        logging.error(f"❌ Error reading CSV file: {e}")
+        logging.error(f"❌ Error reading {file_path}: {e}")
         return []
 
-# =====================================================================
-# VALIDATOR & MASTER SCHEMA MAPPER
-# =====================================================================
 def validate_and_normalize(raw_items, existing_kv_keys=set()):
     logging.info(f"🧹 Normalizing records & screening against ${MIN_SURPLUS_THRESHOLD:,.2f} threshold...")
     qualified_leads = []
@@ -201,10 +220,8 @@ def validate_and_normalize(raw_items, existing_kv_keys=set()):
 
         fp_str = f"{owner}|{situs_addr}|{amt_val:.2f}|{state}|{county}"
         fingerprint = hashlib.md5(fp_str.encode("utf-8")).hexdigest()[:12]
-
         case_id = f"AUD-{state}-{county[:4].upper()}-{fingerprint}"
 
-        # Deduplication check against KV existing keys & batch memory
         if fingerprint in seen_fingerprints or case_id in existing_kv_keys:
             duplicate_count += 1
             continue
@@ -240,31 +257,27 @@ def validate_and_normalize(raw_items, existing_kv_keys=set()):
 
         qualified_leads.append(lead_record)
 
-    logging.info(f"📊 Normalization Summary: Ingested={len(raw_items)} | Qualified={len(qualified_leads)} | Duplicates Skipped={duplicate_count} | Rejected={rejected_count}")
+    logging.info(f"📊 Normalization Summary: Total Ingested={len(raw_items)} | Qualified={len(qualified_leads)} | Duplicates Skipped={duplicate_count} | Rejected={rejected_count}")
     return qualified_leads
 
-# =====================================================================
-# INGESTION & BATCH DISPATCH
-# =====================================================================
 def upload(leads, kv_batch_size=50):
     if not leads:
-        logging.info("ℹ️ Zero new leads to process.")
+        logging.info("ℹ️ Zero new leads to upload.")
         return
 
-    # Export master CSV locally
     df = pd.DataFrame(leads)
     df.to_csv("master_surplus_leads.csv", index=False)
     logging.info(f"📁 Saved {len(leads)} normalized lead(s) to 'master_surplus_leads.csv'.")
 
     if DRY_RUN:
-        logging.info("🛡️ [DRY RUN ACTIVE]: Local CSV saved. Cloudflare KV upload bypassed.")
+        logging.info("🛡️ [DRY RUN ACTIVE]: Cloudflare KV upload bypassed.")
         return
 
     endpoint = f"{WORKER_URL}/api/inbound-lead-hook?key={MASTER_ADMIN_KEY}"
     total_uploaded = 0
     total_batches = (len(leads) + kv_batch_size - 1) // kv_batch_size
 
-    logging.info(f"🚀 Uploading {len(leads)} new lead(s) to Cloudflare KV in {total_batches} chunk(s)...")
+    logging.info(f"🚀 Uploading {len(leads)} lead(s) to Cloudflare KV in {total_batches} batch(es)...")
 
     for idx in range(0, len(leads), kv_batch_size):
         batch = leads[idx:idx + kv_batch_size]
@@ -275,7 +288,7 @@ def upload(leads, kv_batch_size=50):
                 total_uploaded += len(batch)
                 logging.info(f"   ✅ Batch [{current_batch_num}/{total_batches}] Ingested ({len(batch)} leads).")
             else:
-                logging.warning(f"   ⚠️ Batch [{current_batch_num}/{total_batches}] KV Upload Failed (Status {res.status_code}).")
+                logging.warning(f"   ⚠️ Batch [{current_batch_num}/{total_batches}] Failed (Status {res.status_code}).")
         except Exception as e:
             logging.error(f"   ⚠️ Batch [{current_batch_num}/{total_batches}] Connection Error: {e}")
 
@@ -283,16 +296,18 @@ def upload(leads, kv_batch_size=50):
 
 if __name__ == "__main__":
     logging.info("🚀 Launching Master Ingress Engine...")
-    
-    # Pre-flight check: Pull existing KV keys to avoid duplicates
     existing_keys = get_existing_kv_keys()
 
-    # Load from local Propwire / custom CSV if present, otherwise process harvesters
-    local_csv_file = "surplus_batch_1_leads_1_to_47.csv"
-    if os.path.exists(local_csv_file):
-        raw_data = process_local_csv(local_csv_file)
+    # Automatically scan all CSV files in workspace and batches/ folder
+    target_csvs = glob.glob("*.csv") + glob.glob("batches/*.csv")
+    target_csvs = [f for f in target_csvs if not f.endswith("master_surplus_leads.csv")]
+
+    raw_data = []
+    if target_csvs:
+        for csv_file in target_csvs:
+            raw_data.extend(process_local_csv(csv_file))
     else:
-        raw_data = []
+        logging.info("ℹ️ No local CSV files found in workspace root or batches/ directory.")
 
     clean_data = validate_and_normalize(raw_data, existing_kv_keys=existing_keys)
     upload(clean_data)

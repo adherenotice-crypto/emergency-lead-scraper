@@ -36,6 +36,7 @@ jobs:
         env:
           PROPWIRE_EMAIL: ${{ secrets.PROPWIRE_EMAIL }}
           PROPWIRE_PASSWORD: ${{ secrets.PROPWIRE_PASSWORD }}
+          PROPWIRE_COOKIE: ${{ secrets.PROPWIRE_COOKIE }}
         run: python propwire_scraper.py
 
       - name: Execute Surplus Lead Ingress Engine

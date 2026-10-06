@@ -117,7 +117,7 @@ def is_valid_address(address):
 # MULTI-PROVIDER CSV LOADER (PROPSTREAM, PROPWIRE, BATCHLEADS & CUSTOM)
 # =====================================================================
 def process_local_csv(file_path):
-    """Parses local CSV exports across PropStream, Propwire, and county lists into standardized schema."""
+    """Parses local CSV exports across PropStream, Propwire, BatchLeads, and county lists into standardized schema."""
     logging.info(f"📁 Processing CSV File: {file_path}")
     if not os.path.exists(file_path):
         return []
@@ -129,16 +129,18 @@ def process_local_csv(file_path):
         for _, row in df.iterrows():
             row_dict = {str(k).upper().strip(): str(v).strip() for k, v in row.items()}
 
-            # PropStream split-name reconstruction vs single name field
-            fn = row_dict.get("OWNER 1 FIRST NAME") or row_dict.get("FIRST NAME") or ""
-            ln = row_dict.get("OWNER 1 LAST NAME") or row_dict.get("LAST NAME") or ""
-            combined_name = f"{fn} {ln}".strip()
+            # PropStream & BatchLeads split-name reconstruction vs single name field
+            fn = row_dict.get("OWNER 1 FIRST NAME") or row_dict.get("FIRST NAME") or row_dict.get("OWNER FIRST NAME") or ""
+            ln = row_dict.get("OWNER 1 LAST NAME") or row_dict.get("LAST NAME") or row_dict.get("OWNER LAST NAME") or ""
+            company = row_dict.get("COMPANY NAME") or row_dict.get("CORPORATE OWNER") or row_dict.get("COMPANY") or ""
+            combined_name = f"{fn} {ln}".strip() or company
 
             owner = (
                 row_dict.get("OWNER_NAME") or
                 row_dict.get("OWNER NAME") or
                 row_dict.get("LEADNAME") or
                 row_dict.get("HOLDER NAME") or
+                row_dict.get("CLAIMANT") or
                 row_dict.get("OWNER") or
                 combined_name
             )
@@ -146,34 +148,58 @@ def process_local_csv(file_path):
             # Property address matching across schemas
             address = (
                 row_dict.get("PROPERTY ADDRESS") or
+                row_dict.get("PROPERTY ST ADDRESS") or
                 row_dict.get("ADDRESS") or
                 row_dict.get("SITUS_ADDRESS") or
                 row_dict.get("PROPERTY_ADDRESS") or
+                row_dict.get("MAILING ADDRESS") or
                 row_dict.get("STREET") or ""
             )
 
-            # Value / Surplus amount parsing
+            # Value / Surplus amount parsing (Removed hardcoded fake fallback "18450")
             amount_raw = (
                 row_dict.get("ESTIMATED EQUITY") or
-                row_dict.get("EXACTAMOUNT") or
+                row_dict.get("EST. EQUITY") or
                 row_dict.get("SURPLUS AMOUNT") or
+                row_dict.get("OVERBID AMOUNT") or
+                row_dict.get("OVERBID") or
+                row_dict.get("EXACTAMOUNT") or
+                row_dict.get("EXCESS FUNDS") or
                 row_dict.get("AMOUNT") or
                 row_dict.get("ESTIMATED VALUE") or
-                "18450"
+                row_dict.get("EST. VALUE") or
+                "0"
             )
 
             # Contact details
             phone = (
                 row_dict.get("PHONE 1") or
+                row_dict.get("PHONE_1") or
                 row_dict.get("PHONE") or
                 row_dict.get("MOBILE") or
                 row_dict.get("CELL") or
+                row_dict.get("WIRELESS") or
                 "PENDING UNMASK"
             )
 
             state = row_dict.get("PROPERTY STATE") or row_dict.get("STATE") or "US"
             county = row_dict.get("PROPERTY COUNTY") or row_dict.get("COUNTY") or "County"
-            apn = row_dict.get("APN - FORMATTED") or row_dict.get("APN") or row_dict.get("PARCEL ID") or row_dict.get("PARCEL") or "PENDING VERIFICATION"
+            apn = (
+                row_dict.get("APN - FORMATTED") or
+                row_dict.get("APN") or
+                row_dict.get("PARCEL ID") or
+                row_dict.get("PARCEL NUMBER") or
+                row_dict.get("PARCEL") or
+                "PENDING VERIFICATION"
+            )
+
+            case_num = (
+                row_dict.get("CASE NUMBER") or
+                row_dict.get("CASE_NUMBER") or
+                row_dict.get("CASE ID") or
+                row_dict.get("DOCKET NUMBER") or
+                ""
+            )
 
             raw_items.append({
                 "owner_name": owner,
@@ -183,6 +209,7 @@ def process_local_csv(file_path):
                 "state": state,
                 "apn": apn,
                 "phone": phone,
+                "case_number": case_num,
                 "holder_type": "PROPSTREAM / SURPLUS PROCEEDS"
             })
 
@@ -212,6 +239,14 @@ def validate_and_normalize(raw_items, existing_kv_keys=set()):
 
         situs_addr = str(item.get("situs_address") or "").strip().upper()
         if not is_valid_address(situs_addr):
+            rejected_count += 1
+            continue
+
+        phone = str(item.get("phone") or "PENDING UNMASK").strip()
+        clean_phone_digits = re.sub(r"[^\d]", "", phone)
+        has_valid_phone = len(clean_phone_digits) >= 10
+
+        if REQUIRE_PHONE_TO_UPLOAD and not has_valid_phone:
             rejected_count += 1
             continue
 
@@ -248,8 +283,8 @@ def validate_and_normalize(raw_items, existing_kv_keys=set()):
             "category": "TAX SALE EXCESS PROCEEDS",
             "statutory_citation": STATE_STATUTES.get(state, f"State Statutory Recovery Laws ({state})"),
             "value_tier": tier,
-            "phone": item.get("phone") or "PENDING UNMASK",
-            "status": "UNSOLD_LEAD",
+            "phone": phone if has_valid_phone else "PENDING UNMASK",
+            "status": "READY_FOR_DISPATCH" if has_valid_phone else "PENDING_UNMASK",
             "ingested_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S PST"),
             "fingerprint": fingerprint,
             "ttl_seconds": KV_TTL_SECONDS

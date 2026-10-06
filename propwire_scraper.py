@@ -15,7 +15,6 @@ def scrape_and_download_propwire():
     logging.info("🚀 Launching Stealth Playwright Browser for Propwire Auto-Fetch...")
 
     with sync_playwright() as p:
-        # Launch Chromium with anti-bot detection flags
         browser = p.chromium.launch(
             headless=True,
             args=[
@@ -30,12 +29,10 @@ def scrape_and_download_propwire():
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         )
         
-        # Mask automated webdriver signature
         page = context.new_page()
         page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
         try:
-            # Check if direct session cookie exists in secrets
             if PROPWIRE_COOKIE:
                 logging.info("🍪 Injecting active Propwire session cookie...")
                 context.add_cookies([{
@@ -44,31 +41,33 @@ def scrape_and_download_propwire():
                     "domain": ".propwire.com",
                     "path": "/"
                 }])
-                page.goto("https://propwire.com/activity", wait_until="networkidle", timeout=60000)
-            else:
-                if not PROPWIRE_EMAIL or not PROPWIRE_PASSWORD:
-                    logging.error("❌ Missing PROPWIRE_EMAIL or PROPWIRE_PASSWORD secrets.")
-                    return
+            
+            logging.info("📥 Navigating to Propwire Activity Downloads...")
+            page.goto("https://propwire.com/activity", wait_until="domcontentloaded", timeout=60000)
+            
+            # Wait 5 seconds for React/Vue dynamic activity table to hydrate
+            page.wait_for_timeout(5000)
 
-                logging.info(f"🔑 Navigating to Propwire Login as {PROPWIRE_EMAIL}...")
-                page.goto("https://propwire.com/login", wait_until="domcontentloaded", timeout=60000)
-                page.wait_for_timeout(3000)
+            logging.info("🔍 Scanning Activity table for CSV export buttons...")
+            
+            # Multi-selector matching for Propwire activity download links
+            download_selectors = [
+                "a:has-text('Download')",
+                "button:has-text('Download')",
+                "a[href*='download']",
+                "a[download]",
+                "svg[data-icon='download']"
+            ]
 
-                email_selector = "input[type='email'], input[name='email'], input[placeholder*='Email']"
-                page.wait_for_selector(email_selector, timeout=30000)
+            download_btn = None
+            for sel in download_selectors:
+                loc = page.locator(sel).first
+                if loc.is_visible():
+                    download_btn = loc
+                    logging.info(f"✅ Found download target using selector: '{sel}'")
+                    break
 
-                page.fill(email_selector, PROPWIRE_EMAIL)
-                page.fill("input[type='password'], input[name='password']", PROPWIRE_PASSWORD)
-                page.click("button[type='submit']")
-                page.wait_for_timeout(5000)
-
-                page.goto("https://propwire.com/activity", wait_until="domcontentloaded", timeout=60000)
-
-            # Locate & trigger CSV download
-            logging.info("📥 Scanning Activity page for latest CSV export...")
-            download_btn = page.locator("a:has-text('Download'), button:has-text('Download')").first
-
-            if download_btn.is_visible():
+            if download_btn:
                 logging.info("⚡ Triggering Propwire CSV download...")
                 with page.expect_download(timeout=60000) as download_info:
                     download_btn.click()
@@ -78,7 +77,7 @@ def scrape_and_download_propwire():
                 download.save_as(output_path)
                 logging.info(f"🎉 SUCCESS: Saved fresh Propwire export to '{output_path}'")
             else:
-                logging.warning("⚠️ No download links found on Propwire Activity page.")
+                logging.warning("⚠️ No download links found. Ensure you have an active completed export at https://propwire.com/activity")
 
         except Exception as e:
             logging.error(f"❌ Propwire Auto-Fetch Error: {e}")

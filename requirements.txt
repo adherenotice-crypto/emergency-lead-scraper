@@ -1,8 +1,1 @@
-requests
-urllib3
-pandas
-openpyxl
-xlrd
-pdfplumber
-beautifulsoup4
-playwright
+requests>=2.31.0

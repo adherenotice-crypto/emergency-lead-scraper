@@ -7,6 +7,7 @@ import glob
 import logging
 import hashlib
 import requests
+import urllib.parse
 from datetime import datetime
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -120,7 +121,6 @@ def skip_trace_tracerfy(owner_name, address, state):
         if res.status_code == 200:
             data = res.json()
             if phones := data.get("phones"):
-                # Return first active wireless/mobile number
                 for p in phones:
                     if p.get("type", "").upper() in ["MOBILE", "WIRELESS", "CELL"]:
                         return p.get("number")
@@ -145,7 +145,6 @@ def process_local_csv(file_path):
             for row in reader:
                 row_dict = {str(k).upper().strip(): str(v).strip() for k, v in row.items() if k}
 
-                # Support LienSuite, Gator, PropStream, and County fields
                 fn = row_dict.get("OWNER 1 FIRST NAME") or row_dict.get("FIRST NAME") or ""
                 ln = row_dict.get("OWNER 1 LAST NAME") or row_dict.get("LAST NAME") or ""
                 company = row_dict.get("COMPANY NAME") or row_dict.get("CORPORATE OWNER") or ""
@@ -255,13 +254,16 @@ def validate_and_normalize(raw_items, existing_kv_keys=set()):
             continue
         seen_fingerprints.add(fingerprint)
 
+        # Pre-compute Google Maps URL to prevent Cloudflare Worker sub-request limits
+        encoded_address = urllib.parse.quote(f"{situs_addr}, {county}, {state}")
+        google_maps_url = f"https://www.google.com/maps/search/?api=1&query={encoded_address}"
+
         # Phone unmasking logic
         phone = str(item.get("phone") or "").strip()
         clean_phone_digits = re.sub(r"[^\d]", "", phone)
         has_valid_phone = len(clean_phone_digits) >= 10
 
         if not has_valid_phone:
-            # Auto-skip trace via Tracerfy API
             phone = skip_trace_tracerfy(owner, situs_addr, state)
             clean_phone_digits = re.sub(r"[^\d]", "", phone)
             has_valid_phone = len(clean_phone_digits) >= 10
@@ -283,7 +285,9 @@ def validate_and_normalize(raw_items, existing_kv_keys=set()):
             "city": f"{county} Area",
             "county": county,
             "state": state,
+            "zip": "00000",
             "apn": str(item.get("apn") or "PENDING VERIFICATION"),
+            "google_maps_url": google_maps_url,
             "exactAmount": amt_val,
             "default_amount": f"${amt_val:,.2f}",
             "category": "TAX SALE EXCESS PROCEEDS",
@@ -306,7 +310,6 @@ def upload(leads, kv_batch_size=50):
         logging.info("ℹ️ Zero new leads to upload.")
         return
 
-    # Write normalized output to CSV using standard library
     fieldnames = list(leads[0].keys())
     with open("master_surplus_leads.csv", "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
